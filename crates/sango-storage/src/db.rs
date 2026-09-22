@@ -2,11 +2,14 @@
 
 use std::path::Path;
 
-use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, DB};
 
 use crate::batch::{Batch, Operation};
 use crate::column::Column;
 use crate::error::StorageError;
+
+/// Entrées d'une colonne : paires `(clé, valeur)` brutes.
+pub type ColumnEntries = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// Stockage persistant RocksDB.
 ///
@@ -96,6 +99,22 @@ impl Storage {
     pub fn flush(&self) -> Result<(), StorageError> {
         self.db.flush()?;
         Ok(())
+    }
+
+    /// Lit toutes les entrées d'une colonne.
+    ///
+    /// L'ordre est byte-lex croissant sur les clés. Utilisé au démarrage
+    /// du nœud pour restaurer l'état en mémoire.
+    ///
+    /// Cette méthode charge tout en mémoire — acceptable pour V1.
+    pub fn iter_column(&self, column: Column) -> Result<ColumnEntries, StorageError> {
+        let cf = self.cf(column)?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (k, v) = item?;
+            out.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(out)
     }
 }
 

@@ -457,6 +457,7 @@ mod tests {
             receipt_root: Hash32::from_bytes([0x66; 32]),
             gas_used: 0,
             gas_limit: 30_000_000,
+            base_fee: 1,
         }
     }
 

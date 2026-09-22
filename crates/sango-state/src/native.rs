@@ -90,6 +90,27 @@ impl NativeState {
         self.smt.remove(&kh)
     }
 
+    /// Vue itérable sur toutes les entrées de l'état, dans l'ordre
+    /// byte-lex croissant des `key_hash`.
+    ///
+    /// Utilisé par la couche node pour calculer un diff d'état et le
+    /// persister.
+    pub fn iter_entries(&self) -> impl Iterator<Item = (&Hash32, &Vec<u8>)> {
+        self.smt.iter()
+    }
+
+    /// Restaure une entrée à partir de son `key_hash` déjà calculé.
+    ///
+    /// Utilisé au chargement initial de la base : les clés sont stockées
+    /// sous leur forme hashée, et non sous leur forme logique.
+    ///
+    /// Cette méthode court-circuite le hashage logique `namespace ||
+    /// identifier` : l'appelant doit fournir un `key_hash` obtenu par
+    /// [`state_key_hash`] lors d'une exécution précédente.
+    pub fn restore_entry(&mut self, key_hash: Hash32, value: Vec<u8>) {
+        self.smt.insert(key_hash, value);
+    }
+
     // --- Comptes natifs (typed accessors) -----------------------------------
 
     /// Lit un compte natif.

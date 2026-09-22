@@ -1,29 +1,11 @@
 //! `sango-types` — structures composites du protocole Sango V1.
-//!
-//! Ce crate définit les objets qui composent l’état et les messages du
-//! protocole :
-//!
-//! - [`BlockHeader`] et [`Block`] ;
-//! - [`Transaction`] native ;
-//! - [`Receipt`], [`EvmLog`], [`LogsBloom`] ;
-//! - messages consensus : [`Proposal`], [`Prevote`], [`Precommit`] ;
-//! - certificats : [`PrevoteCertificate`], [`CommitCertificate`] ;
-//! - [`Evidence`] ;
-//! - [`NativeAccount`] ;
-//! - [`Genesis`] et ses sous-configurations.
-//!
-//! Tous les hashes et signatures utilisent :
-//!
-//! - les domain separators définis dans `sango-crypto::domain` ;
-//! - l’encodage canonique fourni par `sango-codec`.
-//!
-//! Voir `SANGO PROTOCOL FREEZE V1` pour les règles normatives.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 mod account;
 mod block;
+mod chain_tip;
 mod consensus;
 mod error;
 mod evidence;
@@ -34,6 +16,7 @@ mod transaction;
 
 pub use account::NativeAccount;
 pub use block::Block;
+pub use chain_tip::ChainTip;
 pub use consensus::{
     CommitCertificate, Precommit, PrecommitEntry, Prevote, PrevoteCertificate, PrevoteEntry,
     Proposal,

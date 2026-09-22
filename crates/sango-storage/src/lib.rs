@@ -37,6 +37,6 @@ mod metadata;
 
 pub use batch::Batch;
 pub use column::Column;
-pub use db::Storage;
+pub use db::{ColumnEntries, Storage};
 pub use error::StorageError;
 pub use metadata::metadata_key;

@@ -10,16 +10,12 @@
 //!
 //! Ce sont les mêmes clés logiques que celles utilisées par le SMT de
 //! `sango-state`. La persistance RocksDB n'influence pas la valeur du
-//! `native_state_root` — elle ne fait que refléter les écritures du SMT.
-//!
-//! ## Séparation
-//!
-//! Le format de stockage (bytes) est défini par le codec canonique de
-//! `sango-codec`, le même que celui utilisé pour le hash SMT.
+//! `native_state_root`.
 
 use sango_codec::{Decode, Encode};
 use sango_primitives::Amount;
 use sango_state::{MetadataKey, Namespace};
+use sango_types::ChainTip;
 
 use crate::column::Column;
 use crate::db::Storage;
@@ -32,6 +28,8 @@ pub fn metadata_key(key: MetadataKey) -> [u8; 2] {
 }
 
 impl Storage {
+    // --- total_burned -------------------------------------------------------
+
     /// Lit le cumul `total_burned` persisté.
     ///
     /// Retourne `None` si aucune entrée n'a été écrite.
@@ -53,6 +51,8 @@ impl Storage {
         self.put(Column::Metadata, &key, &bytes)
     }
 
+    // --- total_gas_used -----------------------------------------------------
+
     /// Lit le cumul `total_gas_used` persisté.
     ///
     /// Retourne `None` si aucune entrée n'a été écrite.
@@ -70,11 +70,32 @@ impl Storage {
         let bytes = gas.encode_to_vec();
         self.put(Column::Metadata, &key, &bytes)
     }
+
+    // --- chain_tip ----------------------------------------------------------
+
+    /// Lit le `ChainTip` persisté.
+    ///
+    /// Retourne `None` si aucun bloc n'a encore été appliqué.
+    pub fn get_chain_tip(&self) -> Result<Option<ChainTip>, StorageError> {
+        let key = metadata_key(MetadataKey::ChainTip);
+        match self.get(Column::Metadata, &key)? {
+            Some(bytes) => Ok(Some(ChainTip::decode_exact(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Persiste le `ChainTip`.
+    pub fn set_chain_tip(&self, tip: &ChainTip) -> Result<(), StorageError> {
+        let key = metadata_key(MetadataKey::ChainTip);
+        let bytes = tip.encode_to_vec();
+        self.put(Column::Metadata, &key, &bytes)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sango_primitives::{Hash32, Height};
 
     fn temp_storage() -> (tempfile::TempDir, Storage) {
         let dir = tempfile::tempdir().unwrap();
@@ -143,8 +164,6 @@ mod tests {
     fn keys_are_isolated_from_other_columns() {
         let (_dir, s) = temp_storage();
         s.set_total_burned(Amount::from_base_units(1)).unwrap();
-        // Une écriture dans une autre colonne avec la même clé brute ne
-        // doit pas affecter Metadata.
         let key = metadata_key(MetadataKey::TotalBurned);
         s.put(Column::Blocks, &key, b"garbage").unwrap();
         assert_eq!(
@@ -163,5 +182,46 @@ mod tests {
             metadata_key(MetadataKey::TotalGasUsed),
             [Namespace::Metadata.tag(), MetadataKey::TotalGasUsed.tag()]
         );
+        assert_eq!(
+            metadata_key(MetadataKey::ChainTip),
+            [Namespace::Metadata.tag(), MetadataKey::ChainTip.tag()]
+        );
+    }
+
+    #[test]
+    fn chain_tip_absent_returns_none() {
+        let (_dir, s) = temp_storage();
+        assert!(s.get_chain_tip().unwrap().is_none());
+    }
+
+    #[test]
+    fn chain_tip_roundtrip() {
+        let (_dir, s) = temp_storage();
+        let tip = ChainTip {
+            height: Height::new(5),
+            block_hash: Hash32::from_bytes([0xab; 32]),
+            base_fee: 100,
+        };
+        s.set_chain_tip(&tip).unwrap();
+        assert_eq!(s.get_chain_tip().unwrap(), Some(tip));
+    }
+
+    #[test]
+    fn chain_tip_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let tip = ChainTip {
+            height: Height::new(10),
+            block_hash: Hash32::from_bytes([0xcd; 32]),
+            base_fee: 999,
+        };
+        {
+            let s = Storage::open(dir.path()).unwrap();
+            s.set_chain_tip(&tip).unwrap();
+            s.flush().unwrap();
+        }
+        {
+            let s = Storage::open(dir.path()).unwrap();
+            assert_eq!(s.get_chain_tip().unwrap(), Some(tip));
+        }
     }
 }

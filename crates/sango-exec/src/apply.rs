@@ -572,6 +572,7 @@ mod tests {
             receipt_root: Hash32::ZERO,
             gas_used: 0,
             gas_limit: 30_000_000,
+            base_fee: 1,
         }
     }
 

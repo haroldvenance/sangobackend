@@ -39,3 +39,4 @@ sango-storage = { path = "crates/sango-storage" }
 sango-tx = { path = "crates/sango-tx" }
 sango-state = { path = "crates/sango-state" }
 sango-exec = { path = "crates/sango-exec" }
+sango-node = { path = "crates/sango-node" }

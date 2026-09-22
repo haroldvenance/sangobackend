@@ -4,16 +4,18 @@ use sango_codec::{Decode, Decoder, Encode, Encoder};
 use sango_crypto::{domain, keccak256};
 use sango_primitives::{ChainId32, Epoch, Hash32, Height, NativeAddress, Round};
 
-/// En-tête de bloc Sango V1 (Freeze, section 18).
+/// En-tête de bloc Sango V1.
 ///
-/// Ordre canonique des champs (normatif) :
+/// Ordre canonique **normatif** :
 ///
 /// ```text
 /// version || chain_id || epoch || height || round
 /// || previous_block_hash || timestamp || proposer_address
 /// || transaction_root || state_root || receipt_root
-/// || gas_used || gas_limit
+/// || gas_used || gas_limit || base_fee
 /// ```
+///
+/// Taille fixe : **248 bytes**.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct BlockHeader {
     /// Version du protocole. `1` pour V1.
@@ -42,10 +44,12 @@ pub struct BlockHeader {
     pub gas_used: u64,
     /// Gas limite du bloc.
     pub gas_limit: u64,
+    /// Base fee par unité de gas (EIP-1559).
+    pub base_fee: u128,
 }
 
 impl BlockHeader {
-    /// Calcule `block_hash` selon la formule normative :
+    /// Calcule `block_hash` :
     ///
     /// ```text
     /// block_hash = Keccak256("SANGO/BLOCK/HEADER/V1" || canonical(header))
@@ -56,8 +60,6 @@ impl BlockHeader {
     }
 
     /// Encode `DOMAIN_BLOCK_HEADER_V1 || canonical(header)`.
-    ///
-    /// Utilisé par [`BlockHeader::hash`].
     #[must_use]
     pub fn encode_to_vec_with_domain(&self) -> Vec<u8> {
         let mut enc = Encoder::new();
@@ -82,6 +84,7 @@ impl Encode for BlockHeader {
         self.receipt_root.encode(enc);
         self.gas_used.encode(enc);
         self.gas_limit.encode(enc);
+        self.base_fee.encode(enc);
     }
 }
 
@@ -101,6 +104,7 @@ impl Decode for BlockHeader {
             receipt_root: Hash32::decode(dec)?,
             gas_used: u64::decode(dec)?,
             gas_limit: u64::decode(dec)?,
+            base_fee: u128::decode(dec)?,
         })
     }
 }
@@ -124,6 +128,7 @@ mod tests {
             receipt_root: Hash32::from_bytes([0x66; 32]),
             gas_used: 0,
             gas_limit: 30_000_000,
+            base_fee: 1,
         }
     }
 
@@ -138,14 +143,22 @@ mod tests {
     #[test]
     fn header_encoding_size_is_fixed() {
         let bytes = sample().encode_to_vec();
-        // 4 + 32 + 8 + 8 + 8 + 32 + 8 + 20 + 32 + 32 + 32 + 8 + 8 = 232
-        assert_eq!(bytes.len(), 232);
+        // 4 + 32 + 8 + 8 + 8 + 32 + 8 + 20 + 32 + 32 + 32 + 8 + 8 + 16 = 248
+        assert_eq!(bytes.len(), 248);
     }
 
     #[test]
     fn hash_is_deterministic() {
         let h = sample();
         assert_eq!(h.hash(), h.hash());
+    }
+
+    #[test]
+    fn hash_changes_with_base_fee() {
+        let mut h = sample();
+        let a = h.hash();
+        h.base_fee = 2;
+        assert_ne!(a, h.hash());
     }
 
     #[test]

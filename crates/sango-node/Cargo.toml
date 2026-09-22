@@ -7,3 +7,15 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+thiserror.workspace = true
+sango-primitives.workspace = true
+sango-codec.workspace = true
+sango-crypto.workspace = true
+sango-types.workspace = true
+sango-state.workspace = true
+sango-storage.workspace = true
+sango-tx.workspace = true
+sango-exec.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

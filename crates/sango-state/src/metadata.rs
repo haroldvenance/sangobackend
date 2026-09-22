@@ -1,21 +1,4 @@
 //! Clés canoniques du namespace `Metadata`.
-//!
-//! Le namespace `Metadata` porte les compteurs globaux de chaîne qui
-//! doivent faire partie du `native_state_root` :
-//!
-//! - [`MetadataKey::TotalBurned`] : cumul des SANGO brûlés (base units) ;
-//! - [`MetadataKey::TotalGasUsed`] : cumul du gas consommé.
-//!
-//! ## Ordre canonique
-//!
-//! Le tag `u8` est **normatif** : il constitue le premier (et unique) byte
-//! de l'identifiant logique avant hashage :
-//!
-//! ```text
-//! key_hash = Keccak256("SANGO/STATE/KEY/V1" || namespace_u8 || tag_u8)
-//! ```
-//!
-//! Ne jamais renuméroter ni réutiliser un tag.
 
 /// Clé canonique du namespace `Metadata`.
 #[repr(u8)]
@@ -25,6 +8,10 @@ pub enum MetadataKey {
     TotalBurned = 0x01,
     /// Cumul du gas consommé (`u64` LE).
     TotalGasUsed = 0x02,
+    /// Pointeur vers le dernier bloc appliqué (`ChainTip`).
+    ///
+    /// Encodage : `u64 (height) || Hash32 (block_hash) || u128 (base_fee)`.
+    ChainTip = 0x03,
 }
 
 impl MetadataKey {
@@ -41,7 +28,11 @@ mod tests {
 
     #[test]
     fn tags_are_unique() {
-        let all = [MetadataKey::TotalBurned, MetadataKey::TotalGasUsed];
+        let all = [
+            MetadataKey::TotalBurned,
+            MetadataKey::TotalGasUsed,
+            MetadataKey::ChainTip,
+        ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate().skip(i + 1) {
                 assert_ne!(a.tag(), b.tag(), "duplicate tag at {i}/{j}");
@@ -53,5 +44,6 @@ mod tests {
     fn tags_match_spec() {
         assert_eq!(MetadataKey::TotalBurned.tag(), 0x01);
         assert_eq!(MetadataKey::TotalGasUsed.tag(), 0x02);
+        assert_eq!(MetadataKey::ChainTip.tag(), 0x03);
     }
 }

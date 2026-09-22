@@ -116,6 +116,11 @@ impl SparseMerkleTree {
         self.entries.remove(key_hash)
     }
 
+    /// Vue itérable sur toutes les entrées, dans l'ordre byte-lex croissant.
+    pub fn iter(&self) -> impl Iterator<Item = (&Hash32, &Vec<u8>)> {
+        self.entries.iter()
+    }
+
     /// Racine de l'arbre.
     #[must_use]
     pub fn root(&self) -> Hash32 {

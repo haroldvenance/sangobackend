@@ -545,6 +545,18 @@ version = "0.1.0"
 [[package]]
 name = "sango-node"
 version = "0.1.0"
+dependencies = [
+ "sango-codec",
+ "sango-crypto",
+ "sango-exec",
+ "sango-primitives",
+ "sango-state",
+ "sango-storage",
+ "sango-tx",
+ "sango-types",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "sango-p2p"

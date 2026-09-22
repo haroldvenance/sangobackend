@@ -76,6 +76,7 @@ mod tests {
             receipt_root: Hash32::from_bytes([0x66; 32]),
             gas_used: 0,
             gas_limit: 30_000_000,
+            base_fee: 1,
         }
     }
 
@@ -143,7 +144,7 @@ mod tests {
             header: header(),
             transactions: Vec::new(),
         };
-        // header = 232 bytes, tx count = 4 bytes (u32 LE) → 236
-        assert_eq!(b.encode_to_vec().len(), 236);
+        // header = 248 bytes, tx count = 4 bytes (u32 LE) → 252
+        assert_eq!(b.encode_to_vec().len(), 252);
     }
 }
