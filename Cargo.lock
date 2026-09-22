@@ -527,6 +527,18 @@ name = "sango-evm"
 version = "0.1.0"
 
 [[package]]
+name = "sango-exec"
+version = "0.1.0"
+dependencies = [
+ "sango-crypto",
+ "sango-primitives",
+ "sango-state",
+ "sango-tx",
+ "sango-types",
+ "thiserror",
+]
+
+[[package]]
 name = "sango-mempool"
 version = "0.1.0"
 

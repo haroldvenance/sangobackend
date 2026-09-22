@@ -15,6 +15,7 @@ members = [
     "crates/sango-p2p",
     "crates/sango-rpc",
     "crates/sango-node",
+    "crates/sango-exec",
     "crates/sango-wallet",
 ]
 
@@ -36,3 +37,5 @@ sango-crypto = { path = "crates/sango-crypto" }
 sango-types = { path = "crates/sango-types" }
 sango-storage = { path = "crates/sango-storage" }
 sango-tx = { path = "crates/sango-tx" }
+sango-state = { path = "crates/sango-state" }
+sango-exec = { path = "crates/sango-exec" }

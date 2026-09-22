@@ -1,4 +1,25 @@
-//! `sango-tx` — validation de transactions natives Sango V1.
+//! `sango-tx` — cycle de vie transactionnel Sango V1.
+//!
+//! ## Responsabilité
+//!
+//! Ce crate est **stateless** : il traite la transaction depuis ses bytes
+//! jusqu'à sa validation, sans jamais toucher à l'état.
+//!
+//! ```text
+//! bytes
+//!   ↓
+//! decode
+//!   ↓
+//! Transaction
+//!   ↓
+//! validate (structure, chain_id, signature, nonce, fee, balance)
+//!   ↓
+//! ValidatedTransaction
+//! ```
+//!
+//! L'**application** d'une transaction validée (mutation d'état, fee
+//! accounting, receipts) est la responsabilité du crate [`sango_exec`],
+//! qui dépend à la fois de `sango-tx` et de `sango-state`.
 //!
 //! ## Pipeline (Freeze, section 2.8)
 //!
@@ -6,35 +27,21 @@
 //! decode → structure → chain_id → signature → nonce → balance → gas/fee
 //! ```
 //!
+//! Chaque étape est exposée comme fonction indépendante.
+//!
 //! ## Bootstrap de clé publique
 //!
-//! **RÉSOLU (A1).** Un compte natif est typiquement **crédité d'abord**
-//! par un transfert entrant : il existe alors sous forme « fantôme »
-//! (porteur d'un solde mais sans clé publique enregistrée). Pour pouvoir
-//! dépenser, il doit **déclarer sa clé publique** dans sa première
-//! transaction en renseignant `tx.public_key = Some(pk)`.
+//! Un compte est typiquement **crédité d'abord** par un transfert entrant :
+//! il existe alors sous forme « fantôme » (`public_key == None`). Pour
+//! pouvoir dépenser, il doit **activer** sa clé publique en la déclarant
+//! dans sa première transaction (`tx.public_key = Some(pk)`).
 //!
-//! Règles :
-//!
-//! - `tx.public_key = None` : la signature est vérifiée contre la clé
-//!   publique du compte, qui doit déjà être enregistrée.
-//! - `tx.public_key = Some(pk)` : `derive_native_address(pk) == tx.sender`
-//!   requis. Si le compte a déjà une clé enregistrée, elle doit être
-//!   **identique** (rotation interdite en V1).
-//! - `PublicKey::ZERO` est rejeté structurellement.
-//!
-//! Le champ `public_key` est inclus dans les bytes signés et le hash de
-//! transaction, ce qui empêche un attaquant de l'ajouter ou de le retirer
-//! après signature.
-//!
-//! Le résultat de validation expose [`ValidatedTransaction::bootstrap_public_key`] :
-//! s'il vaut `Some(pk)`, la couche d'état **doit** enregistrer `pk` comme
-//! clé publique du compte lors de l'application.
+//! Voir [`validate_signature`] pour les règles exactes.
 //!
 //! ## Découplage
 //!
-//! Ce crate **ne dépend pas** de `sango-state`. Les informations sur le
-//! compte émetteur ([`SenderInfo`]) lui sont fournies par l'appelant.
+//! `sango-tx` **ne dépend pas** de `sango-state`. La validation reçoit un
+//! [`SenderInfo`] fourni par l'appelant.
 //!
 //! ## Frais
 //!

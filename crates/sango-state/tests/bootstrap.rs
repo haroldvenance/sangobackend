@@ -179,17 +179,13 @@ fn bootstrap_does_not_touch_unrelated_accounts() {
     let sender = derive_native_address(&pk);
     let other = NativeAddress::from_bytes([0xdd; 20]);
 
-
     let mut state = NativeState::new();
     state
         .credit(sender, Amount::from_base_units(1_000_000))
         .unwrap();
-    state
-        .credit(other, Amount::from_base_units(500))
-        .unwrap();
+    state.credit(other, Amount::from_base_units(500)).unwrap();
 
     let other_before = state.get_account(&other).unwrap();
-
 
     let tx = signed_bootstrap_transfer(&kp, 0, 10, 20);
     let info = sender_info_from_state(&state, &sender);
