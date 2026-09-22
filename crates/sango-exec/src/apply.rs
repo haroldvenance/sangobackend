@@ -368,6 +368,9 @@ fn apply_transfer_no_rollback(
     fee_recipient: NativeAddress,
 ) -> Result<AppliedTransaction, ApplyError> {
     // (1) Structure.
+    if tx.tx_kind.is_staking() {
+        return Err(ApplyError::UnsupportedTxKind(tx.tx_kind));
+    }
     if tx.tx_kind != TxKind::Transfer {
         return Err(ApplyError::UnsupportedTxKind(tx.tx_kind));
     }

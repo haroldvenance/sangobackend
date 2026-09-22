@@ -158,6 +158,7 @@ pub fn validate_structure(tx: &Transaction) -> Result<(), TxValidationError> {
         }
     }
     match tx.tx_kind {
+        // --- Transfers / contrats -------------------------------------------
         TxKind::Transfer => {
             if tx.recipient.is_none() {
                 return Err(TxValidationError::InvalidStructure(
@@ -181,6 +182,169 @@ pub fn validate_structure(tx: &Transaction) -> Result<(), TxValidationError> {
             if tx.recipient.is_some() {
                 return Err(TxValidationError::InvalidStructure(
                     "TX_CONTRACT_CREATE must have no recipient",
+                ));
+            }
+        }
+
+        // --- Staking : bond / unbond ----------------------------------------
+        TxKind::Bond => {
+            if tx.recipient.is_some() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_BOND must have no recipient",
+                ));
+            }
+            if !tx.data.is_empty() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_BOND must have empty data",
+                ));
+            }
+            if tx.value < sango_types::staking_params::min_self_stake() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_BOND below minimum self-stake",
+                ));
+            }
+        }
+        TxKind::Unbond => {
+            if tx.recipient.is_some() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_UNBOND must have no recipient",
+                ));
+            }
+            if !tx.data.is_empty() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_UNBOND must have empty data",
+                ));
+            }
+            if tx.value.is_zero() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_UNBOND requires a positive amount",
+                ));
+            }
+        }
+
+        // --- Staking : delegate / undelegate --------------------------------
+        TxKind::Delegate => {
+            if tx.recipient.is_none() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_DELEGATE requires a validator recipient",
+                ));
+            }
+            if !tx.data.is_empty() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_DELEGATE must have empty data",
+                ));
+            }
+            if tx.value.is_zero() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_DELEGATE requires a positive amount",
+                ));
+            }
+        }
+        TxKind::Undelegate => {
+            if tx.recipient.is_none() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_UNDELEGATE requires a validator recipient",
+                ));
+            }
+            if !tx.data.is_empty() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_UNDELEGATE must have empty data",
+                ));
+            }
+            if tx.value.is_zero() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_UNDELEGATE requires a positive amount",
+                ));
+            }
+        }
+
+        // --- Staking : claim rewards ----------------------------------------
+        TxKind::ClaimRewards => {
+            if tx.recipient.is_none() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_CLAIM_REWARDS requires a validator recipient",
+                ));
+            }
+            if !tx.data.is_empty() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_CLAIM_REWARDS must have empty data",
+                ));
+            }
+            if !tx.value.is_zero() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_CLAIM_REWARDS must have value 0",
+                ));
+            }
+        }
+
+        // --- Staking : register validator -----------------------------------
+        TxKind::RegisterValidator => {
+            if tx.recipient.is_some() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_REGISTER_VALIDATOR must have no recipient",
+                ));
+            }
+            // data = commission_bps (4 BE) || public_key (32)
+            if tx.data.len() != 36 {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_REGISTER_VALIDATOR data must be 36 bytes",
+                ));
+            }
+            let commission_bps =
+                u32::from_be_bytes([tx.data[0], tx.data[1], tx.data[2], tx.data[3]]);
+            if commission_bps > sango_types::staking_params::MAX_COMMISSION_BPS {
+                return Err(TxValidationError::InvalidStructure(
+                    "commission_bps exceeds maximum",
+                ));
+            }
+            if tx.value < sango_types::staking_params::min_self_stake() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_REGISTER_VALIDATOR below minimum self-stake",
+                ));
+            }
+        }
+
+        // --- Staking : update commission ------------------------------------
+        TxKind::UpdateCommission => {
+            if tx.recipient.is_some() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_UPDATE_COMMISSION must have no recipient",
+                ));
+            }
+            // data = new_commission_bps (4 BE)
+            if tx.data.len() != 4 {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_UPDATE_COMMISSION data must be 4 bytes",
+                ));
+            }
+            let new_bps = u32::from_be_bytes([tx.data[0], tx.data[1], tx.data[2], tx.data[3]]);
+            if new_bps > sango_types::staking_params::MAX_COMMISSION_BPS {
+                return Err(TxValidationError::InvalidStructure(
+                    "new commission_bps exceeds maximum",
+                ));
+            }
+            if !tx.value.is_zero() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_UPDATE_COMMISSION must have value 0",
+                ));
+            }
+        }
+
+        // --- Staking : unjail -----------------------------------------------
+        TxKind::Unjail => {
+            if tx.recipient.is_some() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_UNJAIL must have no recipient",
+                ));
+            }
+            if !tx.data.is_empty() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_UNJAIL must have empty data",
+                ));
+            }
+            if !tx.value.is_zero() {
+                return Err(TxValidationError::InvalidStructure(
+                    "TX_UNJAIL must have value 0",
                 ));
             }
         }

@@ -547,6 +547,11 @@ dependencies = [
 [[package]]
 name = "sango-mempool"
 version = "0.1.0"
+dependencies = [
+ "sango-primitives",
+ "sango-types",
+ "thiserror",
+]
 
 [[package]]
 name = "sango-node"

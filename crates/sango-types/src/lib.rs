@@ -12,6 +12,7 @@ mod evidence;
 mod genesis;
 mod header;
 mod receipt;
+mod staking;
 mod transaction;
 
 pub use account::NativeAccount;
@@ -29,6 +30,7 @@ pub use genesis::{
 };
 pub use header::BlockHeader;
 pub use receipt::{EvmLog, LogsBloom, Receipt, ReceiptStatus, LOGS_BLOOM_BYTES, MAX_LOG_TOPICS};
+pub use staking::{params as staking_params, Delegation, ValidatorInfo};
 pub use transaction::{Transaction, TxKind};
 
 /// Version courante du protocole Sango.

@@ -358,6 +358,72 @@ impl NativeState {
     pub fn empty_root() -> Hash32 {
         empty_root()
     }
+
+    // --- Validateurs --------------------------------------------------------
+
+    /// Lit les informations d'un validateur.
+    #[must_use]
+    pub fn get_validator(&self, address: &NativeAddress) -> Option<sango_types::ValidatorInfo> {
+        let bytes = self.get_entry(Namespace::Validator, address.as_bytes())?;
+        sango_types::ValidatorInfo::decode_exact(bytes).ok()
+    }
+
+    /// Vrai si un validateur est enregistré.
+    #[must_use]
+    pub fn validator_exists(&self, address: &NativeAddress) -> bool {
+        self.get_validator(address).is_some()
+    }
+
+    /// Écrit les informations d'un validateur (remplace si existant).
+    pub fn set_validator(&mut self, info: sango_types::ValidatorInfo) {
+        let address = info.address;
+        let bytes = info.encode_to_vec();
+        self.put_entry(Namespace::Validator, address.as_bytes(), bytes);
+    }
+
+    /// Supprime l'enregistrement d'un validateur.
+    pub fn remove_validator(&mut self, address: &NativeAddress) -> Option<Vec<u8>> {
+        self.remove_entry(Namespace::Validator, address.as_bytes())
+    }
+
+    // --- Délégations --------------------------------------------------------
+
+    /// Clé logique d'une délégation : `delegator || validator`.
+    fn delegation_identifier(delegator: &NativeAddress, validator: &NativeAddress) -> [u8; 40] {
+        let mut key = [0u8; 40];
+        key[..20].copy_from_slice(delegator.as_bytes());
+        key[20..].copy_from_slice(validator.as_bytes());
+        key
+    }
+
+    /// Lit une délégation.
+    #[must_use]
+    pub fn get_delegation(
+        &self,
+        delegator: &NativeAddress,
+        validator: &NativeAddress,
+    ) -> Option<sango_types::Delegation> {
+        let key = Self::delegation_identifier(delegator, validator);
+        let bytes = self.get_entry(Namespace::Delegation, &key)?;
+        sango_types::Delegation::decode_exact(bytes).ok()
+    }
+
+    /// Écrit une délégation (remplace si existante).
+    pub fn set_delegation(&mut self, d: sango_types::Delegation) {
+        let key = Self::delegation_identifier(&d.delegator, &d.validator);
+        let bytes = d.encode_to_vec();
+        self.put_entry(Namespace::Delegation, &key, bytes);
+    }
+
+    /// Supprime une délégation.
+    pub fn remove_delegation(
+        &mut self,
+        delegator: &NativeAddress,
+        validator: &NativeAddress,
+    ) -> Option<Vec<u8>> {
+        let key = Self::delegation_identifier(delegator, validator);
+        self.remove_entry(Namespace::Delegation, &key)
+    }
 }
 
 #[cfg(test)]
@@ -841,5 +907,91 @@ mod tests {
         assert_eq!(clone.total_burned(), Amount::from_base_units(42));
         assert_eq!(clone.total_gas_used(), 100);
         assert_eq!(clone.native_state_root(), s.native_state_root());
+    }
+
+    // --- Staking ------------------------------------------------------------
+
+    #[test]
+    fn validator_absent_returns_none() {
+        let s = NativeState::new();
+        assert!(s.get_validator(&addr(0xaa)).is_none());
+        assert!(!s.validator_exists(&addr(0xaa)));
+    }
+
+    #[test]
+    fn validator_roundtrip() {
+        use sango_types::ValidatorInfo;
+        let mut s = NativeState::new();
+        let v = ValidatorInfo {
+            address: addr(0xaa),
+            public_key: PublicKey::from_bytes([0x01; 32]),
+            self_stake: Amount::from_sango(100_000).unwrap(),
+            total_delegated: Amount::ZERO,
+            commission_bps: 700,
+            pending_commission_bps: None,
+            pending_commission_at: None,
+            jailed: false,
+            jailed_until: None,
+        };
+        s.set_validator(v);
+        assert!(s.validator_exists(&addr(0xaa)));
+        assert_eq!(s.get_validator(&addr(0xaa)), Some(v));
+    }
+
+    #[test]
+    fn delegation_absent_returns_none() {
+        let s = NativeState::new();
+        assert!(s.get_delegation(&addr(0xbb), &addr(0xaa)).is_none());
+    }
+
+    #[test]
+    fn delegation_roundtrip() {
+        use sango_types::Delegation;
+        let mut s = NativeState::new();
+        let d = Delegation {
+            delegator: addr(0xbb),
+            validator: addr(0xaa),
+            bonded: Amount::from_sango(1_000).unwrap(),
+            unbonding: Amount::ZERO,
+            unbonding_until: None,
+            pending_rewards: Amount::ZERO,
+        };
+        s.set_delegation(d);
+        assert_eq!(s.get_delegation(&addr(0xbb), &addr(0xaa)), Some(d));
+    }
+
+    #[test]
+    fn delegation_keyed_by_delegator_and_validator() {
+        use sango_types::Delegation;
+        let mut s = NativeState::new();
+        let d = Delegation::empty(addr(0xbb), addr(0xaa));
+        s.set_delegation(d);
+        // Interroger avec un delegator différent.
+        assert!(s.get_delegation(&addr(0xcc), &addr(0xaa)).is_none());
+        // Interroger avec un validator différent.
+        assert!(s.get_delegation(&addr(0xbb), &addr(0xcc)).is_none());
+    }
+
+    #[test]
+    fn validator_staking_does_not_touch_accounts() {
+        use sango_types::ValidatorInfo;
+        let mut s = NativeState::new();
+        s.credit(addr(0xaa), Amount::from_sango(200_000).unwrap())
+            .unwrap();
+        let account_before = s.get_account(&addr(0xaa));
+
+        s.set_validator(ValidatorInfo {
+            address: addr(0xaa),
+            public_key: PublicKey::from_bytes([0x01; 32]),
+            self_stake: Amount::from_sango(100_000).unwrap(),
+            total_delegated: Amount::ZERO,
+            commission_bps: 700,
+            pending_commission_bps: None,
+            pending_commission_at: None,
+            jailed: false,
+            jailed_until: None,
+        });
+
+        assert_eq!(s.get_account(&addr(0xaa)), account_before);
     }
 }

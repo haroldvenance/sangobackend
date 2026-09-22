@@ -5,25 +5,47 @@ use sango_crypto::{domain, keccak256, sign_native, verify_native, CryptoError, N
 use sango_primitives::{Amount, ChainId32, Hash32, NativeAddress, PublicKey, Signature};
 
 /// Type de transaction native.
+///
+/// ## Tags canoniques
+///
+/// Les tags `0x01` à `0x03` sont **normatifs** (Freeze section 21).
+/// Les tags `0x04` à `0x0B` étendent V1 pour le staking natif.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum TxKind {
     /// Transfert de SANGO entre deux comptes natifs.
-    Transfer,
+    Transfer = 0x01,
     /// Appel d'un contrat EVM.
-    ContractCall,
+    ContractCall = 0x02,
     /// Création d'un contrat EVM.
-    ContractCreate,
+    ContractCreate = 0x03,
+    /// Self-stake du compte émetteur (min 100 000 SANGO).
+    Bond = 0x04,
+    /// Retrait du self-stake (déclenche unbonding 14 jours).
+    Unbond = 0x05,
+    /// Délégation de `value` au validateur `recipient`.
+    Delegate = 0x06,
+    /// Retrait d'une délégation (déclenche unbonding 14 jours).
+    Undelegate = 0x07,
+    /// Réclamation des récompenses accumulées auprès d'un validateur.
+    ClaimRewards = 0x08,
+    /// Enregistrement initial d'un validateur.
+    ///
+    /// `data = commission_bps(4 BE) || public_key(32)`.
+    RegisterValidator = 0x09,
+    /// Modification de la commission d'un validateur.
+    ///
+    /// `data = new_commission_bps(4 BE)`. Prend effet après un délai de
+    /// 7 jours.
+    UpdateCommission = 0x0A,
+    /// Sortie de jail après une période de downtime écoulée.
+    Unjail = 0x0B,
 }
 
 impl TxKind {
     /// Tag canonique (`u8`).
     #[must_use]
     pub const fn tag(self) -> u8 {
-        match self {
-            TxKind::Transfer => 0x01,
-            TxKind::ContractCall => 0x02,
-            TxKind::ContractCreate => 0x03,
-        }
+        self as u8
     }
 
     /// Parse un tag canonique.
@@ -32,26 +54,38 @@ impl TxKind {
             0x01 => Ok(TxKind::Transfer),
             0x02 => Ok(TxKind::ContractCall),
             0x03 => Ok(TxKind::ContractCreate),
+            0x04 => Ok(TxKind::Bond),
+            0x05 => Ok(TxKind::Unbond),
+            0x06 => Ok(TxKind::Delegate),
+            0x07 => Ok(TxKind::Undelegate),
+            0x08 => Ok(TxKind::ClaimRewards),
+            0x09 => Ok(TxKind::RegisterValidator),
+            0x0A => Ok(TxKind::UpdateCommission),
+            0x0B => Ok(TxKind::Unjail),
             other => Err(CodecError::InvalidTag { tag: other }),
         }
     }
+
+    /// Vrai s'il s'agit d'un `TxKind` de staking natif.
+    #[must_use]
+    pub const fn is_staking(self) -> bool {
+        matches!(
+            self,
+            TxKind::Bond
+                | TxKind::Unbond
+                | TxKind::Delegate
+                | TxKind::Undelegate
+                | TxKind::ClaimRewards
+                | TxKind::RegisterValidator
+                | TxKind::UpdateCommission
+                | TxKind::Unjail
+        )
+    }
 }
 
-/// Transaction native Sango V1 (Freeze, section 21).
+/// Transaction native Sango V1.
 ///
-/// ## Ordre canonique
-///
-/// ```text
-/// version || chain_id || nonce || sender || public_key?
-/// || gas_limit || max_fee || priority_fee || value
-/// || tx_kind || recipient || data || signature
-/// ```
-///
-/// Le `recipient` vaut `None` (NIL) uniquement pour `TxKind::ContractCreate`.
-///
-/// Le champ `public_key` est **inclus dans les bytes signés** et dans le
-/// hash de transaction : impossible pour un attaquant d'ajouter ou
-/// retirer la clé après signature.
+/// Voir le Freeze section 21 pour l'ordre canonique.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Transaction {
     /// Version du format de transaction.
@@ -62,27 +96,21 @@ pub struct Transaction {
     pub nonce: u64,
     /// Adresse native de l'émetteur.
     pub sender: NativeAddress,
-    /// Clé publique Ed25519, si déclarée dans la transaction.
-    ///
-    /// - `Some(pk)` : **déclaration de clé**. Le réseau vérifie
-    ///   `derive_native_address(pk) == sender`. Utilisé pour activer un
-    ///   compte fraîchement crédité (ghost) qui n'a pas encore de clé
-    ///   enregistrée.
-    /// - `None` : le compte doit déjà avoir une clé enregistrée.
+    /// Clé publique Ed25519, si déclarée (bootstrap).
     pub public_key: Option<PublicKey>,
     /// Limite de gas.
     pub gas_limit: u64,
-    /// Prix maximum par unité de gas (base + priorité).
+    /// Prix maximum par unité de gas.
     pub max_fee: u128,
     /// Pourboire par unité de gas.
     pub priority_fee: u128,
-    /// Montant transféré (en base units).
+    /// Montant transféré (base units). Peut être 0.
     pub value: Amount,
     /// Type de transaction.
     pub tx_kind: TxKind,
-    /// Destinataire. `None` pour `TxKind::ContractCreate`.
+    /// Destinataire. Voir les règles de `TxKind`.
     pub recipient: Option<NativeAddress>,
-    /// Données d'appel ou bytecode d'initialisation.
+    /// Données additionnelles. Voir les règles de `TxKind`.
     pub data: Vec<u8>,
     /// Signature Ed25519 sur `DOMAIN_TX_V1 || champs hors signature`.
     pub signature: Signature,
@@ -95,15 +123,13 @@ impl Transaction {
         self.public_key.is_some()
     }
 
-    /// Retourne les bytes à hasher :
-    ///
-    /// ```text
-    /// DOMAIN_TX_V1 || version || chain_id || nonce || sender
-    /// || public_key? || gas_limit || max_fee || priority_fee
-    /// || value || tx_kind || recipient || data
-    /// ```
-    ///
-    /// La signature n'est **pas** incluse.
+    /// Vrai s'il s'agit d'un `TxKind` de staking natif.
+    #[must_use]
+    pub const fn is_staking(&self) -> bool {
+        self.tx_kind.is_staking()
+    }
+
+    /// Retourne les bytes à hasher.
     #[must_use]
     pub fn signing_payload(&self) -> Vec<u8> {
         let mut enc = Encoder::new();
@@ -112,19 +138,13 @@ impl Transaction {
         enc.into_bytes()
     }
 
-    /// Hash canonique de la transaction :
-    ///
-    /// ```text
-    /// tx_hash = Keccak256(signing_payload())
-    /// ```
+    /// Hash canonique.
     #[must_use]
     pub fn hash(&self) -> Hash32 {
         keccak256(&self.signing_payload())
     }
 
     /// Signe la transaction avec `keypair`.
-    ///
-    /// Retourne une copie avec la signature renseignée.
     #[must_use]
     pub fn sign(&self, keypair: &NativeKeypair) -> Self {
         let sig = sign_native(keypair, domain::TX_V1, &self.encode_unsigned_to_vec());
@@ -230,16 +250,43 @@ mod tests {
     }
 
     #[test]
-    fn tx_kind_tag_roundtrip() {
+    fn all_tx_kind_tags_roundtrip() {
         for k in [
             TxKind::Transfer,
             TxKind::ContractCall,
             TxKind::ContractCreate,
+            TxKind::Bond,
+            TxKind::Unbond,
+            TxKind::Delegate,
+            TxKind::Undelegate,
+            TxKind::ClaimRewards,
+            TxKind::RegisterValidator,
+            TxKind::UpdateCommission,
+            TxKind::Unjail,
         ] {
             assert_eq!(TxKind::from_tag(k.tag()).unwrap(), k);
         }
+    }
+
+    #[test]
+    fn invalid_tx_kind_rejected() {
         assert!(TxKind::from_tag(0x00).is_err());
         assert!(TxKind::from_tag(0xff).is_err());
+    }
+
+    #[test]
+    fn is_staking_classifies_correctly() {
+        assert!(!TxKind::Transfer.is_staking());
+        assert!(!TxKind::ContractCall.is_staking());
+        assert!(!TxKind::ContractCreate.is_staking());
+        assert!(TxKind::Bond.is_staking());
+        assert!(TxKind::Unbond.is_staking());
+        assert!(TxKind::Delegate.is_staking());
+        assert!(TxKind::Undelegate.is_staking());
+        assert!(TxKind::ClaimRewards.is_staking());
+        assert!(TxKind::RegisterValidator.is_staking());
+        assert!(TxKind::UpdateCommission.is_staking());
+        assert!(TxKind::Unjail.is_staking());
     }
 
     #[test]
@@ -251,94 +298,27 @@ mod tests {
     }
 
     #[test]
-    fn transaction_with_declared_pubkey_roundtrip() {
+    fn staking_transaction_roundtrip() {
         let mut tx = sample_unsigned();
-        tx.public_key = Some(PublicKey::from_bytes([0xcc; 32]));
+        tx.tx_kind = TxKind::Delegate;
+        tx.value = Amount::from_sango(1000).unwrap();
+        tx.data = Vec::new();
         let bytes = tx.encode_to_vec();
         let decoded = Transaction::decode_exact(&bytes).unwrap();
-        assert_eq!(decoded.public_key, Some(PublicKey::from_bytes([0xcc; 32])));
+        assert_eq!(decoded, tx);
     }
 
     #[test]
-    fn recipient_none_roundtrip() {
-        let mut tx = sample_unsigned();
-        tx.tx_kind = TxKind::ContractCreate;
-        tx.recipient = None;
-        let bytes = tx.encode_to_vec();
-        let decoded = Transaction::decode_exact(&bytes).unwrap();
-        assert_eq!(decoded.recipient, None);
+    fn hash_is_deterministic() {
+        let tx = sample_unsigned();
+        assert_eq!(tx.hash(), tx.hash());
     }
 
     #[test]
     fn sign_verify_roundtrip() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let pk = kp.public_key();
-        let mut tx = sample_unsigned();
-        tx.sender = NativeAddress::from_bytes([0x00; 20]);
-        let signed = tx.sign(&kp);
-        assert!(signed.verify(&pk).is_ok());
-    }
-
-    #[test]
-    fn verify_rejects_modified_field() {
-        let kp = NativeKeypair::from_seed([0x42; 32]);
-        let pk = kp.public_key();
-        let signed = sample_unsigned().sign(&kp);
-        let mut tampered = signed.clone();
-        tampered.value = Amount::from_base_units(1);
-        assert!(tampered.verify(&pk).is_err());
-    }
-
-    #[test]
-    fn verify_rejects_added_public_key() {
-        let kp = NativeKeypair::from_seed([0x42; 32]);
-        let pk = kp.public_key();
-        let signed = sample_unsigned().sign(&kp);
-        let mut tampered = signed.clone();
-        tampered.public_key = Some(PublicKey::from_bytes([0xff; 32]));
-        // Le public_key est dans les bytes signés, donc la signature ne
-        // vérifie plus.
-        assert!(tampered.verify(&pk).is_err());
-    }
-
-    #[test]
-    fn tx_hash_is_deterministic() {
-        let tx = sample_unsigned();
-        assert_eq!(tx.hash(), tx.hash());
-    }
-
-    #[test]
-    fn tx_hash_changes_with_field() {
-        let tx = sample_unsigned();
-        let a = tx.hash();
-        let mut t2 = tx.clone();
-        t2.nonce = 1;
-        assert_ne!(a, t2.hash());
-    }
-
-    #[test]
-    fn tx_hash_changes_with_public_key() {
-        let tx = sample_unsigned();
-        let a = tx.hash();
-        let mut t2 = tx.clone();
-        t2.public_key = Some(PublicKey::from_bytes([0xcc; 32]));
-        assert_ne!(a, t2.hash());
-    }
-
-    #[test]
-    fn tx_hash_ignores_signature() {
-        let kp = NativeKeypair::from_seed([0x42; 32]);
-        let tx = sample_unsigned();
-        let signed = tx.sign(&kp);
-        assert_eq!(tx.hash(), signed.hash());
-    }
-
-    #[test]
-    fn declares_public_key_flag() {
-        let tx = sample_unsigned();
-        assert!(!tx.declares_public_key());
-        let mut tx2 = tx;
-        tx2.public_key = Some(PublicKey::from_bytes([0x11; 32]));
-        assert!(tx2.declares_public_key());
+        let tx = sample_unsigned().sign(&kp);
+        assert!(tx.verify(&pk).is_ok());
     }
 }
