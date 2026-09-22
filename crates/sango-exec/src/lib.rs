@@ -3,48 +3,42 @@
 //! ## Responsabilité
 //!
 //! Appliquer une transaction **déjà validée** à un état donné, et produire
-//! le résultat d'exécution :
-//!
-//! ```text
-//! ValidatedTransaction
-//!         ↓
-//!     sango-exec
-//!         ↓
-//!  ┌──────┴───────┐
-//!  │              │
-//!  ▼              ▼
-//! state          result (receipt, fees, burned)
-//! ```
-//!
-//! ## Position dans l'architecture
+//! le résultat d'exécution.
 //!
 //! ```text
 //! sango-tx       (stateless, validation)
 //!     ▲
 //!     │
-//! sango-exec     (application, mutations, fee accounting)
+//! sango-exec     (application, mutations, fee accounting, receipts)
 //!     │
 //!     ▼
 //! sango-state    (état canonique, SMT)
 //! ```
 //!
-//! `sango-exec` dépend de `sango-tx` et `sango-state`. **Ni `sango-tx` ni
-//! `sango-state` ne dépendent de `sango-exec`.**
+//! ## Points d'entrée
+//!
+//! - [`apply_transfer`] / [`apply_transfer_with_gas`] : une transaction.
+//! - [`apply_block_transfers`] : plusieurs transactions sans `BlockHeader`.
+//! - [`apply_block`] : bloc complet avec receipts et offre courante.
+//!
+//! ## Compteurs globaux
+//!
+//! `apply_block` agrège les frais brûlés et le gas consommé et effectue
+//! **un seul** appel à `add_burned` + `add_gas_used` par bloc. C'est plus
+//! efficace que des écritures par transaction.
 //!
 //! ## Atomicité
 //!
-//! L'application d'une transaction et l'application d'un bloc entier sont
-//! **atomiques** : en cas d'échec à n'importe quelle étape, l'état est
-//! restauré exactement comme avant l'appel.
+//! Tous les points d'entrée sont atomiques. En cas d'échec, l'état est
+//! restauré (snapshot + rollback).
 //!
 //! ## Extensions futures
 //!
-//! Ce crate accueillera également :
+//! Ce crate accueillera :
 //!
 //! - l'invocation EVM (`TX_CONTRACT_CALL`, `TX_CONTRACT_CREATE`) ;
 //! - les mutations de staking (`sango-staking`) ;
-//! - la génération de receipts (`sango-types::Receipt`) ;
-//! - le calcul des roots (`transaction_root`, `receipt_root`).
+//! - le `receipt_root` (MPT des receipts, à venir).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -53,9 +47,8 @@ mod apply;
 mod error;
 
 pub use apply::{
-    apply_block_transfers, apply_transfer, apply_transfer_with_gas, BlockApplyResult,
+    apply_block, apply_block_transfers, apply_transfer, apply_transfer_with_gas,
+    AppliedTransaction, BlockApplyResult, BlockExecutionResult, ExecutionContext,
     NATIVE_TRANSFER_GAS,
 };
 pub use error::ApplyError;
-
-pub use apply::AppliedTransaction;

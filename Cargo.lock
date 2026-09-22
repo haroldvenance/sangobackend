@@ -586,6 +586,7 @@ dependencies = [
  "rocksdb",
  "sango-codec",
  "sango-primitives",
+ "sango-state",
  "sango-types",
  "tempfile",
  "thiserror",

@@ -9,9 +9,6 @@ use thiserror::Error;
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ApplyError {
     /// Le `tx_kind` n'est pas géré par l'applier natif.
-    ///
-    /// Les `TX_CONTRACT_CALL` et `TX_CONTRACT_CREATE` seront traités par
-    /// la couche EVM (à venir).
     #[error("tx_kind {0:?} is not supported by the native applier")]
     UnsupportedTxKind(TxKind),
 
@@ -31,6 +28,10 @@ pub enum ApplyError {
     /// `gas_used * effective_gas_price` déborde `u128`.
     #[error("gas_used * effective_gas_price overflows u128")]
     TotalFeeOverflow,
+
+    /// La somme des `gas_used` d'un bloc déborde `u64`.
+    #[error("total_gas_used overflows u64")]
+    TotalGasUsedOverflow,
 
     /// Solde insuffisant au moment de l'application.
     #[error("insufficient balance at apply time: needed {needed}, available {available}")]
@@ -62,6 +63,15 @@ pub enum ApplyError {
         txs: usize,
         /// Nombre de validations.
         validated: usize,
+    },
+
+    /// `total_burned > initial_supply` : incohérence d'état.
+    #[error("current_supply underflow: initial {initial}, burned {burned}")]
+    CurrentSupplyUnderflow {
+        /// Offre initiale.
+        initial: u128,
+        /// Cumul brûlé.
+        burned: u128,
     },
 
     /// Erreur d'état sous-jacente.

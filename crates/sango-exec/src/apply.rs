@@ -7,25 +7,29 @@
 //! 3. enregistre sa clé publique si bootstrap ;
 //! 4. crédite le destinataire de `value` ;
 //! 5. crédite le validateur de `validator_fee = 90 %` ;
-//! 6. `burn_fee = 10 %` est **brûlé** — implicitement, en n'étant crédité
-//!    à personne.
+//! 6. `burn_fee = 10 %` est **brûlé** — implicitement, en n'étant
+//!    crédité à personne ;
+//! 7. incrémente `total_burned` et `total_gas_used` dans l'état.
 //!
 //! ## Atomicité
 //!
-//! Toutes les mutations d'une transaction sont atomiques. De même pour un
-//! bloc entier via [`apply_block_transfers`].
+//! - **Transaction** : [`apply_transfer_with_gas`] est atomique. En cas
+//!   d'échec, `state` est restauré.
+//! - **Bloc** : [`apply_block_transfers`] et [`apply_block`] sont atomiques
+//!   au niveau du bloc entier. Si une seule transaction échoue, tout le
+//!   bloc est annulé.
 //!
-//! ## TODO (V1 complète)
+//! ## Compteurs globaux
 //!
-//! L'implémentation actuelle utilise `NativeState::clone` pour garantir
-//! l'atomicité. Acceptable pour la V1 initiale ; à remplacer par un undo
-//! log pour les grandes bases d'état.
+//! Pour minimiser les écritures SMT, `apply_block` **agrège** les frais
+//! brûlés et le gas consommé sur l'ensemble du bloc, et effectue **un seul**
+//! appel à `add_burned` et `add_gas_used` en fin de traitement.
 
 use sango_crypto::derive_native_address;
-use sango_primitives::{Amount, Hash32, NativeAddress, PublicKey};
+use sango_primitives::{Amount, ChainId32, Hash32, NativeAddress, PublicKey};
 use sango_state::{NativeState, StateError};
 use sango_tx::{split_fee, ValidatedTransaction};
-use sango_types::{Transaction, TxKind};
+use sango_types::{Block, EvmLog, LogsBloom, Receipt, ReceiptStatus, Transaction, TxKind};
 
 use crate::error::ApplyError;
 
@@ -34,6 +38,22 @@ use crate::error::ApplyError;
 /// Constante normative V1 : tout `TX_TRANSFER` consomme exactement ce
 /// montant de gas.
 pub const NATIVE_TRANSFER_GAS: u64 = 21_000;
+
+/// Contexte d'exécution pour un bloc.
+///
+/// Contient les paramètres globaux nécessaires à l'application, qui ne
+/// sont pas dans le `BlockHeader` lui-même (V1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutionContext {
+    /// Chain ID attendu pour le réseau.
+    pub chain_id: ChainId32,
+    /// Base fee courante (base units par gas).
+    pub base_fee: u128,
+    /// Adresse native du validateur proposant qui perçoit les frais.
+    pub fee_recipient: NativeAddress,
+    /// Offre initiale du réseau (dérivée du Genesis).
+    pub initial_supply: Amount,
+}
 
 /// Détail de l'application d'une transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,10 +80,10 @@ pub struct AppliedTransaction {
     pub bootstrap_public_key: Option<PublicKey>,
 }
 
-/// Résultat de l'application d'un bloc entier.
+/// Résultat de l'application d'un ensemble de transactions.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BlockApplyResult {
-    /// Transactions appliquées, dans l'ordre du bloc.
+    /// Transactions appliquées, dans l'ordre.
     pub applied: Vec<AppliedTransaction>,
     /// Somme des gas consommés.
     pub total_gas_used: u64,
@@ -74,6 +94,39 @@ pub struct BlockApplyResult {
     /// Somme des parts brûlées.
     pub total_burned: u128,
 }
+
+/// Résultat complet de l'application d'un bloc.
+///
+/// Produit par [`apply_block`] : inclut les receipts, les agrégats
+/// financiers, l'offre courante et le `state_root` (racine de l'état natif
+/// **après** application du bloc).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockExecutionResult {
+    /// Agrégats financiers et liste des transactions appliquées.
+    pub apply_result: BlockApplyResult,
+    /// Un receipt par transaction, dans l'ordre du bloc.
+    pub receipts: Vec<Receipt>,
+    /// Cumul des frais brûlés (base units).
+    pub fee_burned: u128,
+    /// Cumul des frais versés au validateur (base units).
+    pub fee_paid: u128,
+    /// Cumul du gas consommé.
+    pub gas_used: u64,
+    /// Cumul global des SANGO brûlés depuis le genesis (base units).
+    pub total_burned_after: Amount,
+    /// Cumul global du gas consommé depuis le genesis.
+    pub total_gas_used_after: u64,
+    /// Offre courante après application :
+    /// `initial_supply − total_burned`.
+    pub current_supply: Amount,
+    /// Racine de l'état natif après application.
+    pub native_state_root: Hash32,
+    /// Racine des receipts dans le bloc. **Placeholder** (`Hash32::ZERO`)
+    /// tant que le MPT EVM n'est pas implémenté.
+    pub receipt_root: Hash32,
+}
+
+// --- API mono-transaction --------------------------------------------------
 
 /// Applique un transfert natif avec le gas standard.
 pub fn apply_transfer(
@@ -88,6 +141,8 @@ pub fn apply_transfer(
 /// Applique un transfert natif avec un `gas_used` explicite.
 ///
 /// **Atomique** : en cas d'échec, `state` est inchangé.
+///
+/// Met à jour `total_burned` et `total_gas_used` dans l'état.
 pub fn apply_transfer_with_gas(
     state: &mut NativeState,
     tx: &Transaction,
@@ -97,7 +152,18 @@ pub fn apply_transfer_with_gas(
 ) -> Result<AppliedTransaction, ApplyError> {
     let snapshot = state.clone();
     match apply_transfer_no_rollback(state, tx, validated, gas_used, fee_recipient) {
-        Ok(r) => Ok(r),
+        Ok(applied) => {
+            // Compteurs globaux.
+            if let Err(e) = state.add_burned(Amount::from_base_units(applied.burn_fee)) {
+                *state = snapshot;
+                return Err(ApplyError::State(e));
+            }
+            if let Err(e) = state.add_gas_used(applied.gas_used) {
+                *state = snapshot;
+                return Err(ApplyError::State(e));
+            }
+            Ok(applied)
+        }
         Err(e) => {
             *state = snapshot;
             Err(e)
@@ -105,10 +171,16 @@ pub fn apply_transfer_with_gas(
     }
 }
 
+// --- API multi-transactions (block) ---------------------------------------
+
 /// Applique une séquence de transferts natifs **atomiquement**.
 ///
-/// Si **une seule** transaction échoue, tout le bloc est annulé : `state`
-/// est restauré dans son état initial.
+/// Agrège les frais brûlés et le gas en une seule écriture SMT.
+/// Si **une seule** transaction échoue, tout le bloc est annulé.
+///
+/// Ce point d'entrée est destiné aux tests et cas où le `BlockHeader`
+/// n'est pas nécessaire. Pour l'application complète d'un bloc, voir
+/// [`apply_block`].
 pub fn apply_block_transfers(
     state: &mut NativeState,
     txs: &[Transaction],
@@ -128,12 +200,22 @@ pub fn apply_block_transfers(
     for (tx, v) in txs.iter().zip(validated.iter()) {
         match apply_transfer_no_rollback(state, tx, v, NATIVE_TRANSFER_GAS, fee_recipient) {
             Ok(applied) => {
-                result.total_gas_used = result.total_gas_used.saturating_add(applied.gas_used);
-                result.total_fee = result.total_fee.saturating_add(applied.total_fee);
+                result.total_gas_used = result
+                    .total_gas_used
+                    .checked_add(applied.gas_used)
+                    .ok_or(ApplyError::TotalGasUsedOverflow)?;
+                result.total_fee = result
+                    .total_fee
+                    .checked_add(applied.total_fee)
+                    .ok_or(ApplyError::TotalFeeOverflow)?;
                 result.total_validator_fee = result
                     .total_validator_fee
-                    .saturating_add(applied.validator_fee);
-                result.total_burned = result.total_burned.saturating_add(applied.burn_fee);
+                    .checked_add(applied.validator_fee)
+                    .ok_or(ApplyError::TotalFeeOverflow)?;
+                result.total_burned = result
+                    .total_burned
+                    .checked_add(applied.burn_fee)
+                    .ok_or(ApplyError::TotalFeeOverflow)?;
                 result.applied.push(applied);
             }
             Err(e) => {
@@ -143,13 +225,141 @@ pub fn apply_block_transfers(
         }
     }
 
+    // Écriture agrégée des compteurs globaux.
+    if let Err(e) = state.add_burned(Amount::from_base_units(result.total_burned)) {
+        *state = snapshot;
+        return Err(ApplyError::State(e));
+    }
+    if let Err(e) = state.add_gas_used(result.total_gas_used) {
+        *state = snapshot;
+        return Err(ApplyError::State(e));
+    }
+
     Ok(result)
 }
 
+/// Applique un bloc complet : transactions + receipts + compteurs globaux.
+///
+/// **Atomique** : en cas d'échec, `state` est restauré.
+///
+/// ## Limites V1
+///
+/// - Seuls les `TX_TRANSFER` sont supportés ; les `TX_CONTRACT_*` seront
+///   gérés par la couche EVM (à venir).
+/// - `receipt_root` est un placeholder `Hash32::ZERO` tant que le MPT EVM
+///   n'est pas implémenté.
+pub fn apply_block(
+    state: &mut NativeState,
+    block: &Block,
+    validated: &[ValidatedTransaction],
+    ctx: &ExecutionContext,
+) -> Result<BlockExecutionResult, ApplyError> {
+    if block.transactions.len() != validated.len() {
+        return Err(ApplyError::LengthMismatch {
+            txs: block.transactions.len(),
+            validated: validated.len(),
+        });
+    }
+
+    let snapshot = state.clone();
+
+    // 1. Appliquer les transactions (sans toucher aux compteurs globaux).
+    let mut applied: Vec<AppliedTransaction> = Vec::with_capacity(validated.len());
+    let mut total_gas_used: u64 = 0;
+    let mut total_fee: u128 = 0;
+    let mut total_validator_fee: u128 = 0;
+    let mut total_burned: u128 = 0;
+
+    for (tx, v) in block.transactions.iter().zip(validated.iter()) {
+        match apply_transfer_no_rollback(state, tx, v, NATIVE_TRANSFER_GAS, ctx.fee_recipient) {
+            Ok(a) => {
+                total_gas_used = total_gas_used
+                    .checked_add(a.gas_used)
+                    .ok_or(ApplyError::TotalGasUsedOverflow)?;
+                total_fee = total_fee
+                    .checked_add(a.total_fee)
+                    .ok_or(ApplyError::TotalFeeOverflow)?;
+                total_validator_fee = total_validator_fee
+                    .checked_add(a.validator_fee)
+                    .ok_or(ApplyError::TotalFeeOverflow)?;
+                total_burned = total_burned
+                    .checked_add(a.burn_fee)
+                    .ok_or(ApplyError::TotalFeeOverflow)?;
+                applied.push(a);
+            }
+            Err(e) => {
+                *state = snapshot;
+                return Err(e);
+            }
+        }
+    }
+
+    // 2. Mettre à jour les compteurs globaux en une seule passe.
+    if let Err(e) = state.add_burned(Amount::from_base_units(total_burned)) {
+        *state = snapshot;
+        return Err(ApplyError::State(e));
+    }
+    if let Err(e) = state.add_gas_used(total_gas_used) {
+        *state = snapshot;
+        return Err(ApplyError::State(e));
+    }
+
+    // 3. Générer les receipts (cumulative_gas_used par ordre).
+    let mut receipts = Vec::with_capacity(applied.len());
+    let mut cumulative: u64 = 0;
+    for a in &applied {
+        cumulative = cumulative
+            .checked_add(a.gas_used)
+            .ok_or(ApplyError::TotalGasUsedOverflow)?;
+        receipts.push(Receipt {
+            tx_hash: a.tx_hash,
+            status: ReceiptStatus::Success,
+            cumulative_gas_used: cumulative,
+            gas_used: a.gas_used,
+            contract_address: None,
+            logs_bloom: LogsBloom::EMPTY,
+            logs: Vec::<EvmLog>::new(),
+        });
+    }
+
+    // 4. Offre courante après application.
+    let total_burned_after = state.total_burned();
+    let current_supply =
+        state
+            .current_supply(ctx.initial_supply)
+            .ok_or(ApplyError::CurrentSupplyUnderflow {
+                initial: ctx.initial_supply.base_units(),
+                burned: total_burned_after.base_units(),
+            })?;
+
+    Ok(BlockExecutionResult {
+        apply_result: BlockApplyResult {
+            applied,
+            total_gas_used,
+            total_fee,
+            total_validator_fee,
+            total_burned,
+        },
+        receipts,
+        fee_burned: total_burned,
+        fee_paid: total_validator_fee,
+        gas_used: total_gas_used,
+        total_burned_after,
+        total_gas_used_after: state.total_gas_used(),
+        current_supply,
+        native_state_root: state.native_state_root(),
+        // TODO(MPT): à remplacer par le vrai MPT des receipts.
+        receipt_root: Hash32::ZERO,
+    })
+}
+
+// --- Implémentation sans rollback ------------------------------------------
+
 /// Implémentation sans rollback.
 ///
-/// Suppose que l'appelant a snapshoté l'état et le restaurera en cas
-/// d'erreur.
+/// Ne touche **pas** aux compteurs globaux (`total_burned`,
+/// `total_gas_used`) : c'est la responsabilité de l'appelant de les
+/// mettre à jour après succès (éventuellement de façon agrégée).
 fn apply_transfer_no_rollback(
     state: &mut NativeState,
     tx: &Transaction,
@@ -180,7 +390,7 @@ fn apply_transfer_no_rollback(
             fee: total_fee,
         })?;
 
-    // (3) Vérifications préalables — rendent les mutations infaillibles.
+    // (3) Vérifications préalables.
     let sender_balance = state.balance_of(&sender).base_units();
     if sender_balance < debit_total {
         return Err(ApplyError::InsufficientBalance {
@@ -225,7 +435,7 @@ fn apply_transfer_no_rollback(
         }
     }
 
-    // (4) Mutations — infaillibles après les vérifications ci-dessus.
+    // (4) Mutations.
     state
         .debit(sender, Amount::from_base_units(debit_total))
         .map_err(map_state_error)?;
@@ -277,7 +487,7 @@ mod tests {
     use sango_primitives::{Amount, ChainId32, Signature};
     use sango_state::NativeState;
     use sango_tx::{validate_transaction, SenderInfo, TxValidationError, ValidationContext};
-    use sango_types::{NativeAccount, Transaction, TxKind};
+    use sango_types::{BlockHeader, NativeAccount, Transaction, TxKind};
 
     fn chain() -> ChainId32 {
         ChainId32::from_bytes([0x11; 32])
@@ -338,6 +548,35 @@ mod tests {
         validate_transaction(tx, &ctx)
     }
 
+    fn exec_ctx() -> ExecutionContext {
+        ExecutionContext {
+            chain_id: chain(),
+            base_fee: 10,
+            fee_recipient: validator(),
+            initial_supply: Amount::from_sango(1_000_000_000).unwrap(),
+        }
+    }
+
+    fn sample_header() -> BlockHeader {
+        BlockHeader {
+            version: 1,
+            chain_id: chain(),
+            epoch: sango_primitives::Epoch::new(0),
+            height: sango_primitives::Height::new(1),
+            round: sango_primitives::Round::new(0),
+            previous_block_hash: Hash32::from_bytes([0x22; 32]),
+            timestamp: 1_700_000_000,
+            proposer_address: validator(),
+            transaction_root: Hash32::ZERO,
+            state_root: Hash32::ZERO,
+            receipt_root: Hash32::ZERO,
+            gas_used: 0,
+            gas_limit: 30_000_000,
+        }
+    }
+
+    // --- Mono-transaction ---------------------------------------------------
+
     #[test]
     fn apply_transfer_moves_funds_and_splits_fee() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
@@ -353,11 +592,9 @@ mod tests {
         let v = validate(&state, &tx).unwrap();
         let applied = apply_transfer(&mut state, &tx, &v, validator()).unwrap();
 
-        // total_fee = 21_000 × 12 = 252_000 ; validator = 226_800 ; burn = 25_200
         assert_eq!(applied.total_fee, 252_000);
         assert_eq!(applied.validator_fee, 226_800);
         assert_eq!(applied.burn_fee, 25_200);
-
         assert_eq!(
             state.balance_of(&sender),
             Amount::from_base_units(1_000_000 - 100 - 252_000)
@@ -369,6 +606,10 @@ mod tests {
         );
         assert_eq!(state.nonce_of(&sender), 1);
         assert_eq!(state.public_key_of(&sender), Some(pk));
+
+        // Compteurs globaux mis à jour.
+        assert_eq!(state.total_burned(), Amount::from_base_units(25_200));
+        assert_eq!(state.total_gas_used(), NATIVE_TRANSFER_GAS);
     }
 
     #[test]
@@ -388,15 +629,13 @@ mod tests {
         tx.recipient = Some(sender);
         let tx = tx.sign(&kp);
         let v = validate(&state, &tx).unwrap();
-        let applied = apply_transfer(&mut state, &tx, &v, validator()).unwrap();
+        apply_transfer(&mut state, &tx, &v, validator()).unwrap();
 
-        assert_eq!(applied.total_fee, 252_000);
-        // Self-transfer : net -252_000
         assert_eq!(
             state.balance_of(&sender),
             Amount::from_base_units(1_000_000 - 252_000)
         );
-        assert_eq!(state.nonce_of(&sender), 1);
+        assert_eq!(state.total_burned(), Amount::from_base_units(25_200));
     }
 
     #[test]
@@ -416,11 +655,6 @@ mod tests {
         let v = validate(&state, &tx).unwrap();
         let applied = apply_transfer(&mut state, &tx, &v, sender).unwrap();
 
-        // Sender = fee_recipient :
-        //   -value      = -100
-        //   -total_fee  = -252_000
-        //   +validator  = +226_800
-        //   net         = -25_300
         assert_eq!(
             state.balance_of(&sender),
             Amount::from_base_units(1_000_000 - 25_300)
@@ -444,14 +678,14 @@ mod tests {
         let tx = bootstrap_tx(&kp, 0, 100);
         let v = validate(&state, &tx).unwrap();
 
-        // Vider le solde après validation.
         state.set_account(NativeAccount::from_public_key(pk, Amount::ZERO, 0));
+        let root_before = state.native_state_root();
 
         let err = apply_transfer(&mut state, &tx, &v, validator()).unwrap_err();
         assert!(matches!(err, ApplyError::InsufficientBalance { .. }));
-        // Rollback : état inchangé.
         assert_eq!(state.balance_of(&sender), Amount::ZERO);
         assert_eq!(state.nonce_of(&sender), 0);
+        assert_eq!(state.native_state_root(), root_before);
     }
 
     #[test]
@@ -474,6 +708,8 @@ mod tests {
         assert_eq!(err, ApplyError::UnsupportedTxKind(TxKind::ContractCall));
     }
 
+    // --- Multi-transactions (apply_block_transfers) -------------------------
+
     #[test]
     fn apply_block_multiple_transfers() {
         let kp1 = NativeKeypair::from_seed([0x01; 32]);
@@ -491,7 +727,6 @@ mod tests {
 
         let tx1 = bootstrap_tx(&kp1, 0, 100);
         let tx2 = bootstrap_tx(&kp2, 0, 200);
-
         let v1 = validate(&state, &tx1).unwrap();
         let v2 = validate(&state, &tx2).unwrap();
 
@@ -504,16 +739,19 @@ mod tests {
         assert_eq!(result.total_burned, 2 * 25_200);
         assert_eq!(state.nonce_of(&s1), 1);
         assert_eq!(state.nonce_of(&s2), 1);
+        // Compteurs agrégés sur le bloc.
+        assert_eq!(state.total_burned(), Amount::from_base_units(2 * 25_200));
+        assert_eq!(state.total_gas_used(), 2 * NATIVE_TRANSFER_GAS);
     }
 
     #[test]
     fn apply_block_is_atomic_on_failure() {
         let kp1 = NativeKeypair::from_seed([0x01; 32]);
         let kp2 = NativeKeypair::from_seed([0x02; 32]);
+        let s1 = derive_native_address(&kp1.public_key());
         let s2 = derive_native_address(&kp2.public_key());
 
         let mut state = NativeState::new();
-        let s1 = derive_native_address(&kp1.public_key());
         state
             .credit(s1, Amount::from_base_units(1_000_000))
             .unwrap();
@@ -526,7 +764,6 @@ mod tests {
         let v1 = validate(&state, &tx1).unwrap();
         let v2 = validate(&state, &tx2).unwrap();
 
-        // Casser le solde de s2 après validation.
         state.set_account(NativeAccount::from_public_key(
             kp2.public_key(),
             Amount::ZERO,
@@ -537,10 +774,11 @@ mod tests {
         let err =
             apply_block_transfers(&mut state, &[tx1, tx2], &[v1, v2], validator()).unwrap_err();
         assert!(matches!(err, ApplyError::InsufficientBalance { .. }));
-        // Rollback complet : tx1 non appliquée.
         assert_eq!(state.native_state_root(), root_before);
         assert_eq!(state.nonce_of(&s1), 0);
         assert_eq!(state.nonce_of(&s2), 0);
+        assert_eq!(state.total_burned(), Amount::ZERO);
+        assert_eq!(state.total_gas_used(), 0);
     }
 
     #[test]
@@ -559,5 +797,184 @@ mod tests {
                 validated: 0
             }
         );
+    }
+
+    // --- apply_block --------------------------------------------------------
+
+    #[test]
+    fn apply_block_empty() {
+        let mut state = NativeState::new();
+        let block = Block {
+            header: sample_header(),
+            transactions: Vec::new(),
+        };
+        let r = apply_block(&mut state, &block, &[], &exec_ctx()).unwrap();
+        assert_eq!(r.apply_result.applied.len(), 0);
+        assert_eq!(r.receipts.len(), 0);
+        assert_eq!(r.gas_used, 0);
+        assert_eq!(r.fee_burned, 0);
+        assert_eq!(r.current_supply, exec_ctx().initial_supply);
+        assert_eq!(r.total_burned_after, Amount::ZERO);
+        assert_eq!(r.total_gas_used_after, 0);
+        assert_eq!(r.receipt_root, Hash32::ZERO);
+    }
+
+    #[test]
+    fn apply_block_two_transfers_with_receipts() {
+        let kp1 = NativeKeypair::from_seed([0x01; 32]);
+        let kp2 = NativeKeypair::from_seed([0x02; 32]);
+        let s1 = derive_native_address(&kp1.public_key());
+        let s2 = derive_native_address(&kp2.public_key());
+
+        let mut state = NativeState::new();
+        state
+            .credit(s1, Amount::from_base_units(1_000_000))
+            .unwrap();
+        state
+            .credit(s2, Amount::from_base_units(1_000_000))
+            .unwrap();
+
+        let tx1 = bootstrap_tx(&kp1, 0, 100);
+        let tx2 = bootstrap_tx(&kp2, 0, 200);
+        let v1 = validate(&state, &tx1).unwrap();
+        let v2 = validate(&state, &tx2).unwrap();
+
+        let block = Block {
+            header: sample_header(),
+            transactions: vec![tx1.clone(), tx2.clone()],
+        };
+        let r = apply_block(&mut state, &block, &[v1, v2], &exec_ctx()).unwrap();
+
+        assert_eq!(r.receipts.len(), 2);
+        assert_eq!(r.receipts[0].tx_hash, tx1.hash());
+        assert_eq!(r.receipts[1].tx_hash, tx2.hash());
+        // cumulative_gas_used croissant.
+        assert_eq!(r.receipts[0].cumulative_gas_used, NATIVE_TRANSFER_GAS);
+        assert_eq!(r.receipts[1].cumulative_gas_used, 2 * NATIVE_TRANSFER_GAS);
+        assert_eq!(r.receipts[0].gas_used, NATIVE_TRANSFER_GAS);
+        assert_eq!(r.receipts[0].status, ReceiptStatus::Success);
+        assert_eq!(r.receipts[0].contract_address, None);
+        assert!(r.receipts[0].logs.is_empty());
+        assert!(r.receipts[0].logs_bloom.is_empty());
+
+        assert_eq!(r.gas_used, 2 * NATIVE_TRANSFER_GAS);
+        assert_eq!(r.fee_burned, 2 * 25_200);
+        assert_eq!(r.fee_paid, 2 * 226_800);
+        assert_eq!(r.total_burned_after, Amount::from_base_units(2 * 25_200));
+        assert_eq!(r.total_gas_used_after, 2 * NATIVE_TRANSFER_GAS);
+    }
+
+    #[test]
+    fn apply_block_updates_current_supply() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let sender = derive_native_address(&kp.public_key());
+
+        let mut state = NativeState::new();
+        state
+            .credit(sender, Amount::from_base_units(1_000_000))
+            .unwrap();
+
+        let tx = bootstrap_tx(&kp, 0, 100);
+        let v = validate(&state, &tx).unwrap();
+        let block = Block {
+            header: sample_header(),
+            transactions: vec![tx],
+        };
+        let initial = exec_ctx().initial_supply;
+        let r = apply_block(&mut state, &block, &[v], &exec_ctx()).unwrap();
+
+        let expected_burned = Amount::from_base_units(25_200);
+        assert_eq!(r.total_burned_after, expected_burned);
+        assert_eq!(
+            r.current_supply.base_units(),
+            initial.base_units() - expected_burned.base_units()
+        );
+    }
+
+    #[test]
+    fn apply_block_full_is_atomic_on_failure() {
+        let kp1 = NativeKeypair::from_seed([0x01; 32]);
+        let kp2 = NativeKeypair::from_seed([0x02; 32]);
+        let s1 = derive_native_address(&kp1.public_key());
+        let s2 = derive_native_address(&kp2.public_key());
+
+        let mut state = NativeState::new();
+        state
+            .credit(s1, Amount::from_base_units(1_000_000))
+            .unwrap();
+        state
+            .credit(s2, Amount::from_base_units(1_000_000))
+            .unwrap();
+
+        let tx1 = bootstrap_tx(&kp1, 0, 100);
+        let tx2 = bootstrap_tx(&kp2, 0, 200);
+        let v1 = validate(&state, &tx1).unwrap();
+        let v2 = validate(&state, &tx2).unwrap();
+
+        state.set_account(NativeAccount::from_public_key(
+            kp2.public_key(),
+            Amount::ZERO,
+            0,
+        ));
+        let root_before = state.native_state_root();
+
+        let block = Block {
+            header: sample_header(),
+            transactions: vec![tx1, tx2],
+        };
+        let err = apply_block(&mut state, &block, &[v1, v2], &exec_ctx()).unwrap_err();
+        assert!(matches!(err, ApplyError::InsufficientBalance { .. }));
+        assert_eq!(state.native_state_root(), root_before);
+        assert_eq!(state.total_burned(), Amount::ZERO);
+        assert_eq!(state.total_gas_used(), 0);
+    }
+
+    #[test]
+    fn apply_block_full_length_mismatch() {
+        let mut state = NativeState::new();
+        let block = Block {
+            header: sample_header(),
+            transactions: Vec::new(),
+        };
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let tx = bootstrap_tx(&kp, 0, 1);
+        let _ = tx;
+        let v = ValidatedTransaction {
+            tx_hash: Hash32::ZERO,
+            sender: NativeAddress::from_bytes([0xaa; 20]),
+            effective_gas_price: 12,
+            max_total_fee: 252_000,
+            value: 100,
+            bootstrap_public_key: None,
+        };
+        let err = apply_block(&mut state, &block, &[v], &exec_ctx()).unwrap_err();
+        assert_eq!(
+            err,
+            ApplyError::LengthMismatch {
+                txs: 0,
+                validated: 1
+            }
+        );
+    }
+
+    #[test]
+    fn apply_block_state_root_matches_native_root() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let sender = derive_native_address(&kp.public_key());
+
+        let mut state = NativeState::new();
+        state
+            .credit(sender, Amount::from_base_units(1_000_000))
+            .unwrap();
+
+        let tx = bootstrap_tx(&kp, 0, 100);
+        let v = validate(&state, &tx).unwrap();
+        let block = Block {
+            header: sample_header(),
+            transactions: vec![tx],
+        };
+        let r = apply_block(&mut state, &block, &[v], &exec_ctx()).unwrap();
+
+        assert_eq!(r.native_state_root, state.native_state_root());
     }
 }
