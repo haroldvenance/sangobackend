@@ -25,9 +25,12 @@ license = "Apache-2.0"
 authors = ["Sango Contributors"]
 repository = "https://github.com/sango/sango"
 
-
 [workspace.dependencies]
 thiserror = "2"
 hex = "0.4"
 hex-literal = "0.4"
+
 sango-primitives = { path = "crates/sango-primitives" }
+sango-codec = { path = "crates/sango-codec" }
+sango-crypto = { path = "crates/sango-crypto" }
+sango-types = { path = "crates/sango-types" }

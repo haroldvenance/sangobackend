@@ -150,3 +150,22 @@ fn u64_le_byte_order() {
     let bytes = 0x0102030405060708u64.encode_to_vec();
     assert_eq!(bytes, vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
 }
+
+#[test]
+fn roundtrip_bool() {
+    roundtrip(&false);
+    roundtrip(&true);
+}
+
+#[test]
+fn bool_encoding_is_one_byte() {
+    assert_eq!(false.encode_to_vec(), vec![0x00]);
+    assert_eq!(true.encode_to_vec(), vec![0x01]);
+}
+
+#[test]
+fn reject_invalid_bool_tag() {
+    let bytes = [0x02];
+    let err = bool::decode_exact(&bytes).unwrap_err();
+    assert!(matches!(err, CodecError::InvalidTag { tag: 2 }));
+}

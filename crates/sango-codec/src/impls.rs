@@ -188,3 +188,26 @@ impl Decode for Amount {
         Ok(Self::from_base_units(dec.read_u128_le()?))
     }
 }
+
+// --- Clés et signatures -----------------------------------------------------
+
+impl_fixed_bytes!(sango_primitives::PublicKey, 32);
+impl_fixed_bytes!(sango_primitives::Signature, 64);
+
+// --- Booléens (tag u8 : 0 = false, 1 = true) --------------------------------
+
+impl Encode for bool {
+    fn encode(&self, enc: &mut Encoder) {
+        enc.write_u8(u8::from(*self));
+    }
+}
+
+impl Decode for bool {
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, CodecError> {
+        match dec.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(CodecError::InvalidTag { tag: other }),
+        }
+    }
+}

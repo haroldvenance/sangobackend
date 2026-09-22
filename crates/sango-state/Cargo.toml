@@ -7,3 +7,8 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+thiserror.workspace = true
+sango-primitives.workspace = true
+sango-codec.workspace = true
+sango-crypto.workspace = true
+sango-types.workspace = true

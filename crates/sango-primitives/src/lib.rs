@@ -8,6 +8,7 @@
 //! - adresses : [`NativeAddress`], [`EvmAddress`]
 //! - numériques : [`Height`], [`Round`], [`Epoch`]
 //! - montants : [`Amount`]
+//! - clés et signatures : [`PublicKey`], [`Signature`]
 //!
 //! Voir `SANGO PROTOCOL FREEZE V1` pour les règles normatives.
 
@@ -20,6 +21,7 @@ mod bytes;
 mod chain_id;
 mod error;
 mod hash;
+mod keys;
 mod numeric;
 
 pub use address::{EvmAddress, NativeAddress};
@@ -27,4 +29,5 @@ pub use amount::{Amount, BASE_UNITS_PER_SANGO, MAX_SUPPLY_BASE};
 pub use chain_id::{ChainId32, EvmChainId};
 pub use error::PrimitiveError;
 pub use hash::Hash32;
+pub use keys::{PublicKey, Signature};
 pub use numeric::{Epoch, Height, Round};
