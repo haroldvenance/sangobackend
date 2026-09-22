@@ -509,6 +509,12 @@ dependencies = [
 [[package]]
 name = "sango-consensus"
 version = "0.1.0"
+dependencies = [
+ "sango-crypto",
+ "sango-primitives",
+ "sango-types",
+ "thiserror",
+]
 
 [[package]]
 name = "sango-crypto"
