@@ -7,3 +7,12 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+thiserror.workspace = true
+sango-primitives.workspace = true
+sango-codec.workspace = true
+sango-types.workspace = true
+
+rocksdb = { version = "0.24", default-features = false, features = ["lz4"] }
+
+[dev-dependencies]
+tempfile = "3"

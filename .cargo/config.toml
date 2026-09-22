@@ -1,0 +1,11 @@
+# Configuration Cargo locale au workspace Sango.
+#
+# Utilise la bibliothèque RocksDB installée sur le système
+# (`librocksdb-dev`) au lieu de compiler la version vendorisée.
+#
+# Voir : https://github.com/rust-rocksdb/rust-rocksdb
+# `librocksdb-sys` honore ROCKSDB_LIB_DIR et ROCKSDB_INCLUDE_DIR.
+
+[env]
+ROCKSDB_LIB_DIR = "/usr/lib/x86_64-linux-gnu"
+ROCKSDB_INCLUDE_DIR = "/usr/include"
