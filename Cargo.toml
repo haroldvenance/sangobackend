@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sango-primitives",
+    "crates/sango-crypto",
+    "crates/sango-codec",
+    "crates/sango-types",
+    "crates/sango-state",
+    "crates/sango-storage",
+    "crates/sango-tx",
+    "crates/sango-mempool",
+    "crates/sango-evm",
+    "crates/sango-staking",
+    "crates/sango-consensus",
+    "crates/sango-p2p",
+    "crates/sango-rpc",
+    "crates/sango-node",
+    "crates/sango-wallet",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Sango Contributors"]
+repository = "https://github.com/sango/sango"
+
+[workspace.dependencies]
+# Sera complété au fur et à mesure.
