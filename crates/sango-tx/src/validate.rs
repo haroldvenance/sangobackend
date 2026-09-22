@@ -50,6 +50,10 @@ pub struct SenderInfo {
     /// Adresse native du compte émetteur.
     pub address: NativeAddress,
     /// Clé publique Ed25519 du compte émetteur.
+    ///
+    /// `PublicKey::ZERO` signifie « clé non enregistrée » ; dans ce cas
+    /// [`validate_signature`] rejette la transaction avec
+    /// [`TxValidationError::PublicKeyNotRegistered`].
     pub public_key: PublicKey,
     /// Solde disponible en base units.
     pub balance: u128,
@@ -61,7 +65,7 @@ impl SenderInfo {
     /// Construit un `SenderInfo` à partir d'une clé publique et d'un état.
     ///
     /// L'adresse est dérivée automatiquement — impossible de fournir une
-    /// adresse incohérente.
+    /// adresse incohérente avec la clé publique.
     #[must_use]
     pub fn from_public_key(public_key: PublicKey, balance: u128, nonce: u64) -> Self {
         let address = derive_native_address(&public_key);
@@ -183,25 +187,33 @@ pub fn validate_chain_id(tx: &Transaction, expected: ChainId32) -> Result<(), Tx
 
 /// Vérifie la signature et la cohérence de [`SenderInfo`].
 ///
-/// Trois contrôles, dans cet ordre :
+/// Quatre contrôles, dans cet ordre :
 ///
+/// 0. `sender.public_key != PublicKey::ZERO` — la clé publique est bien
+///    enregistrée (rejette les comptes « fantômes ») ;
 /// 1. `sender.address == tx.sender` — le `SenderInfo` fourni par l'appelant
-///    correspond bien à la transaction ;
+///    correspond à la transaction ;
 /// 2. `derive_native_address(&sender.public_key) == tx.sender` — la clé
-///    publique fournie dérive bien vers l'adresse déclarée ;
+///    publique dérive vers l'adresse déclarée ;
 /// 3. signature Ed25519 valide sur `DOMAIN_TX_V1 || champs`.
 ///
-/// **Les trois sont obligatoires.** Sans (1), un appelant pourrait fournir
-/// des informations incohérentes avec la tx. Sans (2), un attaquant pourrait
-/// signer avec sa clé tout en déclarant `sender = victime`. Sans (3), la
-/// preuve de possession de la clé privée est absente.
+/// **Les quatre sont obligatoires.** Sans (0), une clé `ZERO` serait
+/// traitée comme une clé valide. Sans (1), un appelant pourrait fournir des
+/// informations incohérentes. Sans (2), un attaquant pourrait signer avec sa
+/// clé tout en déclarant `sender = victime`. Sans (3), la preuve de
+/// possession de la clé privée est absente.
 pub fn validate_signature(tx: &Transaction, sender: &SenderInfo) -> Result<(), TxValidationError> {
-    // (1) Cohérence SenderInfo ↔ tx.
+    // (0) La clé publique du compte doit être enregistrée.
+    if sender.public_key.is_zero() {
+        return Err(TxValidationError::PublicKeyNotRegistered);
+    }
+
+    // (1) Cohérence SenderInfo <-> tx.
     if sender.address != tx.sender {
         return Err(TxValidationError::SenderInfoAddressMismatch);
     }
 
-    // (2) Cohérence clé publique ↔ adresse déclarée.
+    // (2) Cohérence clé publique <-> adresse déclarée.
     let derived = derive_native_address(&sender.public_key);
     if derived != tx.sender {
         return Err(TxValidationError::PublicKeyDoesNotMatchSender);
@@ -434,8 +446,6 @@ mod tests {
     fn signature_rejects_sender_info_address_mismatch() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let (tx, mut info) = signed_transfer(&kp, 0, 100, 1_000_000);
-        // On modifie l'adresse déclarée dans SenderInfo (ne correspond plus
-        // au champ `sender` de la tx).
         info.address = NativeAddress::from_bytes([0xff; 20]);
         assert_eq!(
             validate_signature(&tx, &info),
@@ -448,9 +458,8 @@ mod tests {
         let kp1 = NativeKeypair::from_seed([0x42; 32]);
         let kp2 = NativeKeypair::from_seed([0x43; 32]);
         let (tx, mut info) = signed_transfer(&kp1, 0, 100, 1_000_000);
-        // On remplace la clé publique par une autre : l'adresse déclarée
-        // dans SenderInfo reste celle de kp1 (pour ne pas déclencher
-        // SenderInfoAddressMismatch), mais derive(pk2) != tx.sender.
+        // On remplace la clé publique par celle de kp2 (non-ZERO), mais
+        // l'adresse déclarée reste celle de kp1.
         info.public_key = kp2.public_key();
         assert_eq!(
             validate_signature(&tx, &info),
@@ -466,6 +475,17 @@ mod tests {
         assert_eq!(
             validate_signature(&tx, &info),
             Err(TxValidationError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn signature_rejects_unregistered_public_key() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let (tx, mut info) = signed_transfer(&kp, 0, 100, 1_000_000);
+        info.public_key = PublicKey::ZERO;
+        assert_eq!(
+            validate_signature(&tx, &info),
+            Err(TxValidationError::PublicKeyNotRegistered)
         );
     }
 
@@ -497,7 +517,6 @@ mod tests {
     fn fee_ok() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let (tx, _) = signed_transfer(&kp, 0, 100, 1_000_000);
-        // max_fee=20, priority=2, base_fee=10 → min(20, 12) = 12
         assert_eq!(validate_fee(&tx, 10).unwrap(), 12);
     }
 

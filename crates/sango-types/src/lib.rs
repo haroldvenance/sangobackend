@@ -9,7 +9,7 @@
 //! - messages consensus : [`Proposal`], [`Prevote`], [`Precommit`] ;
 //! - certificats : [`PrevoteCertificate`], [`CommitCertificate`] ;
 //! - [`Evidence`] ;
-//! - [`Account`] natif ;
+//! - [`NativeAccount`] ;
 //! - [`Genesis`] et ses sous-configurations.
 //!
 //! Tous les hashes et signatures utilisent :
@@ -32,7 +32,7 @@ mod header;
 mod receipt;
 mod transaction;
 
-pub use account::Account;
+pub use account::NativeAccount;
 pub use block::Block;
 pub use consensus::{
     CommitCertificate, Precommit, PrecommitEntry, Prevote, PrevoteCertificate, PrevoteEntry,

@@ -2,7 +2,7 @@
 //!
 //! ## Structure FROZEN V1
 //!
-//! - Chaque entrée possède une clé logique `K` = `namespace_u8 || identifier`.
+//! - Chaque entrée possède une clé logique `K = namespace_u8 || identifier`.
 //! - `key_hash = Keccak256("SANGO/STATE/KEY/V1" || K)`.
 //! - Les `key_hash` sont stockés dans un [`SparseMerkleTree`] binaire 256 niveaux.
 //! - Les valeurs sont l'encodage canonique Sango du type concerné.
@@ -12,8 +12,8 @@
 
 use sango_codec::{Decode, Encode};
 use sango_crypto::{domain, hash_domain};
-use sango_primitives::{Amount, Hash32, NativeAddress};
-use sango_types::Account;
+use sango_primitives::{Amount, Hash32, NativeAddress, PublicKey};
+use sango_types::NativeAccount;
 
 use crate::error::StateError;
 use crate::namespace::Namespace;
@@ -84,9 +84,9 @@ impl NativeState {
 
     /// Lit un compte natif.
     #[must_use]
-    pub fn get_account(&self, address: &NativeAddress) -> Option<Account> {
+    pub fn get_account(&self, address: &NativeAddress) -> Option<NativeAccount> {
         let bytes = self.get_entry(Namespace::NativeAccount, address.as_bytes())?;
-        Account::decode_exact(bytes).ok()
+        NativeAccount::decode_exact(bytes).ok()
     }
 
     /// Vrai si un compte natif existe.
@@ -98,7 +98,7 @@ impl NativeState {
     /// Écrit un compte natif. Le remplace s'il existe déjà.
     ///
     /// La clé est dérivée de `account.address`.
-    pub fn set_account(&mut self, account: Account) {
+    pub fn set_account(&mut self, account: NativeAccount) {
         let address = account.address;
         let bytes = account.encode_to_vec();
         self.put_entry(Namespace::NativeAccount, address.as_bytes(), bytes);
@@ -117,13 +117,36 @@ impl NativeState {
         self.get_account(address).map_or(0, |a| a.nonce)
     }
 
-    /// Crédite une adresse, en créant le compte si nécessaire.
-    pub fn credit(&mut self, address: NativeAddress, amount: Amount) -> Result<(), StateError> {
-        let mut acc = self.get_account(&address).unwrap_or(Account {
+    /// Clé publique enregistrée d'un compte.
+    ///
+    /// Retourne `None` si le compte n'existe pas, ou s'il existe mais que sa
+    /// clé publique n'a pas encore été enregistrée (`PublicKey::ZERO`).
+    #[must_use]
+    pub fn public_key_of(&self, address: &NativeAddress) -> Option<PublicKey> {
+        self.get_account(address)
+            .filter(NativeAccount::has_registered_public_key)
+            .map(|a| a.public_key)
+    }
+
+    /// Crée un `NativeAccount` « fantôme » : un compte sans clé publique
+    /// enregistrée, uniquement porteur d'un solde et d'un nonce.
+    ///
+    /// Utilisé en interne par [`Self::credit`], [`Self::debit`] et
+    /// [`Self::bump_nonce`] quand l'adresse n'existe pas encore.
+    fn ghost_account(address: NativeAddress) -> NativeAccount {
+        NativeAccount {
             address,
+            public_key: PublicKey::ZERO,
             balance: Amount::ZERO,
             nonce: 0,
-        });
+        }
+    }
+
+    /// Crédite une adresse, en créant un compte « fantôme » si nécessaire.
+    pub fn credit(&mut self, address: NativeAddress, amount: Amount) -> Result<(), StateError> {
+        let mut acc = self
+            .get_account(&address)
+            .unwrap_or_else(|| Self::ghost_account(address));
         acc.balance = acc
             .balance
             .checked_add(amount)
@@ -134,11 +157,9 @@ impl NativeState {
 
     /// Débite une adresse.
     pub fn debit(&mut self, address: NativeAddress, amount: Amount) -> Result<(), StateError> {
-        let mut acc = self.get_account(&address).unwrap_or(Account {
-            address,
-            balance: Amount::ZERO,
-            nonce: 0,
-        });
+        let mut acc = self
+            .get_account(&address)
+            .unwrap_or_else(|| Self::ghost_account(address));
         let available = acc.balance;
         acc.balance = available
             .checked_sub(amount)
@@ -153,11 +174,9 @@ impl NativeState {
 
     /// Incrémente le nonce d'une adresse.
     pub fn bump_nonce(&mut self, address: NativeAddress) -> Result<(), StateError> {
-        let mut acc = self.get_account(&address).unwrap_or(Account {
-            address,
-            balance: Amount::ZERO,
-            nonce: 0,
-        });
+        let mut acc = self
+            .get_account(&address)
+            .unwrap_or_else(|| Self::ghost_account(address));
         acc.nonce = acc
             .nonce
             .checked_add(1)
@@ -209,14 +228,16 @@ impl NativeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sango_crypto::{derive_native_address, NativeKeypair};
 
     fn addr(b: u8) -> NativeAddress {
         NativeAddress::from_bytes([b; 20])
     }
 
-    fn account(b: u8, balance_units: u128, nonce: u64) -> Account {
-        Account {
+    fn ghost(b: u8, balance_units: u128, nonce: u64) -> NativeAccount {
+        NativeAccount {
             address: addr(b),
+            public_key: PublicKey::ZERO,
             balance: Amount::from_base_units(balance_units),
             nonce,
         }
@@ -240,7 +261,7 @@ mod tests {
     #[test]
     fn put_account_and_get() {
         let mut s = NativeState::new();
-        let a = account(0xaa, 1_000_000, 0);
+        let a = ghost(0xaa, 1_000_000, 0);
         s.set_account(a);
         assert!(s.account_exists(&addr(0xaa)));
         assert_eq!(s.get_account(&addr(0xaa)), Some(a));
@@ -254,10 +275,12 @@ mod tests {
     }
 
     #[test]
-    fn credit_creates_account() {
+    fn credit_creates_ghost_account() {
         let mut s = NativeState::new();
         s.credit(addr(0xaa), Amount::from_base_units(500)).unwrap();
-        assert_eq!(s.balance_of(&addr(0xaa)), Amount::from_base_units(500));
+        let acc = s.get_account(&addr(0xaa)).unwrap();
+        assert_eq!(acc.balance, Amount::from_base_units(500));
+        assert!(!acc.has_registered_public_key());
     }
 
     #[test]
@@ -274,7 +297,7 @@ mod tests {
     #[test]
     fn credit_overflow_rejected() {
         let mut s = NativeState::new();
-        s.set_account(account(0xaa, u128::MAX, 0));
+        s.set_account(ghost(0xaa, u128::MAX, 0));
         let err = s
             .credit(addr(0xaa), Amount::from_base_units(1))
             .unwrap_err();
@@ -284,7 +307,7 @@ mod tests {
     #[test]
     fn bump_nonce_overflow_rejected() {
         let mut s = NativeState::new();
-        s.set_account(account(0xaa, 0, u64::MAX));
+        s.set_account(ghost(0xaa, 0, u64::MAX));
         let err = s.bump_nonce(addr(0xaa)).unwrap_err();
         assert!(matches!(err, StateError::NonceOverflow { .. }));
     }
@@ -373,5 +396,99 @@ mod tests {
             state_key_hash(Namespace::NativeAccount, id),
             state_key_hash(Namespace::NativeAccount, id),
         );
+    }
+
+    // --- Nouvelles sémantiques liées à la clé publique ----------------------
+
+    #[test]
+    fn public_key_of_ghost_is_none() {
+        let mut s = NativeState::new();
+        s.credit(addr(0xaa), Amount::from_base_units(500)).unwrap();
+        assert_eq!(s.public_key_of(&addr(0xaa)), None);
+    }
+
+    #[test]
+    fn public_key_of_registered_account_is_some() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let pk = kp.public_key();
+        let account = NativeAccount::from_public_key(pk, Amount::from_base_units(1_000), 0);
+        let address = account.address;
+
+        let mut s = NativeState::new();
+        s.set_account(account);
+
+        assert_eq!(s.public_key_of(&address), Some(pk));
+    }
+
+    #[test]
+    fn public_key_of_missing_is_none() {
+        let s = NativeState::new();
+        assert_eq!(s.public_key_of(&addr(0xaa)), None);
+    }
+
+    #[test]
+    fn ghost_account_does_not_have_registered_pubkey() {
+        let mut s = NativeState::new();
+        s.credit(addr(0xaa), Amount::from_base_units(100)).unwrap();
+        let acc = s.get_account(&addr(0xaa)).unwrap();
+        assert!(!acc.has_registered_public_key());
+    }
+
+    #[test]
+    fn bump_nonce_preserves_public_key() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let pk = kp.public_key();
+        let account = NativeAccount::from_public_key(pk, Amount::from_base_units(1_000), 0);
+        let address = account.address;
+
+        let mut s = NativeState::new();
+        s.set_account(account);
+        s.bump_nonce(address).unwrap();
+
+        let after = s.get_account(&address).unwrap();
+        assert_eq!(after.public_key, pk);
+        assert_eq!(after.nonce, 1);
+    }
+
+    #[test]
+    fn credit_preserves_public_key() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let pk = kp.public_key();
+        let account = NativeAccount::from_public_key(pk, Amount::from_base_units(1_000), 0);
+        let address = account.address;
+
+        let mut s = NativeState::new();
+        s.set_account(account);
+        s.credit(address, Amount::from_base_units(500)).unwrap();
+
+        let after = s.get_account(&address).unwrap();
+        assert_eq!(after.public_key, pk);
+        assert_eq!(after.balance, Amount::from_base_units(1_500));
+    }
+
+    #[test]
+    fn debit_preserves_public_key() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let pk = kp.public_key();
+        let account = NativeAccount::from_public_key(pk, Amount::from_base_units(1_000), 0);
+        let address = account.address;
+
+        let mut s = NativeState::new();
+        s.set_account(account);
+        s.debit(address, Amount::from_base_units(400)).unwrap();
+
+        let after = s.get_account(&address).unwrap();
+        assert_eq!(after.public_key, pk);
+        assert_eq!(after.balance, Amount::from_base_units(600));
+    }
+
+    #[test]
+    fn derive_native_address_is_used_by_from_public_key() {
+        // Vérifie que le helper de sango-state et celui de sango-crypto
+        // produisent la même adresse.
+        let kp = NativeKeypair::from_seed([0x77; 32]);
+        let pk = kp.public_key();
+        let acc = NativeAccount::from_public_key(pk, Amount::ZERO, 0);
+        assert_eq!(acc.address, derive_native_address(&pk));
     }
 }

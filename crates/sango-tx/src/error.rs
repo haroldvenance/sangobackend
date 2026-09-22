@@ -33,6 +33,12 @@ pub enum TxValidationError {
     #[error("public key does not derive to tx.sender")]
     PublicKeyDoesNotMatchSender,
 
+    /// Le compte émetteur n'a pas de clé publique enregistrée
+    /// (`PublicKey::ZERO`). Voir la documentation de `sango-tx` sur le
+    /// bootstrap.
+    #[error("sender has no registered public key")]
+    PublicKeyNotRegistered,
+
     /// Vérification de signature échouée.
     #[error("signature verification failed")]
     InvalidSignature,
