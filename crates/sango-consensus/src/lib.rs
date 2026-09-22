@@ -53,6 +53,7 @@
 mod error;
 mod proposal_verify;
 mod proposer;
+mod runner;
 mod state;
 mod step;
 mod timeouts;
@@ -62,6 +63,7 @@ mod vote_tracker;
 pub use error::ConsensusError;
 pub use proposal_verify::{verify_proposal, ProposalContext};
 pub use proposer::select_proposer;
+pub use runner::{LocalIdentity, RoundContext, RoundRunner};
 pub use state::{ConsensusState, PolcOutcome};
 pub use step::{Action, Step};
 pub use timeouts::TimeoutConfig;
