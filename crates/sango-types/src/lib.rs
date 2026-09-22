@@ -3,8 +3,12 @@
 //! Ce crate définit les objets qui composent l’état et les messages du
 //! protocole :
 //!
-//! - [`BlockHeader`] et son hash canonique ;
-//! - [`Transaction`] native et son hash / signature ;
+//! - [`BlockHeader`] et [`Block`] ;
+//! - [`Transaction`] native ;
+//! - [`Receipt`], [`EvmLog`], [`LogsBloom`] ;
+//! - messages consensus : [`Proposal`], [`Prevote`], [`Precommit`] ;
+//! - certificats : [`PrevoteCertificate`], [`CommitCertificate`] ;
+//! - [`Evidence`] ;
 //! - [`Account`] natif ;
 //! - [`Genesis`] et ses sous-configurations.
 //!
@@ -19,18 +23,29 @@
 #![warn(missing_docs)]
 
 mod account;
+mod block;
+mod consensus;
 mod error;
+mod evidence;
 mod genesis;
 mod header;
+mod receipt;
 mod transaction;
 
 pub use account::Account;
+pub use block::Block;
+pub use consensus::{
+    CommitCertificate, Precommit, PrecommitEntry, Prevote, PrevoteCertificate, PrevoteEntry,
+    Proposal,
+};
 pub use error::TypeError;
+pub use evidence::{ConsensusMessage, ConsensusMessageType, Evidence, EvidenceType};
 pub use genesis::{
     Allocation, ConsensusConfig, EvmConfig, EvmVersion, FeeConfig, Genesis, GenesisValidator,
     LockSchedule,
 };
 pub use header::BlockHeader;
+pub use receipt::{EvmLog, LogsBloom, Receipt, ReceiptStatus, LOGS_BLOOM_BYTES, MAX_LOG_TOPICS};
 pub use transaction::{Transaction, TxKind};
 
 /// Version courante du protocole Sango.
