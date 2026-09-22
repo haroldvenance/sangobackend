@@ -35,6 +35,11 @@ dependencies = [
 [[package]]
 name = "sango-codec"
 version = "0.1.0"
+dependencies = [
+ "hex-literal",
+ "sango-primitives",
+ "thiserror",
+]
 
 [[package]]
 name = "sango-consensus"
