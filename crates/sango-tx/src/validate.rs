@@ -6,29 +6,21 @@
 //! decode → structure → chain_id → signature → nonce → balance → gas/fee
 //! ```
 //!
-//! Chaque étape est exposée comme fonction indépendante.
+//! ## Bootstrap de clé publique — RÉSOLU (A1)
 //!
-//! ## Source de la clé publique — À SPÉCIFIER
+//! Un compte est typiquement **crédité d'abord** par un transfert entrant :
+//! il existe alors sous forme « fantôme » (`public_key = None`). Pour
+//! pouvoir émettre une transaction, il doit **activer** sa clé publique en
+//! la déclarant dans sa première transaction (`tx.public_key = Some(pk)`).
 //!
-//! **Statut : OUVERT.** Le Freeze V1 ne définit pas encore comment un nœud
-//! obtient la clé publique d'un compte natif. Options envisagées :
+//! Règles :
 //!
-//! - **A1** — la première transaction d'un compte fournit sa clé publique
-//!   (champ optionnel `public_key` dans `Transaction`) ; le compte est créé
-//!   implicitement si `derive(public_key) == tx.sender` et la signature est
-//!   valide.
-//! - **A2** — tous les comptes sont précréés par Genesis ou opération
-//!   protocolaire.
-//! - **A3** — la clé publique est incluse dans **toutes** les transactions.
-//!
-//! Recommandation : **A1**.
-//!
-//! En attendant, `sango-tx` utilise [`SenderInfo`] fourni par l'appelant
-//! (mempool, block builder, RPC). Cela permet :
-//!
-//! - de tester la validation sans dépendre de `sango-state` ;
-//! - de changer la source de la clé publique plus tard sans impacter le
-//!   pipeline de validation.
+//! - `tx.public_key = None` : le compte doit avoir une clé enregistrée ;
+//!   la signature est vérifiée contre la clé d'état.
+//! - `tx.public_key = Some(pk)` : `derive_native_address(pk) == tx.sender`
+//!   requis ; la signature est vérifiée contre `pk`. Si le compte a déjà
+//!   une clé enregistrée, elle doit être **identique** (pas de rotation).
+//! - `Some(PublicKey::ZERO)` est rejeté en validation structurelle.
 
 use sango_crypto::derive_native_address;
 use sango_primitives::{ChainId32, Hash32, NativeAddress, PublicKey};
@@ -39,22 +31,17 @@ use crate::fee;
 
 /// Informations sur le compte émetteur, nécessaires à la validation.
 ///
-/// **Découplage volontaire** : ce crate ne dépend pas de `sango-state`. Les
-/// informations sont fournies par l'appelant.
-///
-/// `address` et `public_key` doivent être cohérents :
-/// `derive_native_address(&public_key) == address`. Cette cohérence est
-/// vérifiée lors de [`validate_signature`].
+/// **Découplage volontaire** : ce crate ne dépend pas de `sango-state`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SenderInfo {
     /// Adresse native du compte émetteur.
     pub address: NativeAddress,
-    /// Clé publique Ed25519 du compte émetteur.
+    /// Clé publique Ed25519 enregistrée, si elle existe.
     ///
-    /// `PublicKey::ZERO` signifie « clé non enregistrée » ; dans ce cas
-    /// [`validate_signature`] rejette la transaction avec
-    /// [`TxValidationError::PublicKeyNotRegistered`].
-    pub public_key: PublicKey,
+    /// - `Some(pk)` : compte actif.
+    /// - `None` : compte inexistant ou « fantôme » (crédité mais pas
+    ///   encore activé).
+    pub public_key: Option<PublicKey>,
     /// Solde disponible en base units.
     pub balance: u128,
     /// Nonce courant du compte.
@@ -62,16 +49,26 @@ pub struct SenderInfo {
 }
 
 impl SenderInfo {
-    /// Construit un `SenderInfo` à partir d'une clé publique et d'un état.
-    ///
-    /// L'adresse est dérivée automatiquement — impossible de fournir une
-    /// adresse incohérente avec la clé publique.
+    /// Construit un `SenderInfo` pour un compte actif avec une clé publique
+    /// enregistrée.
     #[must_use]
     pub fn from_public_key(public_key: PublicKey, balance: u128, nonce: u64) -> Self {
         let address = derive_native_address(&public_key);
         Self {
             address,
-            public_key,
+            public_key: Some(public_key),
+            balance,
+            nonce,
+        }
+    }
+
+    /// Construit un `SenderInfo` pour un compte « fantôme » (crédité mais
+    /// sans clé publique enregistrée).
+    #[must_use]
+    pub fn ghost(address: NativeAddress, balance: u128, nonce: u64) -> Self {
+        Self {
+            address,
+            public_key: None,
             balance,
             nonce,
         }
@@ -102,12 +99,14 @@ pub struct ValidatedTransaction {
     pub max_total_fee: u128,
     /// Montant transféré (base units).
     pub value: u128,
+    /// Si `Some(pk)`, la couche d'état **doit** enregistrer `pk` comme clé
+    /// publique du compte `sender` lors de l'application de la transaction.
+    ///
+    /// Cela correspond à l'activation d'un compte « fantôme ».
+    pub bootstrap_public_key: Option<PublicKey>,
 }
 
 /// Valide une transaction contre un contexte de validation.
-///
-/// Enchaîne les étapes dans l'ordre canonique. Retourne la première erreur
-/// rencontrée.
 pub fn validate_transaction(
     tx: &Transaction,
     ctx: &ValidationContext<'_>,
@@ -120,16 +119,24 @@ pub fn validate_transaction(
     let max_total = fee::total_fee(tx.gas_limit, price).ok_or(TxValidationError::FeeOverflow)?;
     validate_balance(tx, ctx.sender.balance, max_total)?;
 
+    // Si la tx déclare une clé et que le compte n'en avait pas,
+    // c'est un bootstrap : la couche d'état doit l'enregistrer.
+    let bootstrap_public_key = match (tx.public_key, ctx.sender.public_key) {
+        (Some(pk), None) => Some(pk),
+        _ => None,
+    };
+
     Ok(ValidatedTransaction {
         tx_hash: tx.hash(),
         sender: tx.sender,
         effective_gas_price: price,
         max_total_fee: max_total,
         value: tx.value.base_units(),
+        bootstrap_public_key,
     })
 }
 
-/// Valide la structure de la transaction en fonction de son `tx_kind`.
+/// Valide la structure de la transaction.
 pub fn validate_structure(tx: &Transaction) -> Result<(), TxValidationError> {
     if tx.version != 1 {
         return Err(TxValidationError::UnsupportedVersion(tx.version));
@@ -142,6 +149,13 @@ pub fn validate_structure(tx: &Transaction) -> Result<(), TxValidationError> {
             priority_fee: tx.priority_fee,
             max_fee: tx.max_fee,
         });
+    }
+    if let Some(pk) = &tx.public_key {
+        if pk.is_zero() {
+            return Err(TxValidationError::InvalidStructure(
+                "public_key must not be PublicKey::ZERO",
+            ));
+        }
     }
     match tx.tx_kind {
         TxKind::Transfer => {
@@ -187,40 +201,42 @@ pub fn validate_chain_id(tx: &Transaction, expected: ChainId32) -> Result<(), Tx
 
 /// Vérifie la signature et la cohérence de [`SenderInfo`].
 ///
-/// Quatre contrôles, dans cet ordre :
-///
-/// 0. `sender.public_key != PublicKey::ZERO` — la clé publique est bien
-///    enregistrée (rejette les comptes « fantômes ») ;
-/// 1. `sender.address == tx.sender` — le `SenderInfo` fourni par l'appelant
-///    correspond à la transaction ;
-/// 2. `derive_native_address(&sender.public_key) == tx.sender` — la clé
-///    publique dérive vers l'adresse déclarée ;
-/// 3. signature Ed25519 valide sur `DOMAIN_TX_V1 || champs`.
-///
-/// **Les quatre sont obligatoires.** Sans (0), une clé `ZERO` serait
-/// traitée comme une clé valide. Sans (1), un appelant pourrait fournir des
-/// informations incohérentes. Sans (2), un attaquant pourrait signer avec sa
-/// clé tout en déclarant `sender = victime`. Sans (3), la preuve de
-/// possession de la clé privée est absente.
+/// Voir la documentation du module pour la règle de bootstrap.
 pub fn validate_signature(tx: &Transaction, sender: &SenderInfo) -> Result<(), TxValidationError> {
-    // (0) La clé publique du compte doit être enregistrée.
-    if sender.public_key.is_zero() {
-        return Err(TxValidationError::PublicKeyNotRegistered);
-    }
-
-    // (1) Cohérence SenderInfo <-> tx.
+    // (0) Cohérence SenderInfo <-> tx.
     if sender.address != tx.sender {
         return Err(TxValidationError::SenderInfoAddressMismatch);
     }
 
-    // (2) Cohérence clé publique <-> adresse déclarée.
-    let derived = derive_native_address(&sender.public_key);
-    if derived != tx.sender {
-        return Err(TxValidationError::PublicKeyDoesNotMatchSender);
-    }
+    // (1) Déterminer la clé publique effective.
+    let effective_pubkey = match tx.public_key {
+        Some(declared) => {
+            // La clé déclarée doit dériver vers l'adresse déclarée.
+            if derive_native_address(&declared) != tx.sender {
+                return Err(TxValidationError::PublicKeyDoesNotMatchSender);
+            }
+            // Si le compte a déjà une clé enregistrée, elle doit être
+            // identique (pas de rotation en V1).
+            if let Some(existing) = sender.public_key {
+                if existing != declared {
+                    return Err(TxValidationError::PublicKeyAlreadySet);
+                }
+            }
+            declared
+        }
+        None => {
+            let existing = sender
+                .public_key
+                .ok_or(TxValidationError::PublicKeyNotRegistered)?;
+            if derive_native_address(&existing) != tx.sender {
+                return Err(TxValidationError::PublicKeyDoesNotMatchSender);
+            }
+            existing
+        }
+    };
 
-    // (3) Vérification cryptographique de la signature.
-    tx.verify(&sender.public_key)
+    // (2) Vérification cryptographique de la signature.
+    tx.verify(&effective_pubkey)
         .map_err(|_| TxValidationError::InvalidSignature)?;
 
     Ok(())
@@ -238,8 +254,6 @@ pub fn validate_nonce(tx: &Transaction, expected_nonce: u64) -> Result<(), TxVal
 }
 
 /// Vérifie les frais et retourne le prix effectif.
-///
-/// Rejette `max_fee < base_fee` et tout débordement de `base_fee + priority_fee`.
 pub fn validate_fee(tx: &Transaction, base_fee: u128) -> Result<u128, TxValidationError> {
     if tx.max_fee < base_fee {
         return Err(TxValidationError::MaxFeeBelowBaseFee {
@@ -280,7 +294,8 @@ mod tests {
         ChainId32::from_bytes([0x11; 32])
     }
 
-    /// Construit une transaction signée et le `SenderInfo` correspondant.
+    /// Construit une transaction signée **normale** (compte actif, pas de
+    /// déclaration de clé) et le `SenderInfo` correspondant.
     fn signed_transfer(
         keypair: &NativeKeypair,
         nonce: u64,
@@ -294,6 +309,7 @@ mod tests {
             chain_id: chain(),
             nonce,
             sender,
+            public_key: None,
             gas_limit: 21_000,
             max_fee: 20,
             priority_fee: 2,
@@ -308,7 +324,44 @@ mod tests {
             tx,
             SenderInfo {
                 address: sender,
-                public_key: pk,
+                public_key: Some(pk),
+                balance,
+                nonce,
+            },
+        )
+    }
+
+    /// Construit une transaction de **bootstrap** : le compte n'a pas
+    /// encore de clé, la tx en déclare une.
+    fn signed_bootstrap_transfer(
+        keypair: &NativeKeypair,
+        nonce: u64,
+        value: u128,
+        balance: u128,
+    ) -> (Transaction, SenderInfo) {
+        let pk = keypair.public_key();
+        let sender = derive_native_address(&pk);
+        let mut tx = Transaction {
+            version: 1,
+            chain_id: chain(),
+            nonce,
+            sender,
+            public_key: Some(pk),
+            gas_limit: 21_000,
+            max_fee: 20,
+            priority_fee: 2,
+            value: Amount::from_base_units(value),
+            tx_kind: TxKind::Transfer,
+            recipient: Some(NativeAddress::from_bytes([0xbb; 20])),
+            data: Vec::new(),
+            signature: Signature::ZERO,
+        };
+        tx = tx.sign(keypair);
+        (
+            tx,
+            SenderInfo {
+                address: sender,
+                public_key: None,
                 balance,
                 nonce,
             },
@@ -323,9 +376,19 @@ mod tests {
         let pk = kp.public_key();
         let info = SenderInfo::from_public_key(pk, 100, 0);
         assert_eq!(info.address, derive_native_address(&pk));
-        assert_eq!(info.public_key, pk);
+        assert_eq!(info.public_key, Some(pk));
         assert_eq!(info.balance, 100);
         assert_eq!(info.nonce, 0);
+    }
+
+    #[test]
+    fn sender_info_ghost() {
+        let a = NativeAddress::from_bytes([0xaa; 20]);
+        let info = SenderInfo::ghost(a, 500, 3);
+        assert_eq!(info.address, a);
+        assert_eq!(info.public_key, None);
+        assert_eq!(info.balance, 500);
+        assert_eq!(info.nonce, 3);
     }
 
     // --- validate_structure -------------------------------------------------
@@ -413,6 +476,17 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn structure_rejects_zero_declared_public_key() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let (mut tx, _) = signed_transfer(&kp, 0, 100, 1_000_000);
+        tx.public_key = Some(PublicKey::ZERO);
+        assert!(matches!(
+            validate_structure(&tx),
+            Err(TxValidationError::InvalidStructure(_))
+        ));
+    }
+
     // --- validate_chain_id --------------------------------------------------
 
     #[test]
@@ -436,7 +510,7 @@ mod tests {
     // --- validate_signature -------------------------------------------------
 
     #[test]
-    fn signature_ok() {
+    fn signature_ok_normal_path() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let (tx, info) = signed_transfer(&kp, 0, 100, 1_000_000);
         assert!(validate_signature(&tx, &info).is_ok());
@@ -458,9 +532,7 @@ mod tests {
         let kp1 = NativeKeypair::from_seed([0x42; 32]);
         let kp2 = NativeKeypair::from_seed([0x43; 32]);
         let (tx, mut info) = signed_transfer(&kp1, 0, 100, 1_000_000);
-        // On remplace la clé publique par celle de kp2 (non-ZERO), mais
-        // l'adresse déclarée reste celle de kp1.
-        info.public_key = kp2.public_key();
+        info.public_key = Some(kp2.public_key());
         assert_eq!(
             validate_signature(&tx, &info),
             Err(TxValidationError::PublicKeyDoesNotMatchSender)
@@ -479,13 +551,66 @@ mod tests {
     }
 
     #[test]
-    fn signature_rejects_unregistered_public_key() {
+    fn signature_rejects_unregistered_public_key_no_declaration() {
+        // Compte fantôme + tx sans déclaration → PublicKeyNotRegistered.
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let (tx, mut info) = signed_transfer(&kp, 0, 100, 1_000_000);
-        info.public_key = PublicKey::ZERO;
+        info.public_key = None;
         assert_eq!(
             validate_signature(&tx, &info),
             Err(TxValidationError::PublicKeyNotRegistered)
+        );
+    }
+
+    // --- Bootstrap ----------------------------------------------------------
+
+    #[test]
+    fn bootstrap_ok() {
+        // Compte fantôme + tx déclare la clé → OK.
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let (tx, info) = signed_bootstrap_transfer(&kp, 0, 100, 1_000_000);
+        assert!(validate_signature(&tx, &info).is_ok());
+    }
+
+    #[test]
+    fn bootstrap_rejects_declared_pubkey_mismatch() {
+        // La tx déclare une clé, mais elle ne dérive pas vers tx.sender.
+        let kp1 = NativeKeypair::from_seed([0x42; 32]);
+        let kp2 = NativeKeypair::from_seed([0x43; 32]);
+        let (mut tx, info) = signed_bootstrap_transfer(&kp1, 0, 100, 1_000_000);
+        // tx.sender reste celle de kp1 ; on remplace la clé déclarée par
+        // celle de kp2 → derive(kp2) != tx.sender.
+        tx.public_key = Some(kp2.public_key());
+        assert_eq!(
+            validate_signature(&tx, &info),
+            Err(TxValidationError::PublicKeyDoesNotMatchSender)
+        );
+    }
+
+    #[test]
+    fn bootstrap_idempotent_when_pubkey_already_set_same() {
+        // Compte actif + tx re-déclare la même clé → OK.
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let (mut tx, info) = signed_transfer(&kp, 0, 100, 1_000_000);
+        tx.public_key = Some(kp.public_key());
+        // Re-signer car public_key est dans les bytes signés.
+        tx = tx.sign(&kp);
+        assert!(validate_signature(&tx, &info).is_ok());
+    }
+
+    #[test]
+    fn bootstrap_rejects_key_rotation() {
+        // Compte actif + tx déclare une clé différente → PublicKeyAlreadySet.
+        // (En pratique impossible car derive(pk2) != tx.sender, mais on
+        // teste la branche en construisant un SenderInfo incohérent.)
+        let kp1 = NativeKeypair::from_seed([0x42; 32]);
+        let kp2 = NativeKeypair::from_seed([0x43; 32]);
+        let (tx, mut info) = signed_bootstrap_transfer(&kp1, 0, 100, 1_000_000);
+        // On simule un compte qui a déjà kp2 enregistré.
+        info.public_key = Some(kp2.public_key());
+        assert_eq!(
+            validate_signature(&tx, &info),
+            Err(TxValidationError::PublicKeyAlreadySet)
         );
     }
 
@@ -554,7 +679,7 @@ mod tests {
     // --- validate_transaction (top-level) -----------------------------------
 
     #[test]
-    fn full_pipeline_ok() {
+    fn full_pipeline_ok_normal() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let (tx, info) = signed_transfer(&kp, 0, 100, 1_000_000);
         let ctx = ValidationContext {
@@ -568,6 +693,21 @@ mod tests {
         assert_eq!(v.max_total_fee, 21_000 * 12);
         assert_eq!(v.value, 100);
         assert_eq!(v.tx_hash, tx.hash());
+        assert_eq!(v.bootstrap_public_key, None);
+    }
+
+    #[test]
+    fn full_pipeline_ok_bootstrap() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let pk = kp.public_key();
+        let (tx, info) = signed_bootstrap_transfer(&kp, 0, 100, 1_000_000);
+        let ctx = ValidationContext {
+            expected_chain_id: chain(),
+            base_fee: 10,
+            sender: &info,
+        };
+        let v = validate_transaction(&tx, &ctx).unwrap();
+        assert_eq!(v.bootstrap_public_key, Some(pk));
     }
 
     #[test]

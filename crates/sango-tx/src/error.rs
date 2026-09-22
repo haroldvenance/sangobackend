@@ -28,16 +28,25 @@ pub enum TxValidationError {
     #[error("SenderInfo.address does not match tx.sender")]
     SenderInfoAddressMismatch,
 
-    /// L'adresse dérivée de `SenderInfo.public_key` ne correspond pas au
-    /// champ `sender` de la transaction.
+    /// La clé publique (déclarée dans la tx ou enregistrée dans l'état) ne
+    /// dérive pas vers `tx.sender`.
     #[error("public key does not derive to tx.sender")]
     PublicKeyDoesNotMatchSender,
 
     /// Le compte émetteur n'a pas de clé publique enregistrée
-    /// (`PublicKey::ZERO`). Voir la documentation de `sango-tx` sur le
-    /// bootstrap.
+    /// (`SenderInfo.public_key == None`) et la transaction n'en déclare
+    /// pas non plus (`tx.public_key == None`).
+    ///
+    /// Le compte doit soit être créé par Genesis, soit avoir déjà été
+    /// activé via une transaction déclarant sa clé publique.
     #[error("sender has no registered public key")]
     PublicKeyNotRegistered,
+
+    /// La transaction déclare une clé publique différente de celle déjà
+    /// enregistrée pour ce compte. La rotation de clé n'est **pas**
+    /// autorisée en V1.
+    #[error("public key already registered (rotation not allowed)")]
+    PublicKeyAlreadySet,
 
     /// Vérification de signature échouée.
     #[error("signature verification failed")]

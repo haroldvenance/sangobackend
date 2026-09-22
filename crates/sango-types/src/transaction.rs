@@ -39,15 +39,19 @@ impl TxKind {
 
 /// Transaction native Sango V1 (Freeze, section 21).
 ///
-/// Ordre canonique :
+/// ## Ordre canonique
 ///
 /// ```text
-/// version || chain_id || nonce || sender || gas_limit
-/// || max_fee || priority_fee || value || tx_kind
-/// || recipient || data || signature
+/// version || chain_id || nonce || sender || public_key?
+/// || gas_limit || max_fee || priority_fee || value
+/// || tx_kind || recipient || data || signature
 /// ```
 ///
 /// Le `recipient` vaut `None` (NIL) uniquement pour `TxKind::ContractCreate`.
+///
+/// Le champ `public_key` est **inclus dans les bytes signés** et dans le
+/// hash de transaction : impossible pour un attaquant d'ajouter ou
+/// retirer la clé après signature.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Transaction {
     /// Version du format de transaction.
@@ -58,6 +62,14 @@ pub struct Transaction {
     pub nonce: u64,
     /// Adresse native de l'émetteur.
     pub sender: NativeAddress,
+    /// Clé publique Ed25519, si déclarée dans la transaction.
+    ///
+    /// - `Some(pk)` : **déclaration de clé**. Le réseau vérifie
+    ///   `derive_native_address(pk) == sender`. Utilisé pour activer un
+    ///   compte fraîchement crédité (ghost) qui n'a pas encore de clé
+    ///   enregistrée.
+    /// - `None` : le compte doit déjà avoir une clé enregistrée.
+    pub public_key: Option<PublicKey>,
     /// Limite de gas.
     pub gas_limit: u64,
     /// Prix maximum par unité de gas (base + priorité).
@@ -72,18 +84,23 @@ pub struct Transaction {
     pub recipient: Option<NativeAddress>,
     /// Données d'appel ou bytecode d'initialisation.
     pub data: Vec<u8>,
-    /// Signature Ed25519 sur `DOMAIN_TX_V1 || payload`.
+    /// Signature Ed25519 sur `DOMAIN_TX_V1 || champs hors signature`.
     pub signature: Signature,
 }
 
 impl Transaction {
-    /// Retourne les bytes à signer / hasher :
+    /// Vrai si la transaction déclare une clé publique (bootstrap).
+    #[must_use]
+    pub const fn declares_public_key(&self) -> bool {
+        self.public_key.is_some()
+    }
+
+    /// Retourne les bytes à hasher :
     ///
     /// ```text
-    /// DOMAIN_TX_V1
-    /// || version || chain_id || nonce || sender || gas_limit
-    /// || max_fee || priority_fee || value || tx_kind
-    /// || recipient || data
+    /// DOMAIN_TX_V1 || version || chain_id || nonce || sender
+    /// || public_key? || gas_limit || max_fee || priority_fee
+    /// || value || tx_kind || recipient || data
     /// ```
     ///
     /// La signature n'est **pas** incluse.
@@ -110,15 +127,13 @@ impl Transaction {
     /// Retourne une copie avec la signature renseignée.
     #[must_use]
     pub fn sign(&self, keypair: &NativeKeypair) -> Self {
-        let payload = self.signing_payload();
         let sig = sign_native(keypair, domain::TX_V1, &self.encode_unsigned_to_vec());
-        let _ = payload; // payload contient déjà le domaine ; on signe la même chose.
         let mut out = self.clone();
         out.signature = sig;
         out
     }
 
-    /// Vérifie la signature de la transaction contre `public_key`.
+    /// Vérifie la signature contre `public_key`.
     pub fn verify(&self, public_key: &PublicKey) -> Result<(), CryptoError> {
         verify_native(
             public_key,
@@ -141,6 +156,7 @@ impl Transaction {
         self.chain_id.encode(enc);
         self.nonce.encode(enc);
         self.sender.encode(enc);
+        self.public_key.encode(enc);
         self.gas_limit.encode(enc);
         self.max_fee.encode(enc);
         self.priority_fee.encode(enc);
@@ -178,6 +194,7 @@ impl Decode for Transaction {
             chain_id: ChainId32::decode(dec)?,
             nonce: u64::decode(dec)?,
             sender: NativeAddress::decode(dec)?,
+            public_key: Option::<PublicKey>::decode(dec)?,
             gas_limit: u64::decode(dec)?,
             max_fee: u128::decode(dec)?,
             priority_fee: u128::decode(dec)?,
@@ -200,6 +217,7 @@ mod tests {
             chain_id: ChainId32::from_bytes([0x11; 32]),
             nonce: 0,
             sender: NativeAddress::from_bytes([0xaa; 20]),
+            public_key: None,
             gas_limit: 21_000,
             max_fee: 20,
             priority_fee: 2,
@@ -233,6 +251,15 @@ mod tests {
     }
 
     #[test]
+    fn transaction_with_declared_pubkey_roundtrip() {
+        let mut tx = sample_unsigned();
+        tx.public_key = Some(PublicKey::from_bytes([0xcc; 32]));
+        let bytes = tx.encode_to_vec();
+        let decoded = Transaction::decode_exact(&bytes).unwrap();
+        assert_eq!(decoded.public_key, Some(PublicKey::from_bytes([0xcc; 32])));
+    }
+
+    #[test]
     fn recipient_none_roundtrip() {
         let mut tx = sample_unsigned();
         tx.tx_kind = TxKind::ContractCreate;
@@ -247,7 +274,7 @@ mod tests {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let pk = kp.public_key();
         let mut tx = sample_unsigned();
-        tx.sender = NativeAddress::from_bytes([0x00; 20]); // valeur neutre
+        tx.sender = NativeAddress::from_bytes([0x00; 20]);
         let signed = tx.sign(&kp);
         assert!(signed.verify(&pk).is_ok());
     }
@@ -259,6 +286,18 @@ mod tests {
         let signed = sample_unsigned().sign(&kp);
         let mut tampered = signed.clone();
         tampered.value = Amount::from_base_units(1);
+        assert!(tampered.verify(&pk).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_added_public_key() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let pk = kp.public_key();
+        let signed = sample_unsigned().sign(&kp);
+        let mut tampered = signed.clone();
+        tampered.public_key = Some(PublicKey::from_bytes([0xff; 32]));
+        // Le public_key est dans les bytes signés, donc la signature ne
+        // vérifie plus.
         assert!(tampered.verify(&pk).is_err());
     }
 
@@ -278,10 +317,28 @@ mod tests {
     }
 
     #[test]
+    fn tx_hash_changes_with_public_key() {
+        let tx = sample_unsigned();
+        let a = tx.hash();
+        let mut t2 = tx.clone();
+        t2.public_key = Some(PublicKey::from_bytes([0xcc; 32]));
+        assert_ne!(a, t2.hash());
+    }
+
+    #[test]
     fn tx_hash_ignores_signature() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let tx = sample_unsigned();
         let signed = tx.sign(&kp);
         assert_eq!(tx.hash(), signed.hash());
+    }
+
+    #[test]
+    fn declares_public_key_flag() {
+        let tx = sample_unsigned();
+        assert!(!tx.declares_public_key());
+        let mut tx2 = tx;
+        tx2.public_key = Some(PublicKey::from_bytes([0x11; 32]));
+        assert!(tx2.declares_public_key());
     }
 }

@@ -85,6 +85,7 @@ mod tests {
             chain_id: ChainId32::from_bytes([0x11; 32]),
             nonce,
             sender: NativeAddress::from_bytes([0xaa; 20]),
+            public_key: None,
             gas_limit: 21_000,
             max_fee: 20,
             priority_fee: 2,

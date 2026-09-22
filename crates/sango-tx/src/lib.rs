@@ -6,34 +6,35 @@
 //! decode → structure → chain_id → signature → nonce → balance → gas/fee
 //! ```
 //!
-//! Chaque étape est exposée comme fonction indépendante.
+//! ## Bootstrap de clé publique
+//!
+//! **RÉSOLU (A1).** Un compte natif est typiquement **crédité d'abord**
+//! par un transfert entrant : il existe alors sous forme « fantôme »
+//! (porteur d'un solde mais sans clé publique enregistrée). Pour pouvoir
+//! dépenser, il doit **déclarer sa clé publique** dans sa première
+//! transaction en renseignant `tx.public_key = Some(pk)`.
+//!
+//! Règles :
+//!
+//! - `tx.public_key = None` : la signature est vérifiée contre la clé
+//!   publique du compte, qui doit déjà être enregistrée.
+//! - `tx.public_key = Some(pk)` : `derive_native_address(pk) == tx.sender`
+//!   requis. Si le compte a déjà une clé enregistrée, elle doit être
+//!   **identique** (rotation interdite en V1).
+//! - `PublicKey::ZERO` est rejeté structurellement.
+//!
+//! Le champ `public_key` est inclus dans les bytes signés et le hash de
+//! transaction, ce qui empêche un attaquant de l'ajouter ou de le retirer
+//! après signature.
+//!
+//! Le résultat de validation expose [`ValidatedTransaction::bootstrap_public_key`] :
+//! s'il vaut `Some(pk)`, la couche d'état **doit** enregistrer `pk` comme
+//! clé publique du compte lors de l'application.
 //!
 //! ## Découplage
 //!
-//! Ce crate **ne dépend pas** de `sango-state` ni de `sango-storage`. Les
-//! informations sur le compte émetteur ([`SenderInfo`]) lui sont fournies
-//! par l'appelant. Cette séparation permet :
-//!
-//! - de tester la validation sans base de données ;
-//! - de réutiliser le validateur dans plusieurs contextes (mempool, block
-//!   building, RPC).
-//!
-//! ## Source de la clé publique — À SPÉCIFIER
-//!
-//! **Statut : OUVERT.** Le Freeze V1 ne définit pas encore comment un nœud
-//! obtient la clé publique d'un compte natif. Options envisagées :
-//!
-//! - **A1** — la première transaction d'un compte fournit sa clé publique
-//!   (champ optionnel dans `Transaction`) ; création implicite du compte si
-//!   `derive(public_key) == tx.sender` et signature valide.
-//! - **A2** — comptes précréés par Genesis ou opération protocolaire.
-//! - **A3** — clé publique dans **toutes** les transactions.
-//!
-//! Recommandation : **A1**.
-//!
-//! En attendant la décision, `sango-tx` utilise [`SenderInfo`] et ne
-//! présuppose ni la structure de `NativeAccount` ni le format final de
-//! `Transaction`.
+//! Ce crate **ne dépend pas** de `sango-state`. Les informations sur le
+//! compte émetteur ([`SenderInfo`]) lui sont fournies par l'appelant.
 //!
 //! ## Frais
 //!
