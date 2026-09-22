@@ -7,3 +7,8 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+thiserror.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true

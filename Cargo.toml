@@ -26,4 +26,8 @@ authors = ["Sango Contributors"]
 repository = "https://github.com/sango/sango"
 
 [workspace.dependencies]
-# Sera complété au fur et à mesure.
+thiserror = "2"
+hex = "0.4"
+hex-literal = "0.4"
+
+
