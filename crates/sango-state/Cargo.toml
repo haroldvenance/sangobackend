@@ -12,3 +12,6 @@ sango-primitives.workspace = true
 sango-codec.workspace = true
 sango-crypto.workspace = true
 sango-types.workspace = true
+
+[dev-dependencies]
+sango-tx.workspace = true

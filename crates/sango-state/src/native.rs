@@ -7,11 +7,11 @@
 //! - Les `key_hash` sont stockés dans un [`SparseMerkleTree`] binaire 256 niveaux.
 //! - Les valeurs sont l'encodage canonique Sango du type concerné.
 //!
-//! RocksDB (à venir dans `sango-storage`) ne fait que persister les entrées ;
-//! il ne définit **jamais** le consensus.
+//! RocksDB (dans `sango-storage`) ne fait que persister les entrées ; il ne
+//! définit **jamais** le consensus.
 
 use sango_codec::{Decode, Encode};
-use sango_crypto::{domain, hash_domain};
+use sango_crypto::{derive_native_address, domain, hash_domain};
 use sango_primitives::{Amount, Hash32, NativeAddress, PublicKey};
 use sango_types::NativeAccount;
 
@@ -96,8 +96,6 @@ impl NativeState {
     }
 
     /// Écrit un compte natif. Le remplace s'il existe déjà.
-    ///
-    /// La clé est dérivée de `account.address`.
     pub fn set_account(&mut self, account: NativeAccount) {
         let address = account.address;
         let bytes = account.encode_to_vec();
@@ -119,8 +117,8 @@ impl NativeState {
 
     /// Clé publique enregistrée d'un compte.
     ///
-    /// Retourne `None` si le compte n'existe pas, ou s'il existe mais que sa
-    /// clé publique n'a pas encore été enregistrée (`PublicKey::ZERO`).
+    /// Retourne `None` si le compte n'existe pas, ou s'il existe sous forme
+    /// « fantôme » (`PublicKey::ZERO`).
     #[must_use]
     pub fn public_key_of(&self, address: &NativeAddress) -> Option<PublicKey> {
         self.get_account(address)
@@ -128,11 +126,7 @@ impl NativeState {
             .map(|a| a.public_key)
     }
 
-    /// Crée un `NativeAccount` « fantôme » : un compte sans clé publique
-    /// enregistrée, uniquement porteur d'un solde et d'un nonce.
-    ///
-    /// Utilisé en interne par [`Self::credit`], [`Self::debit`] et
-    /// [`Self::bump_nonce`] quand l'adresse n'existe pas encore.
+    /// Crée un `NativeAccount` « fantôme » : compte sans clé enregistrée.
     fn ghost_account(address: NativeAddress) -> NativeAccount {
         NativeAccount {
             address,
@@ -218,6 +212,54 @@ impl NativeState {
         }
     }
 
+    /// Enregistre la clé publique d'un compte « fantôme », l'activant.
+    ///
+    /// Utilisée lors du **bootstrap** : la première transaction d'un compte
+    /// déclare sa clé publique (`tx.public_key = Some(pk)`), le pipeline de
+    /// validation la vérifie, puis la couche d'application appelle cette
+    /// méthode pour l'enregistrer dans l'état.
+    ///
+    /// # Règles (défense en profondeur)
+    ///
+    /// - Le compte doit exister dans l'état (typiquement un « fantôme »
+    ///   créé par un crédit antérieur) — sinon [`StateError::AccountNotFound`].
+    /// - Le compte ne doit pas déjà avoir de clé enregistrée — sinon
+    ///   [`StateError::PublicKeyAlreadyRegistered`]. La rotation de clé
+    ///   n'est **pas** autorisée en V1.
+    /// - `public_key` ne doit pas être `PublicKey::ZERO` — sinon
+    ///   [`StateError::PublicKeyIsZero`].
+    /// - `derive_native_address(public_key)` doit égaler `address` — sinon
+    ///   [`StateError::PublicKeyDoesNotMatchAddress`].
+    ///
+    /// Le solde et le nonce du compte sont préservés.
+    pub fn set_public_key(
+        &mut self,
+        address: NativeAddress,
+        public_key: PublicKey,
+    ) -> Result<(), StateError> {
+        if public_key.is_zero() {
+            return Err(StateError::PublicKeyIsZero);
+        }
+
+        // Defense-in-depth : le pipeline de validation garantit déjà cette
+        // propriété, mais on la revérifie au niveau de l'état.
+        if derive_native_address(&public_key) != address {
+            return Err(StateError::PublicKeyDoesNotMatchAddress { address });
+        }
+
+        let mut acc = self
+            .get_account(&address)
+            .ok_or(StateError::AccountNotFound { address })?;
+
+        if acc.has_registered_public_key() {
+            return Err(StateError::PublicKeyAlreadyRegistered { address });
+        }
+
+        acc.public_key = public_key;
+        self.set_account(acc);
+        Ok(())
+    }
+
     /// Racine de l'état vide (constante normative).
     #[must_use]
     pub fn empty_root() -> Hash32 {
@@ -228,7 +270,7 @@ impl NativeState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sango_crypto::{derive_native_address, NativeKeypair};
+    use sango_crypto::NativeKeypair;
 
     fn addr(b: u8) -> NativeAddress {
         NativeAddress::from_bytes([b; 20])
@@ -242,6 +284,8 @@ mod tests {
             nonce,
         }
     }
+
+    // --- Tests existants (rappel) -------------------------------------------
 
     #[test]
     fn empty_state_is_empty() {
@@ -398,8 +442,6 @@ mod tests {
         );
     }
 
-    // --- Nouvelles sémantiques liées à la clé publique ----------------------
-
     #[test]
     fn public_key_of_ghost_is_none() {
         let mut s = NativeState::new();
@@ -424,14 +466,6 @@ mod tests {
     fn public_key_of_missing_is_none() {
         let s = NativeState::new();
         assert_eq!(s.public_key_of(&addr(0xaa)), None);
-    }
-
-    #[test]
-    fn ghost_account_does_not_have_registered_pubkey() {
-        let mut s = NativeState::new();
-        s.credit(addr(0xaa), Amount::from_base_units(100)).unwrap();
-        let acc = s.get_account(&addr(0xaa)).unwrap();
-        assert!(!acc.has_registered_public_key());
     }
 
     #[test]
@@ -484,11 +518,122 @@ mod tests {
 
     #[test]
     fn derive_native_address_is_used_by_from_public_key() {
-        // Vérifie que le helper de sango-state et celui de sango-crypto
-        // produisent la même adresse.
         let kp = NativeKeypair::from_seed([0x77; 32]);
         let pk = kp.public_key();
         let acc = NativeAccount::from_public_key(pk, Amount::ZERO, 0);
         assert_eq!(acc.address, derive_native_address(&pk));
+    }
+
+    // --- set_public_key : bootstrap -----------------------------------------
+
+    #[test]
+    fn set_public_key_activates_ghost() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let pk = kp.public_key();
+        let address = derive_native_address(&pk);
+
+        let mut s = NativeState::new();
+        s.credit(address, Amount::from_base_units(1_000)).unwrap();
+        assert_eq!(s.public_key_of(&address), None);
+
+        s.set_public_key(address, pk).unwrap();
+
+        assert_eq!(s.public_key_of(&address), Some(pk));
+        let acc = s.get_account(&address).unwrap();
+        assert!(acc.has_registered_public_key());
+    }
+
+    #[test]
+    fn set_public_key_changes_smt_root() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let pk = kp.public_key();
+        let address = derive_native_address(&pk);
+
+        let mut s = NativeState::new();
+        s.credit(address, Amount::from_base_units(500)).unwrap();
+        let root_before = s.native_state_root();
+
+        s.set_public_key(address, pk).unwrap();
+        let root_after = s.native_state_root();
+
+        assert_ne!(root_before, root_after);
+    }
+
+    #[test]
+    fn set_public_key_preserves_balance_and_nonce() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let pk = kp.public_key();
+        let address = derive_native_address(&pk);
+
+        let mut s = NativeState::new();
+        s.set_account(NativeAccount {
+            address,
+            public_key: PublicKey::ZERO,
+            balance: Amount::from_base_units(777),
+            nonce: 3,
+        });
+
+        s.set_public_key(address, pk).unwrap();
+
+        let acc = s.get_account(&address).unwrap();
+        assert_eq!(acc.public_key, pk);
+        assert_eq!(acc.balance, Amount::from_base_units(777));
+        assert_eq!(acc.nonce, 3);
+    }
+
+    #[test]
+    fn set_public_key_rejects_missing_account() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let pk = kp.public_key();
+        let address = derive_native_address(&pk);
+
+        let mut s = NativeState::new();
+        let err = s.set_public_key(address, pk).unwrap_err();
+        assert!(matches!(err, StateError::AccountNotFound { .. }));
+    }
+
+    #[test]
+    fn set_public_key_rejects_zero() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let address = derive_native_address(&kp.public_key());
+
+        let mut s = NativeState::new();
+        s.credit(address, Amount::from_base_units(100)).unwrap();
+
+        let err = s.set_public_key(address, PublicKey::ZERO).unwrap_err();
+        assert_eq!(err, StateError::PublicKeyIsZero);
+    }
+
+    #[test]
+    fn set_public_key_rejects_derivation_mismatch() {
+        let kp1 = NativeKeypair::from_seed([0x42; 32]);
+        let kp2 = NativeKeypair::from_seed([0x43; 32]);
+        let address = derive_native_address(&kp1.public_key());
+
+        let mut s = NativeState::new();
+        s.credit(address, Amount::from_base_units(100)).unwrap();
+
+        let err = s.set_public_key(address, kp2.public_key()).unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::PublicKeyDoesNotMatchAddress { .. }
+        ));
+    }
+
+    #[test]
+    fn set_public_key_rejects_double_registration() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let pk = kp.public_key();
+        let address = derive_native_address(&pk);
+
+        let mut s = NativeState::new();
+        s.set_account(NativeAccount::from_public_key(
+            pk,
+            Amount::from_base_units(1_000),
+            0,
+        ));
+
+        let err = s.set_public_key(address, pk).unwrap_err();
+        assert!(matches!(err, StateError::PublicKeyAlreadyRegistered { .. }));
     }
 }

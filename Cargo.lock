@@ -562,6 +562,7 @@ dependencies = [
  "sango-codec",
  "sango-crypto",
  "sango-primitives",
+ "sango-tx",
  "sango-types",
  "thiserror",
 ]

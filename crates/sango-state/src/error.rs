@@ -30,4 +30,31 @@ pub enum StateError {
         /// Adresse concernée.
         address: NativeAddress,
     },
+
+    /// Tentative d'enregistrer une clé publique sur une adresse qui
+    /// n'existe pas dans l'état (même pas comme « fantôme »).
+    #[error("account not found: {address}")]
+    AccountNotFound {
+        /// Adresse concernée.
+        address: NativeAddress,
+    },
+
+    /// Tentative d'enregistrer une clé publique sur un compte qui en a
+    /// déjà une. La rotation de clé n'est **pas** autorisée en V1.
+    #[error("public key already registered for {address}")]
+    PublicKeyAlreadyRegistered {
+        /// Adresse concernée.
+        address: NativeAddress,
+    },
+
+    /// La clé publique fournie est `PublicKey::ZERO`.
+    #[error("public key must not be PublicKey::ZERO")]
+    PublicKeyIsZero,
+
+    /// La clé publique fournie ne dérive pas vers l'adresse cible.
+    #[error("public key does not derive to address {address}")]
+    PublicKeyDoesNotMatchAddress {
+        /// Adresse cible.
+        address: NativeAddress,
+    },
 }
