@@ -581,6 +581,13 @@ dependencies = [
 [[package]]
 name = "sango-tx"
 version = "0.1.0"
+dependencies = [
+ "sango-codec",
+ "sango-crypto",
+ "sango-primitives",
+ "sango-types",
+ "thiserror",
+]
 
 [[package]]
 name = "sango-types"

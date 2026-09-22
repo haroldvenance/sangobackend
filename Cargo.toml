@@ -35,3 +35,4 @@ sango-codec = { path = "crates/sango-codec" }
 sango-crypto = { path = "crates/sango-crypto" }
 sango-types = { path = "crates/sango-types" }
 sango-storage = { path = "crates/sango-storage" }
+sango-tx = { path = "crates/sango-tx" }
