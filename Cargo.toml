@@ -40,3 +40,4 @@ sango-tx = { path = "crates/sango-tx" }
 sango-state = { path = "crates/sango-state" }
 sango-exec = { path = "crates/sango-exec" }
 sango-node = { path = "crates/sango-node" }
+sango-consensus = { path = "crates/sango-consensus" }

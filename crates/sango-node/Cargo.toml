@@ -16,6 +16,7 @@ sango-state.workspace = true
 sango-storage.workspace = true
 sango-tx.workspace = true
 sango-exec.workspace = true
+sango-consensus.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

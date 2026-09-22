@@ -76,6 +76,7 @@ impl RoundContext {
 ///
 /// Contient le keypair nécessaire pour signer. Dans un futur raffinement,
 /// ceci pourra être remplacé par un trait `Signer` (HSM, wallet externe).
+#[derive(Clone)]
 pub struct LocalIdentity {
     keypair: NativeKeypair,
 }
@@ -211,6 +212,50 @@ impl RoundRunner {
             None => Ok(false),
             Some(id) => Ok(id.address() == self.expected_proposer()?),
         }
+    }
+
+    /// Proposition courante (si une a été reçue ou émise).
+    #[must_use]
+    pub fn current_proposal(&self) -> Option<&Proposal> {
+        self.current_proposal.as_ref()
+    }
+
+    /// Adresse locale, si ce runner a une identité de validateur.
+    #[must_use]
+    pub fn local_address(&self) -> Option<NativeAddress> {
+        self.local.as_ref().map(LocalIdentity::address)
+    }
+
+    /// Réinitialise ce runner pour un nouveau `(height, round)`.
+    ///
+    /// - Si `new_height != self.ctx.height`, l'état de consensus est
+    ///   avancé (`advance_height`, reset des locks).
+    /// - Le tracker, l'étape, la proposition courante et les flags de vote
+    ///   sont réinitialisés.
+    pub fn reset_for_round(&mut self, new_height: Height, new_round: Round, parent_hash: Hash32) {
+        if new_height != self.ctx.height {
+            self.state.advance_height(new_height);
+        }
+        self.ctx = RoundContext {
+            chain_id: self.ctx.chain_id,
+            epoch: self.ctx.epoch,
+            height: new_height,
+            round: new_round,
+            parent_hash,
+        };
+        self.state.set_round(new_round);
+        self.tracker = VoteTracker::new(
+            self.ctx.chain_id,
+            self.ctx.epoch,
+            self.ctx.height,
+            self.ctx.round,
+        );
+        self.step = Step::Propose;
+        self.current_proposal = None;
+        self.actions.clear();
+        self.already_prevoted = false;
+        self.already_precommitted = false;
+        self.committed = false;
     }
 
     /// Récupère et vide les actions accumulées.

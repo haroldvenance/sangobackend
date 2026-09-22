@@ -553,6 +553,7 @@ name = "sango-node"
 version = "0.1.0"
 dependencies = [
  "sango-codec",
+ "sango-consensus",
  "sango-crypto",
  "sango-exec",
  "sango-primitives",
