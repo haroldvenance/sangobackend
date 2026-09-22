@@ -7,8 +7,17 @@
 //! - Les `key_hash` sont stockés dans un [`SparseMerkleTree`] binaire 256 niveaux.
 //! - Les valeurs sont l'encodage canonique Sango du type concerné.
 //!
-//! RocksDB (dans `sango-storage`) ne fait que persister les entrées ; il ne
-//! définit **jamais** le consensus.
+//! RocksDB ne fait que persister les entrées ; il ne définit **jamais** le
+//! consensus.
+//!
+//! ## Métadonnées globales
+//!
+//! Le namespace [`Namespace::Metadata`] porte les compteurs cumulés :
+//!
+//! - [`MetadataKey::TotalBurned`] : cumul des SANGO brûlés ;
+//! - [`MetadataKey::TotalGasUsed`] : cumul du gas consommé.
+//!
+//! Ces valeurs font partie du `native_state_root`.
 
 use sango_codec::{Decode, Encode};
 use sango_crypto::{derive_native_address, domain, hash_domain};
@@ -16,6 +25,7 @@ use sango_primitives::{Amount, Hash32, NativeAddress, PublicKey};
 use sango_types::NativeAccount;
 
 use crate::error::StateError;
+use crate::metadata::MetadataKey;
 use crate::namespace::Namespace;
 use crate::smt::{empty_root, SparseMerkleTree};
 
@@ -205,7 +215,6 @@ impl NativeState {
         match self.credit(to, amount) {
             Ok(()) => Ok(()),
             Err(e) => {
-                // Rollback : impossible d'échouer, on vient de débiter.
                 let _ = self.credit(from, amount);
                 Err(e)
             }
@@ -214,24 +223,7 @@ impl NativeState {
 
     /// Enregistre la clé publique d'un compte « fantôme », l'activant.
     ///
-    /// Utilisée lors du **bootstrap** : la première transaction d'un compte
-    /// déclare sa clé publique (`tx.public_key = Some(pk)`), le pipeline de
-    /// validation la vérifie, puis la couche d'application appelle cette
-    /// méthode pour l'enregistrer dans l'état.
-    ///
-    /// # Règles (défense en profondeur)
-    ///
-    /// - Le compte doit exister dans l'état (typiquement un « fantôme »
-    ///   créé par un crédit antérieur) — sinon [`StateError::AccountNotFound`].
-    /// - Le compte ne doit pas déjà avoir de clé enregistrée — sinon
-    ///   [`StateError::PublicKeyAlreadyRegistered`]. La rotation de clé
-    ///   n'est **pas** autorisée en V1.
-    /// - `public_key` ne doit pas être `PublicKey::ZERO` — sinon
-    ///   [`StateError::PublicKeyIsZero`].
-    /// - `derive_native_address(public_key)` doit égaler `address` — sinon
-    ///   [`StateError::PublicKeyDoesNotMatchAddress`].
-    ///
-    /// Le solde et le nonce du compte sont préservés.
+    /// Voir la documentation de `sango-tx` pour la règle de bootstrap.
     pub fn set_public_key(
         &mut self,
         address: NativeAddress,
@@ -240,24 +232,104 @@ impl NativeState {
         if public_key.is_zero() {
             return Err(StateError::PublicKeyIsZero);
         }
-
-        // Defense-in-depth : le pipeline de validation garantit déjà cette
-        // propriété, mais on la revérifie au niveau de l'état.
         if derive_native_address(&public_key) != address {
             return Err(StateError::PublicKeyDoesNotMatchAddress { address });
         }
-
         let mut acc = self
             .get_account(&address)
             .ok_or(StateError::AccountNotFound { address })?;
-
         if acc.has_registered_public_key() {
             return Err(StateError::PublicKeyAlreadyRegistered { address });
         }
-
         acc.public_key = public_key;
         self.set_account(acc);
         Ok(())
+    }
+
+    // --- Metadata : compteurs globaux ---------------------------------------
+
+    /// Cumul des SANGO brûlés, en base units.
+    ///
+    /// Retourne `Amount::ZERO` si aucune entrée n'a encore été écrite
+    /// (cas normal d'un état initial).
+    #[must_use]
+    pub fn total_burned(&self) -> Amount {
+        match self.get_entry(Namespace::Metadata, &[MetadataKey::TotalBurned.tag()]) {
+            Some(bytes) => u128::decode_exact(bytes)
+                .map(Amount::from_base_units)
+                .unwrap_or(Amount::ZERO),
+            None => Amount::ZERO,
+        }
+    }
+
+    /// Cumul du gas consommé.
+    ///
+    /// Retourne `0` si aucune entrée n'a encore été écrite.
+    #[must_use]
+    pub fn total_gas_used(&self) -> u64 {
+        match self.get_entry(Namespace::Metadata, &[MetadataKey::TotalGasUsed.tag()]) {
+            Some(bytes) => u64::decode_exact(bytes).unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// Ajoute un montant au cumul des SANGO brûlés.
+    ///
+    /// # Erreurs
+    ///
+    /// Retourne [`StateError::TotalBurnedOverflow`] si le cumul dépasserait
+    /// `u128::MAX`.
+    pub fn add_burned(&mut self, amount: Amount) -> Result<(), StateError> {
+        let current = self.total_burned().base_units();
+        let delta = amount.base_units();
+        let new = current
+            .checked_add(delta)
+            .ok_or(StateError::TotalBurnedOverflow { current, delta })?;
+        let bytes = Amount::from_base_units(new).encode_to_vec();
+        self.put_entry(
+            Namespace::Metadata,
+            &[MetadataKey::TotalBurned.tag()],
+            bytes,
+        );
+        Ok(())
+    }
+
+    /// Ajoute un montant au cumul du gas consommé.
+    ///
+    /// # Erreurs
+    ///
+    /// Retourne [`StateError::TotalGasUsedOverflow`] si le cumul dépasserait
+    /// `u64::MAX`.
+    pub fn add_gas_used(&mut self, gas: u64) -> Result<(), StateError> {
+        let current = self.total_gas_used();
+        let new = current
+            .checked_add(gas)
+            .ok_or(StateError::TotalGasUsedOverflow {
+                current,
+                delta: gas,
+            })?;
+        let bytes = new.encode_to_vec();
+        self.put_entry(
+            Namespace::Metadata,
+            &[MetadataKey::TotalGasUsed.tag()],
+            bytes,
+        );
+        Ok(())
+    }
+
+    /// Calcule l'offre existante :
+    ///
+    /// ```text
+    /// current_supply = initial_supply − total_burned
+    /// ```
+    ///
+    /// Retourne `None` si `total_burned > initial_supply`, ce qui signalerait
+    /// une incohérence (ne devrait jamais arriver : `total_burned` est un
+    /// cumul de frais prélevés, donc ≤ supply en circulation au moment du
+    /// prélèvement).
+    #[must_use]
+    pub fn current_supply(&self, initial_supply: Amount) -> Option<Amount> {
+        initial_supply.checked_sub(self.total_burned())
     }
 
     /// Racine de l'état vide (constante normative).
@@ -285,7 +357,7 @@ mod tests {
         }
     }
 
-    // --- Tests existants (rappel) -------------------------------------------
+    // --- Tests existants ----------------------------------------------------
 
     #[test]
     fn empty_state_is_empty() {
@@ -403,10 +475,8 @@ mod tests {
     fn root_depends_on_content() {
         let mut a = NativeState::new();
         a.credit(addr(0xaa), Amount::from_base_units(100)).unwrap();
-
         let mut b = NativeState::new();
         b.credit(addr(0xaa), Amount::from_base_units(101)).unwrap();
-
         assert_ne!(a.native_state_root(), b.native_state_root());
     }
 
@@ -455,10 +525,8 @@ mod tests {
         let pk = kp.public_key();
         let account = NativeAccount::from_public_key(pk, Amount::from_base_units(1_000), 0);
         let address = account.address;
-
         let mut s = NativeState::new();
         s.set_account(account);
-
         assert_eq!(s.public_key_of(&address), Some(pk));
     }
 
@@ -474,11 +542,9 @@ mod tests {
         let pk = kp.public_key();
         let account = NativeAccount::from_public_key(pk, Amount::from_base_units(1_000), 0);
         let address = account.address;
-
         let mut s = NativeState::new();
         s.set_account(account);
         s.bump_nonce(address).unwrap();
-
         let after = s.get_account(&address).unwrap();
         assert_eq!(after.public_key, pk);
         assert_eq!(after.nonce, 1);
@@ -490,11 +556,9 @@ mod tests {
         let pk = kp.public_key();
         let account = NativeAccount::from_public_key(pk, Amount::from_base_units(1_000), 0);
         let address = account.address;
-
         let mut s = NativeState::new();
         s.set_account(account);
         s.credit(address, Amount::from_base_units(500)).unwrap();
-
         let after = s.get_account(&address).unwrap();
         assert_eq!(after.public_key, pk);
         assert_eq!(after.balance, Amount::from_base_units(1_500));
@@ -506,11 +570,9 @@ mod tests {
         let pk = kp.public_key();
         let account = NativeAccount::from_public_key(pk, Amount::from_base_units(1_000), 0);
         let address = account.address;
-
         let mut s = NativeState::new();
         s.set_account(account);
         s.debit(address, Amount::from_base_units(400)).unwrap();
-
         let after = s.get_account(&address).unwrap();
         assert_eq!(after.public_key, pk);
         assert_eq!(after.balance, Amount::from_base_units(600));
@@ -524,20 +586,15 @@ mod tests {
         assert_eq!(acc.address, derive_native_address(&pk));
     }
 
-    // --- set_public_key : bootstrap -----------------------------------------
-
     #[test]
     fn set_public_key_activates_ghost() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let pk = kp.public_key();
         let address = derive_native_address(&pk);
-
         let mut s = NativeState::new();
         s.credit(address, Amount::from_base_units(1_000)).unwrap();
         assert_eq!(s.public_key_of(&address), None);
-
         s.set_public_key(address, pk).unwrap();
-
         assert_eq!(s.public_key_of(&address), Some(pk));
         let acc = s.get_account(&address).unwrap();
         assert!(acc.has_registered_public_key());
@@ -548,14 +605,11 @@ mod tests {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let pk = kp.public_key();
         let address = derive_native_address(&pk);
-
         let mut s = NativeState::new();
         s.credit(address, Amount::from_base_units(500)).unwrap();
         let root_before = s.native_state_root();
-
         s.set_public_key(address, pk).unwrap();
         let root_after = s.native_state_root();
-
         assert_ne!(root_before, root_after);
     }
 
@@ -564,7 +618,6 @@ mod tests {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let pk = kp.public_key();
         let address = derive_native_address(&pk);
-
         let mut s = NativeState::new();
         s.set_account(NativeAccount {
             address,
@@ -572,9 +625,7 @@ mod tests {
             balance: Amount::from_base_units(777),
             nonce: 3,
         });
-
         s.set_public_key(address, pk).unwrap();
-
         let acc = s.get_account(&address).unwrap();
         assert_eq!(acc.public_key, pk);
         assert_eq!(acc.balance, Amount::from_base_units(777));
@@ -586,7 +637,6 @@ mod tests {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let pk = kp.public_key();
         let address = derive_native_address(&pk);
-
         let mut s = NativeState::new();
         let err = s.set_public_key(address, pk).unwrap_err();
         assert!(matches!(err, StateError::AccountNotFound { .. }));
@@ -596,10 +646,8 @@ mod tests {
     fn set_public_key_rejects_zero() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let address = derive_native_address(&kp.public_key());
-
         let mut s = NativeState::new();
         s.credit(address, Amount::from_base_units(100)).unwrap();
-
         let err = s.set_public_key(address, PublicKey::ZERO).unwrap_err();
         assert_eq!(err, StateError::PublicKeyIsZero);
     }
@@ -609,10 +657,8 @@ mod tests {
         let kp1 = NativeKeypair::from_seed([0x42; 32]);
         let kp2 = NativeKeypair::from_seed([0x43; 32]);
         let address = derive_native_address(&kp1.public_key());
-
         let mut s = NativeState::new();
         s.credit(address, Amount::from_base_units(100)).unwrap();
-
         let err = s.set_public_key(address, kp2.public_key()).unwrap_err();
         assert!(matches!(
             err,
@@ -625,15 +671,154 @@ mod tests {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let pk = kp.public_key();
         let address = derive_native_address(&pk);
-
         let mut s = NativeState::new();
         s.set_account(NativeAccount::from_public_key(
             pk,
             Amount::from_base_units(1_000),
             0,
         ));
-
         let err = s.set_public_key(address, pk).unwrap_err();
         assert!(matches!(err, StateError::PublicKeyAlreadyRegistered { .. }));
+    }
+
+    // --- Metadata : total_burned / total_gas_used ---------------------------
+
+    #[test]
+    fn initial_total_burned_is_zero() {
+        let s = NativeState::new();
+        assert_eq!(s.total_burned(), Amount::ZERO);
+    }
+
+    #[test]
+    fn initial_total_gas_used_is_zero() {
+        let s = NativeState::new();
+        assert_eq!(s.total_gas_used(), 0);
+    }
+
+    #[test]
+    fn add_burned_accumulates() {
+        let mut s = NativeState::new();
+        s.add_burned(Amount::from_base_units(100)).unwrap();
+        assert_eq!(s.total_burned(), Amount::from_base_units(100));
+        s.add_burned(Amount::from_base_units(250)).unwrap();
+        assert_eq!(s.total_burned(), Amount::from_base_units(350));
+    }
+
+    #[test]
+    fn add_gas_used_accumulates() {
+        let mut s = NativeState::new();
+        s.add_gas_used(21_000).unwrap();
+        assert_eq!(s.total_gas_used(), 21_000);
+        s.add_gas_used(42_000).unwrap();
+        assert_eq!(s.total_gas_used(), 63_000);
+    }
+
+    #[test]
+    fn add_burned_changes_root() {
+        let mut s = NativeState::new();
+        let before = s.native_state_root();
+        s.add_burned(Amount::from_base_units(1)).unwrap();
+        assert_ne!(s.native_state_root(), before);
+    }
+
+    #[test]
+    fn add_gas_used_changes_root() {
+        let mut s = NativeState::new();
+        let before = s.native_state_root();
+        s.add_gas_used(1).unwrap();
+        assert_ne!(s.native_state_root(), before);
+    }
+
+    #[test]
+    fn add_burned_overflow_rejected() {
+        let mut s = NativeState::new();
+        s.add_burned(Amount::from_base_units(u128::MAX)).unwrap();
+        let err = s.add_burned(Amount::from_base_units(1)).unwrap_err();
+        assert!(matches!(err, StateError::TotalBurnedOverflow { .. }));
+        // La valeur n'a pas changé.
+        assert_eq!(s.total_burned(), Amount::from_base_units(u128::MAX));
+    }
+
+    #[test]
+    fn add_gas_used_overflow_rejected() {
+        let mut s = NativeState::new();
+        s.add_gas_used(u64::MAX).unwrap();
+        let err = s.add_gas_used(1).unwrap_err();
+        assert!(matches!(err, StateError::TotalGasUsedOverflow { .. }));
+        assert_eq!(s.total_gas_used(), u64::MAX);
+    }
+
+    #[test]
+    fn metadata_root_is_insertion_order_invariant() {
+        let mut a = NativeState::new();
+        a.add_burned(Amount::from_base_units(100)).unwrap();
+        a.add_gas_used(21_000).unwrap();
+
+        let mut b = NativeState::new();
+        b.add_gas_used(21_000).unwrap();
+        b.add_burned(Amount::from_base_units(100)).unwrap();
+
+        assert_eq!(a.native_state_root(), b.native_state_root());
+    }
+
+    #[test]
+    fn metadata_is_independent_of_accounts() {
+        let mut s = NativeState::new();
+        s.credit(addr(0xaa), Amount::from_base_units(1_000))
+            .unwrap();
+        s.add_burned(Amount::from_base_units(50)).unwrap();
+        // total_burned n'est pas affecté par un crédit ultérieur.
+        s.credit(addr(0xbb), Amount::from_base_units(500)).unwrap();
+        assert_eq!(s.total_burned(), Amount::from_base_units(50));
+        assert_eq!(s.balance_of(&addr(0xaa)), Amount::from_base_units(1_000));
+        assert_eq!(s.balance_of(&addr(0xbb)), Amount::from_base_units(500));
+    }
+
+    #[test]
+    fn current_supply_subtracts_burned() {
+        let initial = Amount::from_sango(1_000_000_000).unwrap();
+        let mut s = NativeState::new();
+        s.add_burned(Amount::from_sango(1_000).unwrap()).unwrap();
+        let current = s.current_supply(initial).unwrap();
+        assert_eq!(
+            current.base_units(),
+            initial.base_units() - Amount::from_sango(1_000).unwrap().base_units()
+        );
+    }
+
+    #[test]
+    fn current_supply_no_burn_is_initial() {
+        let initial = Amount::from_sango(1_000_000_000).unwrap();
+        let s = NativeState::new();
+        assert_eq!(s.current_supply(initial), Some(initial));
+    }
+
+    #[test]
+    fn current_supply_underflow_returns_none() {
+        let initial = Amount::from_base_units(100);
+        let mut s = NativeState::new();
+        s.add_burned(Amount::from_base_units(101)).unwrap();
+        assert_eq!(s.current_supply(initial), None);
+    }
+
+    #[test]
+    fn total_burned_does_not_affect_account_balance() {
+        let mut s = NativeState::new();
+        s.credit(addr(0xaa), Amount::from_base_units(1_000))
+            .unwrap();
+        let before = s.balance_of(&addr(0xaa));
+        s.add_burned(Amount::from_base_units(500)).unwrap();
+        assert_eq!(s.balance_of(&addr(0xaa)), before);
+    }
+
+    #[test]
+    fn metadata_survives_clone() {
+        let mut s = NativeState::new();
+        s.add_burned(Amount::from_base_units(42)).unwrap();
+        s.add_gas_used(100).unwrap();
+        let clone = s.clone();
+        assert_eq!(clone.total_burned(), Amount::from_base_units(42));
+        assert_eq!(clone.total_gas_used(), 100);
+        assert_eq!(clone.native_state_root(), s.native_state_root());
     }
 }

@@ -32,7 +32,7 @@ pub enum StateError {
     },
 
     /// Tentative d'enregistrer une clé publique sur une adresse qui
-    /// n'existe pas dans l'état (même pas comme « fantôme »).
+    /// n'existe pas dans l'état.
     #[error("account not found: {address}")]
     AccountNotFound {
         /// Adresse concernée.
@@ -56,5 +56,31 @@ pub enum StateError {
     PublicKeyDoesNotMatchAddress {
         /// Adresse cible.
         address: NativeAddress,
+    },
+
+    /// Le cumul `total_burned` dépasserait `u128::MAX`.
+    #[error("total_burned overflow: current {current}, delta {delta}")]
+    TotalBurnedOverflow {
+        /// Valeur actuelle.
+        current: u128,
+        /// Delta tenté.
+        delta: u128,
+    },
+
+    /// Le cumul `total_gas_used` dépasserait `u64::MAX`.
+    #[error("total_gas_used overflow: current {current}, delta {delta}")]
+    TotalGasUsedOverflow {
+        /// Valeur actuelle.
+        current: u64,
+        /// Delta tenté.
+        delta: u64,
+    },
+
+    /// Une métadonnée présente dans l'état n'a pas pu être décodée
+    /// (encodage corrompu ou incompatible).
+    #[error("corrupted metadata entry: {key}")]
+    CorruptedMetadata {
+        /// Nom de la clé fautive.
+        key: &'static str,
     },
 }

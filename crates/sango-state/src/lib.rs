@@ -24,6 +24,13 @@
 //! )
 //! ```
 //!
+//! ## Namespaces
+//!
+//! - `NativeAccount` : [`NativeAccount`](sango_types::NativeAccount) ;
+//! - `Validator`, `Delegation`, `Staking`, `Evidence`, `Governance` :
+//!   à venir ;
+//! - `Metadata` : compteurs globaux (`total_burned`, `total_gas_used`).
+//!
 //! RocksDB (dans `sango-storage`) ne fait que persister les entrées ; il ne
 //! définit jamais le consensus.
 
@@ -31,12 +38,14 @@
 #![warn(missing_docs)]
 
 mod error;
+mod metadata;
 mod namespace;
 mod native;
 mod root;
 mod smt;
 
 pub use error::StateError;
+pub use metadata::MetadataKey;
 pub use namespace::Namespace;
 pub use native::{state_key_hash, NativeState};
 pub use root::global_state_root;
