@@ -72,6 +72,14 @@ impl Node {
         &self.state
     }
 
+    /// Vue en écriture sur l'état. **Usage tests uniquement** : ne pas
+    /// appeler depuis du code de production, qui doit passer par
+    /// `apply_block`.
+    #[doc(hidden)]
+    pub fn state_mut_for_test(&mut self) -> &mut NativeState {
+        &mut self.state
+    }
+
     /// Vue en lecture sur le stockage.
     #[must_use]
     pub fn storage(&self) -> &Storage {
@@ -135,6 +143,55 @@ impl Node {
             },
             None => SenderInfo::ghost(address, 0, 0),
         }
+    }
+
+    /// Lit un bloc par hauteur.
+    ///
+    /// Retourne `None` si aucun bloc n'est enregistré à cette hauteur.
+    pub fn get_block_by_height(&self, height: u64) -> Result<Option<Block>, NodeError> {
+        let height_key = height.to_le_bytes();
+        let Some(hash_bytes) = self.storage.get(Column::BlockHeights, &height_key)? else {
+            return Ok(None);
+        };
+        if hash_bytes.len() != 32 {
+            return Err(NodeError::CorruptedStateKey {
+                got: hash_bytes.len(),
+            });
+        }
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(&hash_bytes);
+        let hash = Hash32::from_bytes(raw);
+        let Some(block_bytes) = self.storage.get(Column::Blocks, hash.as_bytes())? else {
+            return Ok(None);
+        };
+        Block::decode_exact(&block_bytes)
+            .map(Some)
+            .map_err(|e| NodeError::Storage(sango_storage::StorageError::Codec(e)))
+    }
+
+    /// Liste tous les validateurs enregistrés.
+    ///
+    /// Itère toutes les entrées d'état et filtre celles qui, une fois
+    /// décodées comme `ValidatorInfo`, ont un `key_hash` qui correspond
+    /// exactement à `state_key_hash(Validator, info.address)`. C'est une
+    /// vérification cryptographique : aucune ambiguïté possible avec un
+    /// compte ou une délégation.
+    ///
+    /// Complexité : `O(n)` sur le nombre d'entrées d'état. Acceptable pour
+    /// V1 (les validateurs sont peu nombreux et l'appel est rare).
+    #[must_use]
+    pub fn all_validators(&self) -> Vec<sango_types::ValidatorInfo> {
+        use sango_state::{state_key_hash, Namespace};
+        let mut out = Vec::new();
+        for (key_hash, value) in self.state.iter_entries() {
+            if let Ok(info) = sango_types::ValidatorInfo::decode_exact(value) {
+                let expected = state_key_hash(Namespace::Validator, info.address.as_bytes());
+                if expected == *key_hash {
+                    out.push(info);
+                }
+            }
+        }
+        out
     }
 
     /// Applique un bloc de bout en bout.
@@ -217,6 +274,11 @@ impl Node {
             Column::BlockHeaders,
             block_hash.as_bytes(),
             block.header.encode_to_vec(),
+        );
+        batch.put(
+            Column::BlockHeights,
+            block.header.height.get().to_le_bytes(),
+            block_hash.as_bytes(),
         );
         for tx in &block.transactions {
             let tx_hash = tx.hash();

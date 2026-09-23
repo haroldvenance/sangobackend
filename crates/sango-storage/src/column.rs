@@ -14,6 +14,8 @@ pub enum Column {
     Blocks,
     /// En-têtes de blocs indexés par `block_hash`.
     BlockHeaders,
+    /// Index hauteur → hash de bloc (`u64 LE` → `Hash32`).
+    BlockHeights,
     /// Transactions indexées par `tx_hash`.
     Transactions,
     /// Receipts indexés par `tx_hash`.
@@ -37,6 +39,7 @@ impl Column {
     pub const ALL: &'static [Column] = &[
         Column::Blocks,
         Column::BlockHeaders,
+        Column::BlockHeights,
         Column::Transactions,
         Column::Receipts,
         Column::StateNative,
@@ -53,6 +56,7 @@ impl Column {
         match self {
             Column::Blocks => "blocks",
             Column::BlockHeaders => "block_headers",
+            Column::BlockHeights => "block_heights",
             Column::Transactions => "transactions",
             Column::Receipts => "receipts",
             Column::StateNative => "state_native",
@@ -82,6 +86,7 @@ mod tests {
     fn names_match_freeze() {
         assert_eq!(Column::Blocks.name(), "blocks");
         assert_eq!(Column::BlockHeaders.name(), "block_headers");
+        assert_eq!(Column::BlockHeights.name(), "block_heights");
         assert_eq!(Column::Transactions.name(), "transactions");
         assert_eq!(Column::Receipts.name(), "receipts");
         assert_eq!(Column::StateNative.name(), "state_native");
@@ -94,6 +99,6 @@ mod tests {
 
     #[test]
     fn all_contains_every_variant() {
-        assert_eq!(Column::ALL.len(), 10);
+        assert_eq!(Column::ALL.len(), 11);
     }
 }
