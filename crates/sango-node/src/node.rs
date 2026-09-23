@@ -4,11 +4,11 @@ use std::path::Path;
 
 use sango_codec::{Decode, Encode};
 use sango_exec::{apply_block as exec_apply_block, BlockExecutionResult, ExecutionContext};
-use sango_primitives::{Amount, ChainId32, Hash32, NativeAddress};
+use sango_primitives::{Amount, ChainId32, Epoch, Hash32, Height, NativeAddress, Round};
 use sango_state::{MetadataKey, NativeState};
 use sango_storage::{metadata_key, Batch, Column, Storage};
-use sango_tx::{validate_transaction, SenderInfo, ValidationContext};
-use sango_types::{Block, BlockHeader, ChainTip};
+use sango_tx::{validate_transaction, SenderInfo, ValidatedTransaction, ValidationContext};
+use sango_types::{Block, BlockHeader, ChainTip, Transaction};
 
 use crate::base_fee::{next_base_fee, INITIAL_BASE_FEE};
 use crate::diff::diff_state;
@@ -128,9 +128,9 @@ impl Node {
             .map_err(|e| NodeError::Storage(sango_storage::StorageError::Codec(e)))
     }
 
-    /// Construit un [`SenderInfo`] à partir de l'état courant.
-    fn sender_info(&self, address: NativeAddress) -> SenderInfo {
-        match self.state.get_account(&address) {
+    /// Construit un [`SenderInfo`] depuis un état donné.
+    fn sender_info_from_state(state: &NativeState, address: NativeAddress) -> SenderInfo {
+        match state.get_account(&address) {
             Some(acc) => SenderInfo {
                 address: acc.address,
                 public_key: if acc.has_registered_public_key() {
@@ -143,6 +143,106 @@ impl Node {
             },
             None => SenderInfo::ghost(address, 0, 0),
         }
+    }
+
+    /// Construit un [`SenderInfo`] à partir de l'état courant.
+    fn sender_info(&self, address: NativeAddress) -> SenderInfo {
+        Self::sender_info_from_state(&self.state, address)
+    }
+
+    /// Prépare un bloc à proposer à partir d'une liste ordonnée de
+    /// transactions candidates (typiquement issues du mempool).
+    ///
+    /// ## Comportement
+    ///
+    /// - Clone l'état courant pour **ne pas le muter**.
+    /// - Valide puis applique chaque candidate sur la copie.
+    /// - **S'arrête au premier échec** : la dépendance de nonce impose
+    ///   qu'un tx en échec bloque les suivants.
+    /// - Construit un `Block` avec les txs acceptées et le gas cumulé.
+    ///
+    /// ## Placeholders V1
+    ///
+    /// - `transaction_root`, `state_root`, `receipt_root` restent à
+    ///   `Hash32::ZERO` tant que les MPT ne sont pas implémentés.
+    /// - `Node::apply_block` ne vérifie **pas** ces trois roots (limite
+    ///   documentée).
+    ///
+    /// Le `Vec<ValidatedTransaction>` retourné correspond 1:1 aux txs du
+    /// bloc, dans le même ordre.
+    #[must_use]
+    pub fn prepare_block_from_candidates(
+        &self,
+        epoch: Epoch,
+        round: Round,
+        candidates: Vec<Transaction>,
+        max_txs: usize,
+        proposer: NativeAddress,
+        timestamp: u64,
+    ) -> (Block, Vec<ValidatedTransaction>) {
+        use sango_exec::{apply_tx_no_rollback, gas_for, ExecutionContext, NATIVE_TRANSFER_GAS};
+
+        let mut trial = self.state.clone();
+
+        let (parent_hash, height) = match self.tip {
+            Some(t) => (t.block_hash, t.height.get() + 1),
+            None => (Hash32::ZERO, 0),
+        };
+        let base_fee = self
+            .expected_base_fee()
+            .unwrap_or(crate::base_fee::INITIAL_BASE_FEE);
+
+        let mut accepted: Vec<Transaction> = Vec::new();
+        let mut validated: Vec<ValidatedTransaction> = Vec::new();
+        let mut total_gas: u64 = 0;
+
+        for tx in candidates.into_iter().take(max_txs) {
+            let sender = Self::sender_info_from_state(&trial, tx.sender);
+            let vctx = ValidationContext {
+                expected_chain_id: self.chain_id,
+                base_fee,
+                sender: &sender,
+            };
+            let v = match validate_transaction(&tx, &vctx) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let gas_used = gas_for(tx.tx_kind).unwrap_or(NATIVE_TRANSFER_GAS);
+            let exec_ctx = ExecutionContext {
+                chain_id: self.chain_id,
+                base_fee,
+                fee_recipient: proposer,
+                initial_supply: self.initial_supply,
+                current_time: timestamp,
+            };
+            if apply_tx_no_rollback(&mut trial, &tx, &v, gas_used, &exec_ctx).is_err() {
+                break;
+            }
+            total_gas = total_gas.saturating_add(gas_used);
+            accepted.push(tx);
+            validated.push(v);
+        }
+
+        let block = Block {
+            header: BlockHeader {
+                version: sango_types::PROTOCOL_VERSION_V1,
+                chain_id: self.chain_id,
+                epoch,
+                height: Height::new(height),
+                round,
+                previous_block_hash: parent_hash,
+                timestamp,
+                proposer_address: proposer,
+                transaction_root: Hash32::ZERO,
+                state_root: Hash32::ZERO,
+                receipt_root: Hash32::ZERO,
+                gas_used: total_gas,
+                gas_limit: 30_000_000,
+                base_fee,
+            },
+            transactions: accepted,
+        };
+        (block, validated)
     }
 
     /// Lit un bloc par hauteur.

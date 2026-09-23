@@ -25,8 +25,8 @@ pub mod staking;
 
 pub use apply::{
     apply_block, apply_block_transfers, apply_transfer, apply_transfer_with_gas,
-    AppliedTransaction, BlockApplyResult, BlockExecutionResult, ExecutionContext,
-    NATIVE_TRANSFER_GAS,
+    apply_tx_no_rollback, AppliedTransaction, BlockApplyResult, BlockExecutionResult,
+    ExecutionContext, NATIVE_TRANSFER_GAS,
 };
 pub use error::ApplyError;
 pub use staking::{apply_staking_no_rollback, gas_for};

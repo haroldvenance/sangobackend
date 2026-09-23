@@ -1,14 +1,23 @@
 //! Driver événementiel pour la participation au consensus.
 
+use std::collections::{HashMap, HashSet};
+
 use sango_consensus::{
     Action, ConsensusError, ConsensusState, LocalIdentity, RoundContext, RoundRunner, Step,
     ValidatorSet,
 };
 use sango_primitives::{Epoch, Hash32, Height, NativeAddress, Round};
-use sango_types::{Block, BlockHeader, CommitCertificate, Precommit, Prevote, Proposal};
+use sango_types::{CommitCertificate, Precommit, Prevote, Proposal, Transaction};
 
+use crate::base_fee::INITIAL_BASE_FEE;
 use crate::error::NodeError;
-use crate::node::Node;
+use crate::node_handle::NodeHandle;
+
+/// Nombre maximum de transactions incluses dans un bloc proposé.
+pub const MAX_TXS_PER_BLOCK: usize = 1024;
+
+/// Nombre maximal d'itérations dans `process_actions`.
+const MAX_ACTION_LOOPS: usize = 32;
 
 /// Message réseau sortant produit par le driver.
 #[derive(Clone, Debug)]
@@ -63,12 +72,9 @@ pub enum DriverError {
     TooManyActions,
 }
 
-/// Nombre maximal d'itérations dans `process_actions`.
-const MAX_ACTION_LOOPS: usize = 32;
-
 /// Driver consensus pour un nœud.
 pub struct Driver {
-    node: Node,
+    handle: NodeHandle,
     validator_set: ValidatorSet,
     local: Option<LocalIdentity>,
     epoch: Epoch,
@@ -78,18 +84,20 @@ pub struct Driver {
 }
 
 impl Driver {
-    /// Construit un driver à partir d'un nœud existant.
+    /// Construit un driver à partir d'un `NodeHandle`.
     pub fn new(
-        node: Node,
+        handle: NodeHandle,
         validator_set: ValidatorSet,
         local: Option<LocalIdentity>,
         epoch: Epoch,
     ) -> Result<Self, DriverError> {
-        let chain_id = node.chain_id();
-        let (height, parent_hash) = match node.tip() {
-            Some(t) => (Height::new(t.height.get() + 1), t.block_hash),
-            None => (Height::new(0), Hash32::ZERO),
-        };
+        let (chain_id, height, parent_hash) = handle.with_node(|n| {
+            let (h, p) = match n.tip() {
+                Some(t) => (Height::new(t.height.get() + 1), t.block_hash),
+                None => (Height::new(0), Hash32::ZERO),
+            };
+            (n.chain_id(), h, p)
+        });
         let round = Round::new(0);
         let ctx = RoundContext {
             chain_id,
@@ -101,7 +109,7 @@ impl Driver {
         let state = ConsensusState::new(height);
         let runner = RoundRunner::new(ctx, validator_set.clone(), state, local.clone());
         Ok(Self {
-            node,
+            handle,
             validator_set,
             local,
             epoch,
@@ -113,10 +121,10 @@ impl Driver {
 
     // --- Accesseurs --------------------------------------------------------
 
-    /// Nœud sous-jacent (lecture).
+    /// Handle partagé sur le nœud + mempool.
     #[must_use]
-    pub fn node(&self) -> &Node {
-        &self.node
+    pub fn node_handle(&self) -> &NodeHandle {
+        &self.handle
     }
 
     /// Validator set.
@@ -156,7 +164,7 @@ impl Driver {
 
     // --- API principale ----------------------------------------------------
 
-    /// Propose un bloc si nous sommes le proposer et à l'étape `Propose`.
+    /// Propose un bloc (avec txs du mempool) si nous sommes le proposer.
     pub fn maybe_propose(&mut self) -> Result<(), DriverError> {
         if self.runner.step() != Step::Propose {
             return Ok(());
@@ -164,7 +172,29 @@ impl Driver {
         if !self.runner.is_proposer()? {
             return Ok(());
         }
-        let block = self.build_block()?;
+
+        let id = self.local.as_ref().ok_or(DriverError::NoLocalIdentity)?;
+        let proposer = id.address();
+
+        // 1. Récupérer les candidats du mempool, ordonnés par priorité.
+        let candidates = self.collect_mempool_candidates();
+
+        // 2. Construire le bloc via Node (pré-validation + application trial).
+        let epoch = self.epoch;
+        let round = self.runner.ctx().round;
+        let height = self.runner.ctx().height;
+        let timestamp = 1_700_000_000u64.saturating_add(height.get());
+        let (block, _validated) = self.handle.with_node(|n| {
+            n.prepare_block_from_candidates(
+                epoch,
+                round,
+                candidates,
+                MAX_TXS_PER_BLOCK,
+                proposer,
+                timestamp,
+            )
+        });
+
         self.runner.propose(block)?;
         self.process_actions()
     }
@@ -219,33 +249,74 @@ impl Driver {
 
     // --- Internes ----------------------------------------------------------
 
-    fn build_block(&self) -> Result<Block, DriverError> {
-        let id = self.local.as_ref().ok_or(DriverError::NoLocalIdentity)?;
-        let (height, parent_hash) = match self.node.tip() {
-            Some(t) => (t.height.get() + 1, t.block_hash),
-            None => (0, Hash32::ZERO),
-        };
-        let base_fee = self.node.expected_base_fee()?;
-        let block = Block {
-            header: BlockHeader {
-                version: sango_types::PROTOCOL_VERSION_V1,
-                chain_id: self.node.chain_id(),
-                epoch: self.epoch,
-                height: Height::new(height),
-                round: self.runner.ctx().round,
-                previous_block_hash: parent_hash,
-                timestamp: 1_700_000_000 + height,
-                proposer_address: id.address(),
-                transaction_root: Hash32::ZERO,
-                state_root: Hash32::ZERO,
-                receipt_root: Hash32::ZERO,
-                gas_used: 0,
-                gas_limit: 30_000_000,
-                base_fee,
-            },
-            transactions: Vec::new(),
-        };
-        Ok(block)
+    /// Collecte les transactions candidates du mempool, ordonnées par
+    /// priorité effective décroissante et FIFO.
+    ///
+    /// Le tri respecte les dépendances de nonce via
+    /// [`sango_mempool::Mempool::select_for_block`].
+    fn collect_mempool_candidates(&self) -> Vec<Transaction> {
+        // 1. Sendors uniques présents dans le mempool.
+        let senders: Vec<NativeAddress> = self.handle.with_mempool(|pool| {
+            let mut s = HashSet::new();
+            for h in pool.hashes() {
+                if let Some(e) = pool.get(&h) {
+                    s.insert(e.tx.sender);
+                }
+            }
+            s.into_iter().collect()
+        });
+
+        if senders.is_empty() {
+            return Vec::new();
+        }
+
+        // 2. Nonces courants dans l'état.
+        let nonces: HashMap<NativeAddress, u64> = self.handle.with_node(|n| {
+            senders
+                .iter()
+                .map(|s| (*s, n.state().nonce_of(s)))
+                .collect()
+        });
+
+        // 3. Sélection ordonnée.
+        let entries = self
+            .handle
+            .with_mempool(|pool| pool.select_for_block(MAX_TXS_PER_BLOCK, &nonces));
+
+        entries.into_iter().map(|e| e.tx).collect()
+    }
+
+    /// Purge le mempool après l'application d'un bloc.
+    ///
+    /// - retire les transactions dont le nonce est déjà appliqué ;
+    /// - retire celles dont `max_fee < new_base_fee`.
+    fn prune_mempool(&self) {
+        // 1. Sendors uniques encore dans le mempool.
+        let senders: Vec<NativeAddress> = self.handle.with_mempool(|pool| {
+            let mut s = HashSet::new();
+            for h in pool.hashes() {
+                if let Some(e) = pool.get(&h) {
+                    s.insert(e.tx.sender);
+                }
+            }
+            s.into_iter().collect()
+        });
+
+        // 2. Nonces courants + nouvelle base fee (state read lock).
+        let (nonces, new_base_fee) = self.handle.with_node(|n| {
+            let nonces: HashMap<NativeAddress, u64> = senders
+                .iter()
+                .map(|s| (*s, n.state().nonce_of(s)))
+                .collect();
+            let bf = n.expected_base_fee().unwrap_or(INITIAL_BASE_FEE);
+            (nonces, bf)
+        });
+
+        // 3. Prune + evict (mempool lock).
+        self.handle.with_mempool(|pool| {
+            let _ = pool.prune_below_nonces(&nonces);
+            let _ = pool.evict_below_base_fee(new_base_fee);
+        });
     }
 
     fn process_actions(&mut self) -> Result<(), DriverError> {
@@ -276,7 +347,8 @@ impl Driver {
                             .current_proposal()
                             .map(|p| p.block.clone())
                             .ok_or(DriverError::MissingBlockForCommit)?;
-                        self.node.apply_block(&block)?;
+                        self.handle.with_node_mut(|n| n.apply_block(&block))?;
+                        self.prune_mempool();
                         self.events.push(DriverEvent::Committed {
                             height,
                             round,

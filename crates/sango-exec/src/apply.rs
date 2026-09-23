@@ -478,7 +478,7 @@ pub(crate) fn apply_transfer_no_rollback(
 /// - `TxKind::Transfer` → [`apply_transfer_no_rollback`]
 /// - `TxKind` de staking → [`crate::staking::apply_staking_no_rollback`]
 /// - Autres → [`ApplyError::UnsupportedTxKind`]
-pub(crate) fn apply_tx_no_rollback(
+pub fn apply_tx_no_rollback(
     state: &mut NativeState,
     tx: &Transaction,
     validated: &ValidatedTransaction,

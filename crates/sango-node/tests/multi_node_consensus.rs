@@ -2,7 +2,7 @@
 
 use sango_consensus::{LocalIdentity, Validator, ValidatorSet};
 use sango_crypto::{derive_native_address, NativeKeypair};
-use sango_node::{Driver, OutgoingMessage};
+use sango_node::{Driver, Node, NodeHandle, OutgoingMessage};
 use sango_primitives::{Amount, ChainId32, Epoch};
 
 fn chain() -> ChainId32 {
@@ -30,25 +30,23 @@ fn make_validators(n: u8) -> (Vec<NativeKeypair>, ValidatorSet) {
     (kps, ValidatorSet::new(vs).unwrap())
 }
 
-/// Construit `n` drivers, chacun avec son propre nœud (temp dir).
 fn make_drivers(n: u8) -> (Vec<tempfile::TempDir>, Vec<Driver>) {
     let (kps, vs) = make_validators(n);
     let mut dirs = Vec::new();
     let mut drivers = Vec::new();
     for kp in kps.iter().take(n as usize) {
         let dir = tempfile::tempdir().unwrap();
-        let node = sango_node::Node::open(dir.path(), chain(), initial_supply()).unwrap();
+        let node = Node::open(dir.path(), chain(), initial_supply()).unwrap();
+        let handle = NodeHandle::new(node);
         let local = LocalIdentity::new(kp.clone());
-        let d = Driver::new(node, vs.clone(), Some(local), Epoch::new(0)).unwrap();
+        let d = Driver::new(handle, vs.clone(), Some(local), Epoch::new(0)).unwrap();
         dirs.push(dir);
         drivers.push(d);
     }
     (dirs, drivers)
 }
 
-/// Fait tourner les drivers jusqu'à ce que tous atteignent `target_height`.
 fn run_until_height(drivers: &mut [Driver], target_height: u64) {
-    // Init : chaque proposer potentiel tente de proposer.
     for d in drivers.iter_mut() {
         d.maybe_propose().unwrap();
     }
@@ -56,17 +54,17 @@ fn run_until_height(drivers: &mut [Driver], target_height: u64) {
     let max_iter = 200;
     for iter in 0..max_iter {
         let all_done = drivers.iter().all(|d| {
-            d.node()
-                .tip()
-                .map(|t| t.height.get() >= target_height)
-                .unwrap_or(false)
+            d.node_handle().with_node(|n| {
+                n.tip()
+                    .map(|t| t.height.get() >= target_height)
+                    .unwrap_or(false)
+            })
         });
         if all_done {
             return;
         }
         assert!(iter < max_iter - 1, "did not reach target height");
 
-        // Collecte des messages sortants.
         let mut proposals = Vec::new();
         let mut prevotes = Vec::new();
         let mut precommits = Vec::new();
@@ -81,7 +79,6 @@ fn run_until_height(drivers: &mut [Driver], target_height: u64) {
         }
         let had_messages = !proposals.is_empty() || !prevotes.is_empty() || !precommits.is_empty();
 
-        // Distribution.
         for d in drivers.iter_mut() {
             for p in &proposals {
                 let _ = d.handle_proposal(p.clone());
@@ -94,12 +91,10 @@ fn run_until_height(drivers: &mut [Driver], target_height: u64) {
             }
         }
 
-        // Nouveau bloc éventuel à produire.
         for d in drivers.iter_mut() {
             d.maybe_propose().unwrap();
         }
 
-        // Si rien ne se passe, on force un timeout.
         if !had_messages {
             for d in drivers.iter_mut() {
                 let _ = d.handle_timeout();
@@ -118,8 +113,8 @@ fn single_validator_commits_one_block() {
     let (_dirs, mut drivers) = make_drivers(1);
     run_until_height(&mut drivers, 0);
 
-    let tip = drivers[0].node().tip().unwrap();
-    assert_eq!(tip.height.get(), 0);
+    let tip = drivers[0].node_handle().with_node(|n| n.tip());
+    assert_eq!(tip.unwrap().height.get(), 0);
 }
 
 #[test]
@@ -127,8 +122,8 @@ fn single_validator_commits_three_blocks() {
     let (_dirs, mut drivers) = make_drivers(1);
     run_until_height(&mut drivers, 2);
 
-    let tip = drivers[0].node().tip().unwrap();
-    assert_eq!(tip.height.get(), 2);
+    let tip = drivers[0].node_handle().with_node(|n| n.tip());
+    assert_eq!(tip.unwrap().height.get(), 2);
 }
 
 #[test]
@@ -136,25 +131,23 @@ fn four_validators_commit_three_blocks() {
     let (_dirs, mut drivers) = make_drivers(4);
     run_until_height(&mut drivers, 2);
 
-    let tips: Vec<_> = drivers.iter().map(|d| d.node().tip().unwrap()).collect();
+    let tips: Vec<_> = drivers
+        .iter()
+        .map(|d| d.node_handle().with_node(|n| n.tip()).unwrap())
+        .collect();
     for t in &tips {
         assert_eq!(t.height.get(), 2);
         assert_eq!(t.block_hash, tips[0].block_hash);
         assert_eq!(t.base_fee, tips[0].base_fee);
     }
 
-    // Les 4 nœuds doivent avoir le même state_root.
     let roots: Vec<_> = drivers
         .iter()
-        .map(|d| d.node().state().native_state_root())
+        .map(|d| d.node_handle().with_node(|n| n.state().native_state_root()))
         .collect();
     for r in &roots {
         assert_eq!(*r, roots[0]);
     }
-
-    // Aucun bloc n'a de transactions : le native_state_root reste celui
-    // d'un état vide + metadata (total_burned / total_gas_used restent 0).
-    // On ne vérifie pas de valeur exacte, juste la cohérence.
 }
 
 #[test]
@@ -162,7 +155,10 @@ fn four_validators_commit_six_blocks() {
     let (_dirs, mut drivers) = make_drivers(4);
     run_until_height(&mut drivers, 5);
 
-    let tips: Vec<_> = drivers.iter().map(|d| d.node().tip().unwrap()).collect();
+    let tips: Vec<_> = drivers
+        .iter()
+        .map(|d| d.node_handle().with_node(|n| n.tip()).unwrap())
+        .collect();
     for t in &tips {
         assert_eq!(t.height.get(), 5);
         assert_eq!(t.block_hash, tips[0].block_hash);
@@ -171,36 +167,28 @@ fn four_validators_commit_six_blocks() {
 
 #[test]
 fn non_validator_follows_passively() {
-    // 3 validateurs + 1 observateur (pas de local).
     let (kps, vs) = make_validators(3);
     let mut dirs = Vec::new();
     let mut drivers = Vec::new();
 
-    // 3 validateurs.
     for kp in kps.iter().take(3) {
         let dir = tempfile::tempdir().unwrap();
-        let node = sango_node::Node::open(dir.path(), chain(), initial_supply()).unwrap();
+        let node = Node::open(dir.path(), chain(), initial_supply()).unwrap();
+        let handle = NodeHandle::new(node);
         let local = LocalIdentity::new(kp.clone());
-        drivers.push(Driver::new(node, vs.clone(), Some(local), Epoch::new(0)).unwrap());
+        drivers.push(Driver::new(handle, vs.clone(), Some(local), Epoch::new(0)).unwrap());
         dirs.push(dir);
     }
-    // 1 observateur.
     {
         let dir = tempfile::tempdir().unwrap();
-        let node = sango_node::Node::open(dir.path(), chain(), initial_supply()).unwrap();
-        drivers.push(Driver::new(node, vs.clone(), None, Epoch::new(0)).unwrap());
+        let node = Node::open(dir.path(), chain(), initial_supply()).unwrap();
+        let handle = NodeHandle::new(node);
+        drivers.push(Driver::new(handle, vs.clone(), None, Epoch::new(0)).unwrap());
         dirs.push(dir);
     }
 
     run_until_height(&mut drivers, 1);
 
-    // L'observateur a bien suivi.
-    let observer_tip = drivers[3].node().tip().unwrap();
-    assert_eq!(observer_tip.height.get(), 1);
-
-    // L'observateur n'a émis aucun vote.
-    // (Vérification indirecte : on re-draine et on s'attend à ce qu'il n'y
-    //  ait rien à drainer pour lui, mais les validateurs ont pu émettre à
-    //  la fin du dernier round.)
-    let _ = observer_tip;
+    let observer_tip = drivers[3].node_handle().with_node(|n| n.tip());
+    assert_eq!(observer_tip.unwrap().height.get(), 1);
 }
