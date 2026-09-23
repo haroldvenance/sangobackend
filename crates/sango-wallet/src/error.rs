@@ -1,0 +1,60 @@
+//! Erreurs du wallet.
+
+use thiserror::Error;
+
+/// Erreur produite par une opération du wallet.
+#[derive(Debug, Error)]
+pub enum WalletError {
+    /// Erreur d'I/O (lecture/écriture du keyfile).
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Erreur de (dé)sérialisation.
+    #[error("serde: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    /// Erreur de décodage hexadécimal.
+    #[error("hex: {0}")]
+    Hex(#[from] hex::FromHexError),
+
+    /// Le keyfile existe déjà.
+    #[error("keyfile already exists: {0}")]
+    KeyfileExists(String),
+
+    /// Le keyfile est introuvable.
+    #[error("keyfile not found: {0}")]
+    KeyfileNotFound(String),
+
+    /// Le keyfile est corrompu ou versionné différemment.
+    #[error("invalid keyfile: {0}")]
+    InvalidKeyfile(String),
+
+    /// L'adresse fournie n'est pas valide.
+    #[error("invalid address: {0}")]
+    InvalidAddress(String),
+
+    /// Le montant fourni n'est pas un décimal valide.
+    #[error("invalid amount: {0}")]
+    InvalidAmount(String),
+
+    /// Erreur de communication avec le nœud.
+    #[error("rpc: {0}")]
+    Rpc(String),
+
+    /// Le nœud a retourné une erreur JSON-RPC.
+    #[error("rpc error [{code}]: {message}")]
+    RpcResponse {
+        /// Code JSON-RPC.
+        code: i32,
+        /// Message.
+        message: String,
+    },
+
+    /// Usage invalide de la CLI.
+    #[error("usage: {0}")]
+    Usage(String),
+
+    /// Chaîne attendue en hex mais reçue autre chose.
+    #[error("invalid hex string: {0}")]
+    InvalidHex(String),
+}

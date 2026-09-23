@@ -45,3 +45,4 @@ sango-node = { path = "crates/sango-node" }
 sango-consensus = { path = "crates/sango-consensus" }
 sango-mempool = { path = "crates/sango-mempool" }
 sango-rpc = { path = "crates/sango-rpc" }
+sango-wallet = { path = "crates/sango-wallet" }

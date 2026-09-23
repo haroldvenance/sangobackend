@@ -660,6 +660,18 @@ dependencies = [
 [[package]]
 name = "sango-wallet"
 version = "0.1.0"
+dependencies = [
+ "hex",
+ "rand_core",
+ "sango-codec",
+ "sango-crypto",
+ "sango-primitives",
+ "sango-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "semver"
