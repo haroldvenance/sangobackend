@@ -198,9 +198,9 @@ pub fn validate_structure(tx: &Transaction) -> Result<(), TxValidationError> {
                     "TX_BOND must have empty data",
                 ));
             }
-            if tx.value < sango_types::staking_params::min_self_stake() {
+            if tx.value.is_zero() {
                 return Err(TxValidationError::InvalidStructure(
-                    "TX_BOND below minimum self-stake",
+                    "TX_BOND requires a positive amount",
                 ));
             }
         }
@@ -284,10 +284,12 @@ pub fn validate_structure(tx: &Transaction) -> Result<(), TxValidationError> {
                     "TX_REGISTER_VALIDATOR must have no recipient",
                 ));
             }
-            // data = commission_bps (4 BE) || public_key (32)
-            if tx.data.len() != 36 {
+            // data = commission_bps (4 BE). La clé publique du validateur
+            // est celle du compte (`tx.public_key` au bootstrap, ou déjà
+            // enregistrée dans l'état).
+            if tx.data.len() != 4 {
                 return Err(TxValidationError::InvalidStructure(
-                    "TX_REGISTER_VALIDATOR data must be 36 bytes",
+                    "TX_REGISTER_VALIDATOR data must be 4 bytes",
                 ));
             }
             let commission_bps =

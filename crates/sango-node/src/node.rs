@@ -202,6 +202,7 @@ impl Node {
             base_fee: block.header.base_fee,
             fee_recipient: block.header.proposer_address,
             initial_supply: self.initial_supply,
+            current_time: block.header.timestamp,
         };
         let result = exec_apply_block(&mut self.state, block, &validated, &ctx)?;
 

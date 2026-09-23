@@ -53,6 +53,9 @@ pub struct ExecutionContext {
     pub fee_recipient: NativeAddress,
     /// Offre initiale du réseau (dérivée du Genesis).
     pub initial_supply: Amount,
+    /// Timestamp Unix courant (secondes), utilisé pour les unbondings et
+    /// les délais de commission.
+    pub current_time: u64,
 }
 
 /// Détail de l'application d'une transaction.
@@ -173,10 +176,11 @@ pub fn apply_transfer_with_gas(
 
 // --- API multi-transactions (block) ---------------------------------------
 
-/// Applique une séquence de transferts natifs **atomiquement**.
+/// Applique une séquence de transactions natives **atomiquement**.
 ///
-/// Agrège les frais brûlés et le gas en une seule écriture SMT.
-/// Si **une seule** transaction échoue, tout le bloc est annulé.
+/// Supporte `TX_TRANSFER` et tous les `TxKind` de staking. Agrège les frais
+/// brûlés et le gas en une seule écriture SMT. Si **une seule** transaction
+/// échoue, tout le bloc est annulé.
 ///
 /// Ce point d'entrée est destiné aux tests et cas où le `BlockHeader`
 /// n'est pas nécessaire. Pour l'application complète d'un bloc, voir
@@ -185,7 +189,7 @@ pub fn apply_block_transfers(
     state: &mut NativeState,
     txs: &[Transaction],
     validated: &[ValidatedTransaction],
-    fee_recipient: NativeAddress,
+    ctx: &ExecutionContext,
 ) -> Result<BlockApplyResult, ApplyError> {
     if txs.len() != validated.len() {
         return Err(ApplyError::LengthMismatch {
@@ -198,7 +202,8 @@ pub fn apply_block_transfers(
     let mut result = BlockApplyResult::default();
 
     for (tx, v) in txs.iter().zip(validated.iter()) {
-        match apply_transfer_no_rollback(state, tx, v, NATIVE_TRANSFER_GAS, fee_recipient) {
+        let gas_used = crate::staking::gas_for(tx.tx_kind).unwrap_or(NATIVE_TRANSFER_GAS);
+        match apply_tx_no_rollback(state, tx, v, gas_used, ctx) {
             Ok(applied) => {
                 result.total_gas_used = result
                     .total_gas_used
@@ -244,8 +249,8 @@ pub fn apply_block_transfers(
 ///
 /// ## Limites V1
 ///
-/// - Seuls les `TX_TRANSFER` sont supportés ; les `TX_CONTRACT_*` seront
-///   gérés par la couche EVM (à venir).
+/// - `TX_TRANSFER` et les `TxKind` de staking sont supportés.
+/// - Les `TX_CONTRACT_*` seront gérés par la couche EVM (à venir).
 /// - `receipt_root` est un placeholder `Hash32::ZERO` tant que le MPT EVM
 ///   n'est pas implémenté.
 pub fn apply_block(
@@ -271,7 +276,8 @@ pub fn apply_block(
     let mut total_burned: u128 = 0;
 
     for (tx, v) in block.transactions.iter().zip(validated.iter()) {
-        match apply_transfer_no_rollback(state, tx, v, NATIVE_TRANSFER_GAS, ctx.fee_recipient) {
+        let gas_used = crate::staking::gas_for(tx.tx_kind).unwrap_or(NATIVE_TRANSFER_GAS);
+        match apply_tx_no_rollback(state, tx, v, gas_used, ctx) {
             Ok(a) => {
                 total_gas_used = total_gas_used
                     .checked_add(a.gas_used)
@@ -360,7 +366,7 @@ pub fn apply_block(
 /// Ne touche **pas** aux compteurs globaux (`total_burned`,
 /// `total_gas_used`) : c'est la responsabilité de l'appelant de les
 /// mettre à jour après succès (éventuellement de façon agrégée).
-fn apply_transfer_no_rollback(
+pub(crate) fn apply_transfer_no_rollback(
     state: &mut NativeState,
     tx: &Transaction,
     validated: &ValidatedTransaction,
@@ -467,6 +473,27 @@ fn apply_transfer_no_rollback(
     })
 }
 
+/// Dispatcher : applique n'importe quelle transaction native.
+///
+/// - `TxKind::Transfer` → [`apply_transfer_no_rollback`]
+/// - `TxKind` de staking → [`crate::staking::apply_staking_no_rollback`]
+/// - Autres → [`ApplyError::UnsupportedTxKind`]
+pub(crate) fn apply_tx_no_rollback(
+    state: &mut NativeState,
+    tx: &Transaction,
+    validated: &ValidatedTransaction,
+    gas_used: u64,
+    ctx: &ExecutionContext,
+) -> Result<AppliedTransaction, ApplyError> {
+    if tx.tx_kind == TxKind::Transfer {
+        return apply_transfer_no_rollback(state, tx, validated, gas_used, ctx.fee_recipient);
+    }
+    if tx.tx_kind.is_staking() {
+        return crate::staking::apply_staking_no_rollback(state, tx, validated, gas_used, ctx);
+    }
+    Err(ApplyError::UnsupportedTxKind(tx.tx_kind))
+}
+
 fn map_state_error(e: StateError) -> ApplyError {
     match e {
         StateError::InsufficientBalance {
@@ -557,6 +584,7 @@ mod tests {
             base_fee: 10,
             fee_recipient: validator(),
             initial_supply: Amount::from_sango(1_000_000_000).unwrap(),
+            current_time: 1_700_000_000,
         }
     }
 
@@ -735,7 +763,7 @@ mod tests {
         let v2 = validate(&state, &tx2).unwrap();
 
         let result =
-            apply_block_transfers(&mut state, &[tx1, tx2], &[v1, v2], validator()).unwrap();
+            apply_block_transfers(&mut state, &[tx1, tx2], &[v1, v2], &exec_ctx()).unwrap();
 
         assert_eq!(result.applied.len(), 2);
         assert_eq!(result.total_fee, 2 * 252_000);
@@ -776,7 +804,7 @@ mod tests {
         let root_before = state.native_state_root();
 
         let err =
-            apply_block_transfers(&mut state, &[tx1, tx2], &[v1, v2], validator()).unwrap_err();
+            apply_block_transfers(&mut state, &[tx1, tx2], &[v1, v2], &exec_ctx()).unwrap_err();
         assert!(matches!(err, ApplyError::InsufficientBalance { .. }));
         assert_eq!(state.native_state_root(), root_before);
         assert_eq!(state.nonce_of(&s1), 0);
@@ -788,12 +816,12 @@ mod tests {
     #[test]
     fn apply_block_length_mismatch() {
         let mut state = NativeState::new();
-        let r = apply_block_transfers(&mut state, &[], &[], validator()).unwrap();
+        let r = apply_block_transfers(&mut state, &[], &[], &exec_ctx()).unwrap();
         assert!(r.applied.is_empty());
 
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let tx = bootstrap_tx(&kp, 0, 1);
-        let err = apply_block_transfers(&mut state, &[tx], &[], validator()).unwrap_err();
+        let err = apply_block_transfers(&mut state, &[tx], &[], &exec_ctx()).unwrap_err();
         assert_eq!(
             err,
             ApplyError::LengthMismatch {

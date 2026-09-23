@@ -77,4 +77,79 @@ pub enum ApplyError {
     /// Erreur d'état sous-jacente.
     #[error("state error: {0}")]
     State(#[from] StateError),
+
+    // --- Staking ------------------------------------------------------------
+    /// Un validateur est déjà enregistré à cette adresse.
+    #[error("validator already registered: {0}")]
+    ValidatorAlreadyExists(NativeAddress),
+
+    /// Aucun validateur à cette adresse.
+    #[error("validator not found: {0}")]
+    ValidatorNotFound(NativeAddress),
+
+    /// L'émetteur n'est pas un validateur enregistré.
+    #[error("sender is not a validator: {0}")]
+    NotAValidator(NativeAddress),
+
+    /// Le self-stake restant serait inférieur au minimum après unbond.
+    #[error("insufficient self-stake after operation: needed {needed}, would be {would_be}")]
+    InsufficientSelfStake {
+        /// Minimum requis.
+        needed: u128,
+        /// Valeur résultante.
+        would_be: u128,
+    },
+
+    /// Self-stake insuffisant pour l'unbond.
+    #[error("insufficient self-stake: needed {needed}, available {available}")]
+    InsufficientSelfStakeAvailable {
+        /// Montant demandé.
+        needed: u128,
+        /// Montant disponible.
+        available: u128,
+    },
+
+    /// Délégation insuffisante pour l'undelegate.
+    #[error("insufficient delegation: needed {needed}, available {available}")]
+    InsufficientDelegation {
+        /// Montant demandé.
+        needed: u128,
+        /// Montant disponible.
+        available: u128,
+    },
+
+    /// Commission au-dessus du maximum.
+    #[error("commission too high: got {got}, max {max}")]
+    CommissionTooHigh {
+        /// Valeur reçue (bps).
+        got: u32,
+        /// Valeur maximale (bps).
+        max: u32,
+    },
+
+    /// Tentative d'unjail avant expiration.
+    #[error("jail period has not expired: until {until}, now {now}")]
+    JailNotExpired {
+        /// Timestamp Unix de fin de jail.
+        until: u64,
+        /// Timestamp Unix courant.
+        now: u64,
+    },
+
+    /// Tentative d'unjail d'un validateur qui n'est pas jailed.
+    #[error("validator is not jailed: {0}")]
+    NotJailed(NativeAddress),
+
+    /// Le compte n'a pas de clé publique enregistrée et la transaction n'en
+    /// déclare pas (bootstrap requis).
+    #[error("sender has no registered public key and tx does not provide one")]
+    MissingPublicKey,
+
+    /// Auto-délégation interdite en V1.
+    #[error("self-delegation is not allowed")]
+    SelfDelegation,
+
+    /// Données de commission invalides (longueur incorrecte).
+    #[error("invalid commission data")]
+    InvalidCommissionData,
 }
