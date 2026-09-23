@@ -9,19 +9,30 @@
 //! - **Liveness** : ping.
 //! - **Encodage** : codec canonique Sango, aucun protobuf.
 //!
-//! ## Ce que ce crate **ne fait pas**
+//! ## Utilisation depuis un thread synchrone
 //!
-//! - La logique de consensus.
-//! - La validation des messages (le [`crate::P2pService`] transmet le
-//!   message décodé au driver, qui valide).
-//! - La synchronisation initiale (à venir : protocole `sync` séparé).
+//! ```no_run
+//! use sango_p2p::{spawn, P2pConfig, NetworkMessage};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Le runtime tokio doit exister (créé une fois dans le binaire).
+//! let rt = tokio::runtime::Runtime::new()?;
+//! let _guard = rt.enter();
+//!
+//! let handle = spawn(P2pConfig::devnet())?;
+//!
+//! // Boucle du driver : non-bloquante.
+//! if let Some(event) = handle.service.try_recv_event() {
+//!     println!("event: {event:?}");
+//! }
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! ## Invariants
 //!
 //! - Le `PeerId` libp2p est **distinct** de l'identité du validateur.
-//! - Un message est diffusé uniquement après décodage réussi côté émetteur.
-//! - Un message reçu n'est **jamais** relayé sans validation par le
-//!   driver (via `P2pService::broadcast`).
+//! - Un message reçu n'est **jamais** relayé sans validation par le driver.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -35,4 +46,9 @@ pub mod topics;
 pub use config::P2pConfig;
 pub use error::P2pError;
 pub use message::{MessageType, NetworkMessage};
-pub use service::{spawn, spawn_with_events, P2pCommand, P2pEvent, P2pHandle, P2pService};
+pub use service::{spawn, P2pCommand, P2pEvent, P2pHandle, P2pService, CHANNEL_CAPACITY};
+
+// Ré-exports de libp2p pour éviter que les consommateurs (sango-node)
+// n'aient à dépendre directement de libp2p.
+pub use libp2p::multiaddr;
+pub use libp2p::{Multiaddr, PeerId};

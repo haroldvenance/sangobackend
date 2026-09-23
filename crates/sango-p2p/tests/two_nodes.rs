@@ -2,17 +2,26 @@
 //!
 //! ## Scénario
 //!
-//! 1. On démarre deux services P2P avec mDNS désactivé.
-//! 2. On les connecte manuellement via `dial`.
-//! 3. On envoie un message depuis le nœud A.
-//! 4. On vérifie qu'il est reçu par le nœud B.
+//! 1. Démarre deux services P2P (mDNS désactivé, ports OS-assignés).
+//! 2. Attend l'événement `NewListenAddr` de chacun.
+//! 3. A dial B.
+//! 4. Attend `PeerConnected` des deux côtés.
+//! 5. Attend que gossipsub échange les souscriptions.
+//! 6. A publie une transaction.
+//! 7. B la reçoit.
+//!
+//! ## Runtime
+//!
+//! Le test utilise un runtime tokio multi-thread créé manuellement. Le
+//! runtime reste vivant tant que `_rt` n'est pas droppé, ce qui garantit
+//! que la tâche du swarm continue de tourner.
 
 use std::time::Duration;
 
-use sango_p2p::{spawn_with_events, NetworkMessage, P2pConfig, P2pEvent};
+use sango_p2p::{spawn, NetworkMessage, P2pConfig, P2pEvent};
 use sango_primitives::{Amount, ChainId32, NativeAddress, Signature};
 use sango_types::{Transaction, TxKind};
-use tokio::time::timeout;
+use tokio::runtime::Runtime;
 
 fn chain() -> ChainId32 {
     ChainId32::from_bytes([0x11; 32])
@@ -36,83 +45,98 @@ fn dummy_tx(nonce: u64) -> Transaction {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_nodes_exchange_message() {
-    // 1. Démarrer deux services P2P sur des ports OS-assignés.
+/// Poll les événements d'un service jusqu'à en trouver un qui matche.
+///
+/// Timeout global : 5 secondes. Poll interval : 10 ms.
+fn wait_for<F, T>(service: &sango_p2p::P2pService, mut predicate: F) -> T
+where
+    F: FnMut(&P2pEvent) -> Option<T>,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        while let Some(event) = service.try_recv_event() {
+            if let Some(v) = predicate(&event) {
+                return v;
+            }
+            // ignore les autres événements
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("timeout waiting for event");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn two_nodes_exchange_message() {
+    let rt = Runtime::new().expect("tokio runtime");
+    let _guard = rt.enter();
+
     let cfg = P2pConfig {
         mdns_enabled: false,
         ..Default::default()
     };
-    let (handle_a, mut events_a) = spawn_with_events(cfg.clone()).unwrap();
-    let (handle_b, mut events_b) = spawn_with_events(cfg).unwrap();
+
+    let handle_a = spawn(cfg.clone()).expect("spawn A");
+    let handle_b = spawn(cfg).expect("spawn B");
 
     let peer_a = handle_a.service.local_peer_id();
     let peer_b = handle_b.service.local_peer_id();
+    assert_ne!(peer_a, peer_b, "les PeerId doivent être distincts");
 
-    // 2. Attendre que les deux aient une adresse d'écoute.
-    //    On récupère l'adresse via les events `NewListenAddr`.
-    let addr_a = wait_for_listen_addr(&mut events_a).await;
-    let addr_b = wait_for_listen_addr(&mut events_b).await;
+    // 1. Attendre les adresses d'écoute.
+    let addr_a = wait_for(&handle_a.service, |e| match e {
+        P2pEvent::NewListenAddr(a) => Some(a.clone()),
+        _ => None,
+    });
+    let addr_b = wait_for(&handle_b.service, |e| match e {
+        P2pEvent::NewListenAddr(a) => Some(a.clone()),
+        _ => None,
+    });
 
     eprintln!("node A: peer={peer_a} addr={addr_a}");
     eprintln!("node B: peer={peer_b} addr={addr_b}");
 
-    // 3. Dial mutuel.
-    handle_a.service.dial(addr_b.clone(), peer_b).await.unwrap();
-    handle_b.service.dial(addr_a.clone(), peer_a).await.unwrap();
+    // 2. A dial B.
+    handle_a
+        .service
+        .dial_sync(addr_b.clone())
+        .expect("dial B from A");
 
-    // 4. Attendre que les deux soient connectés.
-    wait_for_connected(&mut events_a).await;
-    wait_for_connected(&mut events_b).await;
+    // 3. Attendre PeerConnected des deux côtés.
+    let _ = wait_for(&handle_a.service, |e| match e {
+        P2pEvent::PeerConnected(p) if *p == peer_b => Some(*p),
+        _ => None,
+    });
+    let _ = wait_for(&handle_b.service, |e| match e {
+        P2pEvent::PeerConnected(p) if *p == peer_a => Some(*p),
+        _ => None,
+    });
 
-    // 5. Attendre que les topics gossipsub soient souscrits (health
-    //    propagation). On laisse un peu de temps pour que gossipsub
-    //    échange les subscriptions.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // 4. Attendre la propagation des souscriptions gossipsub.
+    wait_for(&handle_a.service, |e| match e {
+        P2pEvent::Subscribed { peer_id, .. } if *peer_id == peer_b => Some(()),
+        _ => None,
+    });
 
-    // 6. A publie une tx.
+    // 5. A publie une tx.
     let tx = dummy_tx(42);
-    let expected = NetworkMessage::Transaction(tx.clone());
-    handle_a.service.broadcast(expected.clone()).await.unwrap();
+    let expected = NetworkMessage::Transaction(tx);
+    handle_a
+        .service
+        .broadcast_sync(expected.clone())
+        .expect("broadcast");
 
-    // 7. B doit recevoir.
-    let received = timeout(Duration::from_secs(5), async {
-        loop {
-            match events_b.recv().await {
-                Some(P2pEvent::Message { message, .. }) => {
-                    return *message;
-                }
-                Some(_) => continue,
-                None => panic!("events_b closed"),
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for message");
+    // 6. B doit recevoir.
+    let received = wait_for(&handle_b.service, |e| match e {
+        P2pEvent::Message { message, .. } => Some((**message).clone()),
+        _ => None,
+    });
 
     assert_eq!(received, expected);
 
-    // 8. Shutdown.
-    handle_a.service.shutdown().await.unwrap();
-    handle_b.service.shutdown().await.unwrap();
-    let _ = handle_a.task.await;
-    let _ = handle_b.task.await;
-}
-
-async fn wait_for_listen_addr(
-    events: &mut tokio::sync::mpsc::Receiver<P2pEvent>,
-) -> libp2p::Multiaddr {
-    // Note : P2pEvent n'expose pas directement `NewListenAddr`. On doit
-    // donc passer par un canal dédié ou modifier l'API. Pour ce test,
-    // on utilise une astuce : la config utilise un port fixe dédié.
-    //
-    // **Limitation** : en pratique, on devrait exposer les `NewListenAddr`
-    // via `P2pEvent`. C'est un TODO(P2) quand on intégrera dans le Driver.
-    let _ = events;
-    panic!("à implémenter en P2 : exposer NewListenAddr via P2pEvent");
-}
-
-async fn wait_for_connected(events: &mut tokio::sync::mpsc::Receiver<P2pEvent>) {
-    let _ = events;
-    // Également délégué à P2.
+    // 7. Shutdown.
+    handle_a.service.shutdown_sync().ok();
+    handle_b.service.shutdown_sync().ok();
+    drop(rt);
 }

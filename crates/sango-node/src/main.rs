@@ -1,24 +1,27 @@
-//! Binaire `sango-node` : assemble le nœud, le driver consensus et le RPC.
+//! Binaire `sango-node` : assemble le nœud, le driver consensus, le RPC
+//! et le service P2P optionnel.
 //!
 //! ## Usage
 //!
 //! ```text
-//! sango-node --config devnet.json [--data-dir ./data] [--rpc-addr 127.0.0.1:8545]
+//! sango-node --config devnet.json [--data-dir DIR] [--rpc-addr ADDR]
+//!            [--p2p-listen ADDR]... [--p2p-bootstrap ADDR]... [--mdns]
 //! ```
 //!
 //! ## Architecture
 //!
-//! - **Thread principal** : boucle consensus (propose un bloc toutes les
-//!   500 ms si nous sommes proposer).
-//! - **Thread secondaire** : serveur RPC sur `--rpc-addr`.
+//! - **Thread principal** : boucle consensus (propose un bloc à intervalle
+//!   fixe si nous sommes proposer).
+//! - **Runtime tokio** : service P2P dans une tâche async dédiée.
+//! - **Thread secondaire** : serveur RPC.
 //! - **Persistance** : RocksDB dans `--data-dir`, flushée à chaque bloc.
 //!
-//! ## Réseau P2P
+//! ## Modes
 //!
-//! **Non implémenté en V1.** Le binaire boucle les messages sortants du
-//! driver sur lui-même (self-loopback). Cela signifie qu'il ne fonctionne
-//! que pour un réseau **à un seul validateur** — c'est suffisant pour les
-//! démonstrations locales et les tests du wallet.
+//! - **Autonome** (sans `--p2p-listen`) : self-loopback local. Utile pour
+//!   les démos mono-validateur.
+//! - **Réseau** (avec `--p2p-listen`) : publie et écoute sur le réseau.
+//!   `--p2p-bootstrap` permet de se connecter à des pairs au démarrage.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -27,14 +30,18 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use sango_p2p::{Multiaddr, PeerId};
+
 use sango_consensus::{LocalIdentity, Validator, ValidatorSet};
 use sango_node::{Driver, Node, NodeBackend, NodeHandle, OutgoingMessage, RuntimeGenesis};
+use sango_p2p::{P2pConfig, P2pEvent};
 use sango_primitives::Epoch;
 use sango_rpc::RpcServer;
 
 const DEFAULT_DATA_DIR: &str = "./sango-data";
 const DEFAULT_RPC_ADDR: &str = "127.0.0.1:8545";
 const BLOCK_INTERVAL_MS: u64 = 500;
+const P2P_DRAIN_PER_TICK: usize = 100;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -50,14 +57,19 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<(), String> {
     let opts = parse_args(args)?;
 
+    // Extraire tous les champs dont on a besoin **avant** de déplacer quoi
+    // que ce soit, pour éviter les partial moves ultérieurs.
     let config_path = opts
         .config
+        .clone()
         .ok_or_else(|| "--config <PATH> is required".to_string())?;
     let data_dir = opts
         .data_dir
+        .clone()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
     let rpc_addr: SocketAddr = opts
         .rpc_addr
+        .clone()
         .unwrap_or_else(|| DEFAULT_RPC_ADDR.to_string())
         .parse()
         .map_err(|e| format!("invalid --rpc-addr: {e}"))?;
@@ -110,9 +122,6 @@ fn run(args: &[String]) -> Result<(), String> {
     let backend = Arc::new(NodeBackend::new(handle.clone()));
     let server =
         RpcServer::bind(rpc_addr, backend).map_err(|e| format!("rpc bind {rpc_addr}: {e}"))?;
-    // On garde `_rpc_shutdown` et `_rpc_thread` vivants pour la durée du
-    // processus : le serveur RPC tourne dans un thread détaché qui se
-    // termine quand le processus est tué.
     let _rpc_shutdown = server.shutdown_handle();
     let _rpc_thread = thread::spawn(move || {
         if let Err(e) = server.serve() {
@@ -120,11 +129,51 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     });
 
-    // --- 8. Driver consensus ----------------------------------------------
+    // --- 8. Runtime tokio + service P2P -----------------------------------
+    let p2p_enabled = !opts.no_p2p && (!opts.p2p_listen.is_empty() || opts.mdns);
+
+    let mut _p2p_runtime: Option<tokio::runtime::Runtime> = None;
+    let p2p_service: Option<sango_p2p::P2pService> = if p2p_enabled {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .map_err(|e| format!("tokio runtime: {e}"))?;
+        let _guard = rt.enter();
+
+        let cfg = build_p2p_config(&opts)?;
+        let p2p_handle = sango_p2p::spawn(cfg).map_err(|e| format!("p2p spawn: {e}"))?;
+        let svc = p2p_handle.service.clone();
+
+        // Attendre un premier NewListenAddr pour l'afficher.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(P2pEvent::NewListenAddr(addr)) = svc.try_recv_event() {
+                println!("✓ P2P listening on {addr}");
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Garder le runtime vivant.
+        _p2p_runtime = Some(rt);
+        Some(svc)
+    } else {
+        None
+    };
+
+    // --- 9. Driver consensus ----------------------------------------------
     let mut driver = Driver::new(handle.clone(), validator_set, local, Epoch::new(0))
         .map_err(|e| format!("driver new: {e}"))?;
 
-    // --- 9. Message de démarrage ------------------------------------------
+    if let Some(svc) = p2p_service.clone() {
+        driver.attach_p2p(svc);
+    }
+
+    // --- 10. Message de démarrage -----------------------------------------
     println!();
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║                SANGO NODE — V1                           ║");
@@ -139,6 +188,11 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         None => println!("║  Validator  : (non-validator)                            ║"),
     }
+    if p2p_service.is_some() {
+        println!("║  P2P        : ENABLED                                    ║");
+    } else {
+        println!("║  P2P        : disabled (self-loopback)                   ║");
+    }
     if genesis.rewards_enabled {
         println!("║  Rewards    : ENABLED                                    ║");
     } else {
@@ -148,16 +202,22 @@ fn run(args: &[String]) -> Result<(), String> {
     println!("╚══════════════════════════════════════════════════════════╝");
     println!();
 
-    // --- 10. Boucle principale --------------------------------------------
+    // --- 11. Boucle principale --------------------------------------------
     let tick = Duration::from_millis(BLOCK_INTERVAL_MS);
     loop {
-        // 10a. Tenter de proposer.
+        // 11a. Drainer les événements P2P entrants.
+        if driver.has_p2p() {
+            let _ = driver.drain_p2p_events(P2P_DRAIN_PER_TICK);
+        }
+
+        // 11b. Tenter de proposer.
         driver
             .maybe_propose()
             .map_err(|e| format!("maybe_propose: {e}"))?;
 
-        // 10b. Self-loopback : redonner les messages sortants au driver.
-        //      (remplace P2P en single-validator)
+        // 11c. Self-loopback : pour un nœud seul, on traite ses propres
+        //      messages. En présence de P2P, cela reste utile pour éviter
+        //      d'attendre l'écho réseau.
         let outgoing = driver.drain_outbox();
         for msg in outgoing {
             match msg {
@@ -173,7 +233,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
 
-        // 10c. Événements (commits, changements de round).
+        // 11d. Événements (commits, changements de round).
         for event in driver.drain_events() {
             match event {
                 sango_node::DriverEvent::Committed {
@@ -199,20 +259,78 @@ fn run(args: &[String]) -> Result<(), String> {
     // écritures RocksDB sont flushées après chaque bloc, donc aucune
     // perte de données.
     //
-    // On garde les variables pour éviter les avertissements.
+    // `p2p_runtime` doit rester vivant jusqu'à la fin du processus : on
+    // l'utilise dans un bloc unreachable pour satisfaire le compilateur.
     #[allow(unreachable_code)]
     {
+        drop(_p2p_runtime);
         _rpc_shutdown.shutdown();
         let _ = _rpc_thread.join();
         Ok(())
     }
 }
 
+// --- Parse P2P config -------------------------------------------------------
+
+fn build_p2p_config(opts: &CliOpts) -> Result<P2pConfig, String> {
+    // Listen addresses.
+    let listen_addrs: Vec<Multiaddr> = if opts.p2p_listen.is_empty() {
+        // Aucune adresse → binding par défaut.
+        vec!["/ip4/127.0.0.1/udp/0/quic-v1"
+            .parse()
+            .map_err(|e| format!("default listen addr: {e}"))?]
+    } else {
+        opts.p2p_listen
+            .iter()
+            .map(|s| {
+                s.parse::<Multiaddr>()
+                    .map_err(|e| format!("bad --p2p-listen {s}: {e}"))
+            })
+            .collect::<Result<_, _>>()?
+    };
+
+    // Bootstrap addresses : forme `/ip4/.../udp/.../quic-v1/p2p/<PeerId>`.
+    let bootstrap_addrs: Vec<(Multiaddr, PeerId)> = opts
+        .p2p_bootstrap
+        .iter()
+        .map(|s| parse_bootstrap(s))
+        .collect::<Result<_, _>>()?;
+
+    Ok(P2pConfig {
+        listen_addrs,
+        bootstrap_addrs,
+        mdns_enabled: opts.mdns,
+        ..Default::default()
+    })
+}
+
+/// Parse `/ip4/.../udp/.../quic-v1/p2p/<PeerId>` en `(addr, peer_id)`.
+fn parse_bootstrap(s: &str) -> Result<(Multiaddr, PeerId), String> {
+    let mut addr: Multiaddr = s
+        .parse()
+        .map_err(|e| format!("bad --p2p-bootstrap {s}: {e}"))?;
+
+    // Extraire le dernier composant (peer id).
+    let peer_id = match addr.pop() {
+        Some(sango_p2p::multiaddr::Protocol::P2p(peer_id)) => peer_id,
+        _ => {
+            return Err(format!("--p2p-bootstrap {s} must end with /p2p/<PeerId>"));
+        }
+    };
+    Ok((addr, peer_id))
+}
+
+// --- CLI --------------------------------------------------------------------
+
 #[derive(Debug, Default)]
 struct CliOpts {
     config: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     rpc_addr: Option<String>,
+    p2p_listen: Vec<String>,
+    p2p_bootstrap: Vec<String>,
+    mdns: bool,
+    no_p2p: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<CliOpts, String> {
@@ -235,6 +353,24 @@ fn parse_args(args: &[String]) -> Result<CliOpts, String> {
                 opts.rpc_addr = Some(v.clone());
                 i += 2;
             }
+            "--p2p-listen" => {
+                let v = args.get(i + 1).ok_or("--p2p-listen needs a value")?;
+                opts.p2p_listen.push(v.clone());
+                i += 2;
+            }
+            "--p2p-bootstrap" => {
+                let v = args.get(i + 1).ok_or("--p2p-bootstrap needs a value")?;
+                opts.p2p_bootstrap.push(v.clone());
+                i += 2;
+            }
+            "--mdns" => {
+                opts.mdns = true;
+                i += 1;
+            }
+            "--no-p2p" => {
+                opts.no_p2p = true;
+                i += 1;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -250,12 +386,23 @@ fn print_help() {
         "sango-node — nœud Sango V1\n\
          \n\
          USAGE:\n\
-         \x20   sango-node --config <PATH> [--data-dir <PATH>] [--rpc-addr <ADDR>]\n\
+         \x20   sango-node --config <PATH> [OPTIONS]\n\
+         \n\
+         REQUIRED:\n\
+         \x20   --config <PATH>            Fichier genesis JSON\n\
          \n\
          OPTIONS:\n\
-         \x20   --config <PATH>     Fichier genesis JSON (obligatoire)\n\
-         \x20   --data-dir <PATH>   Répertoire RocksDB (défaut : {DEFAULT_DATA_DIR})\n\
-         \x20   --rpc-addr <ADDR>   Adresse d'écoute RPC (défaut : {DEFAULT_RPC_ADDR})\n\
-         \x20   --help, -h          Affiche cette aide\n"
+         \x20   --data-dir <PATH>          Répertoire RocksDB (défaut : {DEFAULT_DATA_DIR})\n\
+         \x20   --rpc-addr <ADDR>          Adresse d'écoute RPC (défaut : {DEFAULT_RPC_ADDR})\n\
+         \n\
+         P2P (désactivé par défaut) :\n\
+         \x20   --p2p-listen <MULTIADDR>   Adresse d'écoute (répétable)\n\
+         \x20                              Ex : /ip4/0.0.0.0/udp/9000/quic-v1\n\
+         \x20   --p2p-bootstrap <MULTIADDR> Adresse bootstrap (répétable)\n\
+         \x20                              Format : /ip4/.../udp/.../quic-v1/p2p/<PeerId>\n\
+         \x20   --mdns                     Active la découverte locale mDNS\n\
+         \x20   --no-p2p                   Force P2P désactivé\n\
+         \n\
+         \x20   --help, -h                 Affiche cette aide\n"
     );
 }

@@ -33,6 +33,14 @@ pub enum P2pError {
     #[error("service channel closed")]
     ChannelClosed,
 
+    /// Le canal de communication avec le service est plein.
+    ///
+    /// Se produit si on tente de publier un message à un rythme supérieur
+    /// à ce que le service peut absorber. La capacité par défaut est de
+    /// 1024 commandes.
+    #[error("service channel full")]
+    ChannelFull,
+
     /// Erreur de souscription à un topic.
     #[error("subscription: {0}")]
     Subscription(String),

@@ -6,6 +6,7 @@ use sango_consensus::{
     Action, ConsensusError, ConsensusState, LocalIdentity, RoundContext, RoundRunner, Step,
     ValidatorSet,
 };
+use sango_p2p::{NetworkMessage, P2pEvent, P2pService};
 use sango_primitives::{Epoch, Hash32, Height, NativeAddress, Round};
 use sango_types::{
     CommitCertificate, ConsensusMessage, ConsensusMessageType, Evidence, EvidenceType, Precommit,
@@ -86,6 +87,9 @@ pub struct Driver {
     events: Vec<DriverEvent>,
     /// Evidences détectées en attente d'inclusion dans un prochain bloc.
     pending_evidences: Vec<Evidence>,
+    /// Service P2P (optionnel). Si `None`, le driver fonctionne en mode
+    /// autonome (self-loopback pur, utile pour les tests).
+    p2p: Option<P2pService>,
 }
 
 impl Driver {
@@ -122,6 +126,7 @@ impl Driver {
             outbox: Vec::new(),
             events: Vec::new(),
             pending_evidences: Vec::new(),
+            p2p: None,
         })
     }
 
@@ -174,6 +179,79 @@ impl Driver {
         self.pending_evidences.len()
     }
 
+    // --- P2P ---------------------------------------------------------------
+
+    /// Attache un service P2P au driver.
+    ///
+    /// Une fois attaché :
+    ///
+    /// - les messages sortants sont publiés sur le réseau **en plus**
+    ///   d'être poussés dans `outbox` (self-loopback local) ;
+    /// - `drain_p2p_events()` doit être appelé régulièrement pour
+    ///   consommer les messages entrants.
+    ///
+    /// Peut être appelé plusieurs fois ; le service précédent est remplacé.
+    pub fn attach_p2p(&mut self, svc: P2pService) {
+        self.p2p = Some(svc);
+    }
+
+    /// Vrai si un service P2P est attaché.
+    #[must_use]
+    pub fn has_p2p(&self) -> bool {
+        self.p2p.is_some()
+    }
+
+    /// Poll et route les événements P2P entrants.
+    ///
+    /// Consomme au plus `max_events` événements. Retourne le nombre
+    /// d'événements traités.
+    pub fn drain_p2p_events(&mut self, max_events: usize) -> Result<usize, DriverError> {
+        let Some(p2p) = self.p2p.clone() else {
+            return Ok(0);
+        };
+
+        let mut count = 0;
+        while count < max_events {
+            let Some(event) = p2p.try_recv_event() else {
+                break;
+            };
+            count += 1;
+            match event {
+                P2pEvent::Message { message, .. } => match *message {
+                    NetworkMessage::Proposal(p) => {
+                        let _ = self.handle_proposal(*p);
+                    }
+                    NetworkMessage::Prevote(v) => {
+                        let _ = self.handle_prevote(v);
+                    }
+                    NetworkMessage::Precommit(c) => {
+                        let _ = self.handle_precommit(c);
+                    }
+                    // Les transactions et blocs ne sont pas traités par
+                    // le driver consensus (ils le seront par le mempool
+                    // et le module de sync).
+                    NetworkMessage::Transaction(_) | NetworkMessage::Block(_) => {}
+                },
+                P2pEvent::PeerConnected(peer) => {
+                    eprintln!("[p2p] peer connecté: {peer}");
+                }
+                P2pEvent::PeerDisconnected(peer) => {
+                    eprintln!("[p2p] peer déconnecté: {peer}");
+                }
+                P2pEvent::TransportError(msg) => {
+                    eprintln!("[p2p] erreur transport: {msg}");
+                }
+                P2pEvent::NewListenAddr(addr) => {
+                    eprintln!("[p2p] listen on {addr}");
+                }
+                P2pEvent::Subscribed { peer_id, topic } => {
+                    eprintln!("[p2p] {peer_id} subscribed to {topic}");
+                }
+            }
+        }
+        Ok(count)
+    }
+
     // --- API principale ----------------------------------------------------
 
     /// Propose un bloc (avec txs du mempool + evidences) si nous sommes
@@ -189,13 +267,9 @@ impl Driver {
         let id = self.local.as_ref().ok_or(DriverError::NoLocalIdentity)?;
         let proposer = id.address();
 
-        // 1. Candidats du mempool.
         let candidates = self.collect_mempool_candidates();
-
-        // 2. Evidences en attente.
         let evidences = std::mem::take(&mut self.pending_evidences);
 
-        // 3. Construction du bloc.
         let epoch = self.epoch;
         let round = self.runner.ctx().round;
         let height = self.runner.ctx().height;
@@ -226,10 +300,6 @@ impl Driver {
     }
 
     /// Traite une prevote reçue du réseau.
-    ///
-    /// En cas de double-vote détecté, l'erreur `DoublePrevote` transporte
-    /// les deux messages complets — on construit une `Evidence` et on la
-    /// met en attente pour le prochain bloc.
     pub fn handle_prevote(&mut self, v: Prevote) -> Result<(), DriverError> {
         match self.runner.on_prevote(v) {
             Ok(()) => self.process_actions(),
@@ -268,7 +338,7 @@ impl Driver {
         self.process_actions()
     }
 
-    /// Récupère et vide les messages sortants.
+    /// Récupère et vide les messages sortants (self-loopback).
     pub fn drain_outbox(&mut self) -> Vec<OutgoingMessage> {
         std::mem::take(&mut self.outbox)
     }
@@ -280,8 +350,6 @@ impl Driver {
 
     // --- Internes ----------------------------------------------------------
 
-    /// Collecte les transactions candidates du mempool, ordonnées par
-    /// priorité effective décroissante et FIFO.
     fn collect_mempool_candidates(&self) -> Vec<Transaction> {
         let senders: Vec<NativeAddress> = self.handle.with_mempool(|pool| {
             let mut s = HashSet::new();
@@ -311,7 +379,6 @@ impl Driver {
         entries.into_iter().map(|e| e.tx).collect()
     }
 
-    /// Purge le mempool après l'application d'un bloc.
     fn prune_mempool(&self) {
         let senders: Vec<NativeAddress> = self.handle.with_mempool(|pool| {
             let mut s = HashSet::new();
@@ -347,12 +414,22 @@ impl Driver {
             for action in actions {
                 match action {
                     Action::BroadcastProposal(p) => {
+                        if let Some(p2p) = &self.p2p {
+                            let msg = NetworkMessage::Proposal(p.clone());
+                            let _ = p2p.broadcast_sync(msg);
+                        }
                         self.outbox.push(OutgoingMessage::Proposal(p));
                     }
                     Action::BroadcastPrevote(v) => {
+                        if let Some(p2p) = &self.p2p {
+                            let _ = p2p.broadcast_sync(NetworkMessage::Prevote(v));
+                        }
                         self.outbox.push(OutgoingMessage::Prevote(v));
                     }
                     Action::BroadcastPrecommit(c) => {
+                        if let Some(p2p) = &self.p2p {
+                            let _ = p2p.broadcast_sync(NetworkMessage::Precommit(c));
+                        }
                         self.outbox.push(OutgoingMessage::Precommit(c));
                     }
                     Action::Committed {
@@ -367,7 +444,7 @@ impl Driver {
                             .map(|p| p.block.clone())
                             .ok_or(DriverError::MissingBlockForCommit)?;
 
-                        // Participants = precommitters (pour le downtime).
+                        // Participants = precommitters (downtime).
                         let participants: Vec<NativeAddress> = certificate
                             .precommits
                             .iter()
@@ -408,20 +485,13 @@ impl std::fmt::Debug for Driver {
             .field("step", &self.current_step())
             .field("local", &self.local_address())
             .field("pending_evidences", &self.pending_evidences.len())
+            .field("p2p_attached", &self.p2p.is_some())
             .finish_non_exhaustive()
     }
 }
 
 // --- Construction d'evidence (fonctions libres) ----------------------------
 
-/// Construit une `Evidence` de double-prevote à partir de deux votes
-/// contradictoires signés.
-///
-/// Chaque message contient son `canonical_payload` (l'encodage hors
-/// signature) et sa signature Ed25519. L'`Evidence` produite est
-/// **pleinement vérifiable** : un tiers peut décoder les payloads,
-/// vérifier les signatures, et constater que les deux `block_hash`
-/// diffèrent.
 #[must_use]
 fn build_double_prevote_evidence(first: &Prevote, second: &Prevote) -> Evidence {
     Evidence {
@@ -445,7 +515,6 @@ fn build_double_prevote_evidence(first: &Prevote, second: &Prevote) -> Evidence 
     }
 }
 
-/// Idem pour un double-precommit.
 #[must_use]
 fn build_double_precommit_evidence(first: &Precommit, second: &Precommit) -> Evidence {
     Evidence {

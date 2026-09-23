@@ -2534,6 +2534,7 @@ dependencies = [
  "sango-crypto",
  "sango-exec",
  "sango-mempool",
+ "sango-p2p",
  "sango-primitives",
  "sango-rpc",
  "sango-state",
@@ -2545,6 +2546,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
