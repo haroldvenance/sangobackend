@@ -35,6 +35,8 @@ impl FakeBackend {
             pending_commission_at: None,
             jailed: false,
             jailed_until: None,
+            downtime_window_start: 0,
+            downtime_missed: 0,
         };
         Self {
             chain_id,

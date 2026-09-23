@@ -4,6 +4,7 @@
 #![warn(missing_docs)]
 
 mod apply;
+pub mod downtime;
 mod error;
 pub mod rewards;
 pub mod slashing;
@@ -14,6 +15,7 @@ pub use apply::{
     apply_tx_no_rollback, AppliedTransaction, BlockApplyResult, BlockExecutionResult,
     ExecutionContext, NATIVE_TRANSFER_GAS,
 };
+pub use downtime::{record_participation, ParticipationReport, DOWNTIME_WINDOW, MAX_MISSED};
 pub use error::ApplyError;
 pub use rewards::{
     block_reward, distribute_block_rewards, max_pos_rewards, RewardDistribution, BLOCKS_PER_YEAR,

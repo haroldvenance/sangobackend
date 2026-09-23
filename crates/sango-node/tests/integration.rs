@@ -88,7 +88,7 @@ fn apply_first_block_ok() {
         header: header(0, Hash32::ZERO, INITIAL_BASE_FEE),
         transactions: Vec::new(),
     };
-    let r = node.apply_block(&block).unwrap();
+    let r = node.apply_block(&block, &[]).unwrap();
     assert!(r.apply_result.applied.is_empty());
     assert_eq!(r.gas_used, 0);
 
@@ -107,7 +107,7 @@ fn first_block_wrong_parent_rejected() {
         header: header(0, Hash32::from_bytes([0xee; 32]), INITIAL_BASE_FEE),
         transactions: Vec::new(),
     };
-    let err = node.apply_block(&block).unwrap_err();
+    let err = node.apply_block(&block, &[]).unwrap_err();
     assert!(matches!(
         err,
         sango_node::NodeError::ParentHashMismatch { .. }
@@ -123,7 +123,7 @@ fn first_block_wrong_height_rejected() {
         header: header(5, Hash32::ZERO, INITIAL_BASE_FEE),
         transactions: Vec::new(),
     };
-    let err = node.apply_block(&block).unwrap_err();
+    let err = node.apply_block(&block, &[]).unwrap_err();
     assert!(matches!(err, sango_node::NodeError::HeightMismatch { .. }));
 }
 
@@ -136,7 +136,7 @@ fn first_block_wrong_base_fee_rejected() {
         header: header(0, Hash32::ZERO, 42),
         transactions: Vec::new(),
     };
-    let err = node.apply_block(&block).unwrap_err();
+    let err = node.apply_block(&block, &[]).unwrap_err();
     assert!(matches!(err, sango_node::NodeError::BaseFeeMismatch { .. }));
 }
 
@@ -152,7 +152,7 @@ fn apply_two_empty_blocks() {
         transactions: Vec::new(),
     };
     let h1 = b1.hash();
-    node.apply_block(&b1).unwrap();
+    node.apply_block(&b1, &[]).unwrap();
 
     // Block 1 : gas_used = 0, target = 15M, donc base fee diminue mais
     // reste au minimum absolu (1).
@@ -161,7 +161,7 @@ fn apply_two_empty_blocks() {
         header: header(1, h1, expected_bf),
         transactions: Vec::new(),
     };
-    node.apply_block(&b2).unwrap();
+    node.apply_block(&b2, &[]).unwrap();
 
     let tip = node.tip().unwrap();
     assert_eq!(tip.height.get(), 1);
@@ -177,13 +177,13 @@ fn second_block_wrong_parent_rejected() {
         header: header(0, Hash32::ZERO, INITIAL_BASE_FEE),
         transactions: Vec::new(),
     };
-    node.apply_block(&b1).unwrap();
+    node.apply_block(&b1, &[]).unwrap();
 
     let b2 = Block {
         header: header(1, Hash32::from_bytes([0xaa; 32]), INITIAL_BASE_FEE),
         transactions: Vec::new(),
     };
-    let err = node.apply_block(&b2).unwrap_err();
+    let err = node.apply_block(&b2, &[]).unwrap_err();
     assert!(matches!(
         err,
         sango_node::NodeError::ParentHashMismatch { .. }
@@ -203,7 +203,7 @@ fn chain_id_mismatch_rejected() {
         header: h,
         transactions: Vec::new(),
     };
-    let err = node.apply_block(&block).unwrap_err();
+    let err = node.apply_block(&block, &[]).unwrap_err();
     assert!(matches!(err, sango_node::NodeError::ChainIdMismatch));
 }
 
@@ -222,7 +222,7 @@ fn reject_unknown_sender_transaction() {
         transactions: vec![tx],
     };
 
-    let err = node.apply_block(&block).unwrap_err();
+    let err = node.apply_block(&block, &[]).unwrap_err();
     assert!(matches!(
         err,
         sango_node::NodeError::Validation { index: 0, .. }
@@ -244,7 +244,7 @@ fn reopen_preserves_tip() {
             transactions: Vec::new(),
         };
         let h = block.hash();
-        node.apply_block(&block).unwrap();
+        node.apply_block(&block, &[]).unwrap();
         h
     };
 
@@ -264,7 +264,7 @@ fn state_root_is_stable_across_reopen() {
             header: header(0, Hash32::ZERO, INITIAL_BASE_FEE),
             transactions: Vec::new(),
         };
-        node.apply_block(&block).unwrap();
+        node.apply_block(&block, &[]).unwrap();
         node.state().native_state_root()
     };
 

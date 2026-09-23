@@ -321,7 +321,11 @@ impl Node {
     /// 3. `height` vaut `tip.height + 1` (ou `0`/`1` si vierge).
     /// 4. `base_fee` correspond au calcul EIP-1559.
     /// 5. Chaque transaction est validée.
-    pub fn apply_block(&mut self, block: &Block) -> Result<BlockExecutionResult, NodeError> {
+    pub fn apply_block(
+        &mut self,
+        block: &Block,
+        participants: &[NativeAddress],
+    ) -> Result<BlockExecutionResult, NodeError> {
         // (1) chain_id.
         if block.header.chain_id != self.chain_id {
             return Err(NodeError::ChainIdMismatch);
@@ -381,7 +385,7 @@ impl Node {
             current_height: block.header.height.get(),
             rewards_enabled: self.rewards_enabled,
         };
-        let result = exec_apply_block(&mut self.state, block, &validated, &ctx)?;
+        let result = exec_apply_block(&mut self.state, block, &validated, &ctx, participants)?;
 
         // (6) Diff.
         let diff = diff_state(&state_before, &self.state);

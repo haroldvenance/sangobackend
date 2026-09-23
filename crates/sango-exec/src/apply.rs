@@ -269,6 +269,7 @@ pub fn apply_block(
     block: &Block,
     validated: &[ValidatedTransaction],
     ctx: &ExecutionContext,
+    participants: &[NativeAddress],
 ) -> Result<BlockExecutionResult, ApplyError> {
     if block.transactions.len() != validated.len() {
         return Err(ApplyError::LengthMismatch {
@@ -278,6 +279,25 @@ pub fn apply_block(
     }
 
     let snapshot = state.clone();
+
+    // 0. Suivi de la participation (downtime).
+    //
+    // Déterministe : tous les nœuds voient le même CommitCertificate (donc
+    // les mêmes participants) et évaluent la même fenêtre au même moment.
+    // Fait **avant** l'application des txs pour utiliser l'ensemble actif
+    // tel qu'il était au début du bloc.
+    {
+        let active: Vec<NativeAddress> = state
+            .all_validators()
+            .into_iter()
+            .filter(|v| !v.jailed)
+            .map(|v| v.address)
+            .collect();
+        if let Err(e) = crate::downtime::record_participation(state, &active, participants, ctx) {
+            *state = snapshot;
+            return Err(e);
+        }
+    }
 
     // 1. Appliquer les transactions (sans toucher aux compteurs globaux).
     let mut applied: Vec<AppliedTransaction> = Vec::with_capacity(validated.len());
@@ -864,7 +884,7 @@ mod tests {
             header: sample_header(),
             transactions: Vec::new(),
         };
-        let r = apply_block(&mut state, &block, &[], &exec_ctx()).unwrap();
+        let r = apply_block(&mut state, &block, &[], &exec_ctx(), &[]).unwrap();
         assert_eq!(r.apply_result.applied.len(), 0);
         assert_eq!(r.receipts.len(), 0);
         assert_eq!(r.gas_used, 0);
@@ -899,7 +919,7 @@ mod tests {
             header: sample_header(),
             transactions: vec![tx1.clone(), tx2.clone()],
         };
-        let r = apply_block(&mut state, &block, &[v1, v2], &exec_ctx()).unwrap();
+        let r = apply_block(&mut state, &block, &[v1, v2], &exec_ctx(), &[]).unwrap();
 
         assert_eq!(r.receipts.len(), 2);
         assert_eq!(r.receipts[0].tx_hash, tx1.hash());
@@ -937,7 +957,7 @@ mod tests {
             transactions: vec![tx],
         };
         let initial = exec_ctx().initial_supply;
-        let r = apply_block(&mut state, &block, &[v], &exec_ctx()).unwrap();
+        let r = apply_block(&mut state, &block, &[v], &exec_ctx(), &[]).unwrap();
 
         let expected_burned = Amount::from_base_units(25_200);
         assert_eq!(r.total_burned_after, expected_burned);
@@ -978,7 +998,7 @@ mod tests {
             header: sample_header(),
             transactions: vec![tx1, tx2],
         };
-        let err = apply_block(&mut state, &block, &[v1, v2], &exec_ctx()).unwrap_err();
+        let err = apply_block(&mut state, &block, &[v1, v2], &exec_ctx(), &[]).unwrap_err();
         assert!(matches!(err, ApplyError::InsufficientBalance { .. }));
         assert_eq!(state.native_state_root(), root_before);
         assert_eq!(state.total_burned(), Amount::ZERO);
@@ -1003,7 +1023,7 @@ mod tests {
             value: 100,
             bootstrap_public_key: None,
         };
-        let err = apply_block(&mut state, &block, &[v], &exec_ctx()).unwrap_err();
+        let err = apply_block(&mut state, &block, &[v], &exec_ctx(), &[]).unwrap_err();
         assert_eq!(
             err,
             ApplyError::LengthMismatch {
@@ -1029,8 +1049,84 @@ mod tests {
             header: sample_header(),
             transactions: vec![tx],
         };
-        let r = apply_block(&mut state, &block, &[v], &exec_ctx()).unwrap();
+        let r = apply_block(&mut state, &block, &[v], &exec_ctx(), &[]).unwrap();
 
         assert_eq!(r.native_state_root, state.native_state_root());
+    }
+
+    #[test]
+    fn apply_block_integrated_downtime() {
+        // Vérifie que apply_block déclenche bien le suivi de participation.
+        use sango_types::ValidatorInfo;
+
+        let kp_a = NativeKeypair::from_seed([0xa1; 32]);
+        let kp_b = NativeKeypair::from_seed([0xb1; 32]);
+        let a = derive_native_address(&kp_a.public_key());
+        let b = derive_native_address(&kp_b.public_key());
+
+        let mut state = NativeState::new();
+        let mk = |addr, pk| ValidatorInfo {
+            address: addr,
+            public_key: pk,
+            self_stake: Amount::from_sango(100_000).unwrap(),
+            total_delegated: Amount::ZERO,
+            commission_bps: 700,
+            pending_commission_bps: None,
+            pending_commission_at: None,
+            jailed: false,
+            jailed_until: None,
+            downtime_window_start: 1,
+            downtime_missed: 0,
+        };
+        state.set_validator(mk(a, kp_a.public_key()));
+        state.set_validator(mk(b, kp_b.public_key()));
+
+        // Bloc vide, seul A participe.
+        let mut h = sample_header();
+        h.height = sango_primitives::Height::new(1);
+        let block = Block {
+            header: h,
+            transactions: Vec::new(),
+        };
+
+        let ctx = exec_ctx();
+        apply_block(&mut state, &block, &[], &ctx, &[a]).unwrap();
+
+        let info_a = state.get_validator(&a).unwrap();
+        let info_b = state.get_validator(&b).unwrap();
+        assert_eq!(info_a.downtime_missed, 0, "A a participé");
+        assert_eq!(info_b.downtime_missed, 1, "B a manqué");
+    }
+
+    #[test]
+    fn apply_block_empty_participants_increments_all() {
+        use sango_types::ValidatorInfo;
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let addr = derive_native_address(&kp.public_key());
+
+        let mut state = NativeState::new();
+        state.set_validator(ValidatorInfo {
+            address: addr,
+            public_key: kp.public_key(),
+            self_stake: Amount::from_sango(100_000).unwrap(),
+            total_delegated: Amount::ZERO,
+            commission_bps: 700,
+            pending_commission_bps: None,
+            pending_commission_at: None,
+            jailed: false,
+            jailed_until: None,
+            downtime_window_start: 1,
+            downtime_missed: 0,
+        });
+
+        let mut h = sample_header();
+        h.height = sango_primitives::Height::new(1);
+        let block = Block {
+            header: h,
+            transactions: Vec::new(),
+        };
+        apply_block(&mut state, &block, &[], &exec_ctx(), &[]).unwrap();
+
+        assert_eq!(state.get_validator(&addr).unwrap().downtime_missed, 1);
     }
 }

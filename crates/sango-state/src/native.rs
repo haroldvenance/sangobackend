@@ -1028,6 +1028,8 @@ mod tests {
             pending_commission_at: None,
             jailed: false,
             jailed_until: None,
+            downtime_window_start: 0,
+            downtime_missed: 0,
         };
         s.set_validator(v);
         assert!(s.validator_exists(&addr(0xaa)));
@@ -1086,6 +1088,8 @@ mod tests {
             pending_commission_at: None,
             jailed: false,
             jailed_until: None,
+            downtime_window_start: 0,
+            downtime_missed: 0,
         });
 
         assert_eq!(s.get_account(&addr(0xaa)), account_before);
@@ -1110,6 +1114,8 @@ mod tests {
             pending_commission_at: None,
             jailed: false,
             jailed_until: None,
+            downtime_window_start: 0,
+            downtime_missed: 0,
         });
         let vs = s.all_validators();
         assert_eq!(vs.len(), 1);

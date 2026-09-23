@@ -26,6 +26,10 @@ pub struct ValidatorInfo {
     pub jailed: bool,
     /// Timestamp Unix de sortie automatique du jail (si connu).
     pub jailed_until: Option<u64>,
+    /// Hauteur du début de la fenêtre de downtime courante.
+    pub downtime_window_start: u64,
+    /// Nombre de blocs manqués dans la fenêtre courante.
+    pub downtime_missed: u32,
 }
 
 impl ValidatorInfo {
@@ -55,6 +59,8 @@ impl Encode for ValidatorInfo {
         self.pending_commission_at.encode(enc);
         self.jailed.encode(enc);
         self.jailed_until.encode(enc);
+        self.downtime_window_start.encode(enc);
+        self.downtime_missed.encode(enc);
     }
 }
 
@@ -70,6 +76,8 @@ impl Decode for ValidatorInfo {
             pending_commission_at: Option::<u64>::decode(dec)?,
             jailed: bool::decode(dec)?,
             jailed_until: Option::<u64>::decode(dec)?,
+            downtime_window_start: u64::decode(dec)?,
+            downtime_missed: u32::decode(dec)?,
         })
     }
 }
@@ -169,6 +177,9 @@ pub mod params {
 
     /// Nombre maximum de validateurs actifs.
     pub const MAX_ACTIVE_VALIDATORS: u32 = 100;
+
+    /// Durée du jail automatique pour downtime (5000 blocs ≈ 7 h).
+    pub const DOWNTIME_JAIL_BLOCKS: u64 = 5_000;
 }
 
 #[cfg(test)]
@@ -191,6 +202,8 @@ mod tests {
             pending_commission_at: Some(1_800_000_000),
             jailed: false,
             jailed_until: None,
+            downtime_window_start: 0,
+            downtime_missed: 0,
         };
         let bytes = v.encode_to_vec();
         assert_eq!(ValidatorInfo::decode_exact(&bytes).unwrap(), v);
@@ -208,6 +221,8 @@ mod tests {
             pending_commission_at: None,
             jailed: true,
             jailed_until: Some(1_800_000_000),
+            downtime_window_start: 0,
+            downtime_missed: 0,
         };
         let bytes = v.encode_to_vec();
         assert_eq!(ValidatorInfo::decode_exact(&bytes).unwrap(), v);
@@ -225,6 +240,8 @@ mod tests {
             pending_commission_at: None,
             jailed: false,
             jailed_until: None,
+            downtime_window_start: 0,
+            downtime_missed: 0,
         };
         assert_eq!(v.voting_power(), Amount::from_sango(150_000).unwrap());
     }
@@ -260,5 +277,6 @@ mod tests {
         assert_eq!(DOWNTIME_THRESHOLD_BPS, 8_000);
         assert_eq!(DOWNTIME_WINDOW, 100);
         assert_eq!(MAX_ACTIVE_VALIDATORS, 100);
+        assert_eq!(DOWNTIME_JAIL_BLOCKS, 5_000);
     }
 }

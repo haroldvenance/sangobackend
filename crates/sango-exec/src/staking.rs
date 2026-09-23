@@ -380,6 +380,8 @@ fn apply_register_validator(
         pending_commission_at: None,
         jailed: false,
         jailed_until: None,
+        downtime_window_start: 0,
+        downtime_missed: 0,
     });
     Ok(())
 }
@@ -492,7 +494,6 @@ fn map_state_error(e: sango_state::StateError) -> ApplyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apply::apply_block;
     use sango_crypto::{derive_native_address, NativeKeypair};
     use sango_primitives::{ChainId32, Signature};
     use sango_state::NativeState;
@@ -688,6 +689,8 @@ mod tests {
             pending_commission_at: None,
             jailed: false,
             jailed_until: None,
+            downtime_window_start: 0,
+            downtime_missed: 0,
         });
 
         let tx = sign_tx(
@@ -734,6 +737,8 @@ mod tests {
             pending_commission_at: None,
             jailed: false,
             jailed_until: None,
+            downtime_window_start: 0,
+            downtime_missed: 0,
         });
 
         // Tentative d'unbond de 10 000 SANGO → resterait 90 000 < 100 000 min.
@@ -784,6 +789,8 @@ mod tests {
             pending_commission_at: None,
             jailed: false,
             jailed_until: None,
+            downtime_window_start: 0,
+            downtime_missed: 0,
         });
 
         // Delegate 10 000.
@@ -865,6 +872,8 @@ mod tests {
             pending_commission_at: None,
             jailed: false,
             jailed_until: None,
+            downtime_window_start: 0,
+            downtime_missed: 0,
         });
 
         let tx = sign_tx(
@@ -911,6 +920,8 @@ mod tests {
             pending_commission_at: None,
             jailed: false,
             jailed_until: None,
+            downtime_window_start: 0,
+            downtime_missed: 0,
         });
 
         let tx = sign_tx(
@@ -962,6 +973,8 @@ mod tests {
             pending_commission_at: None,
             jailed: true,
             jailed_until: Some(now() - 1),
+            downtime_window_start: 0,
+            downtime_missed: 0,
         });
 
         let tx = sign_tx(
@@ -1007,6 +1020,8 @@ mod tests {
             pending_commission_at: None,
             jailed: true,
             jailed_until: Some(now() + 3600),
+            downtime_window_start: 0,
+            downtime_missed: 0,
         });
 
         let tx = sign_tx(
@@ -1033,16 +1048,5 @@ mod tests {
             apply_staking_no_rollback(&mut state, &tx, &v, 30_000, &exec_ctx(fee_recipient()))
                 .unwrap_err();
         assert!(matches!(err, ApplyError::JailNotExpired { .. }));
-    }
-
-    // Marqueur anti-warning.
-    #[allow(dead_code)]
-    fn _marker() {
-        let _: fn(
-            &mut NativeState,
-            &sango_types::Block,
-            &[ValidatedTransaction],
-            &ExecutionContext,
-        ) -> Result<crate::BlockExecutionResult, ApplyError> = apply_block;
     }
 }

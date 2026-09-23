@@ -347,7 +347,18 @@ impl Driver {
                             .current_proposal()
                             .map(|p| p.block.clone())
                             .ok_or(DriverError::MissingBlockForCommit)?;
-                        self.handle.with_node_mut(|n| n.apply_block(&block))?;
+
+                        // Extraire les participants depuis le certificat
+                        // (précommits). Déterministe : tous les nœuds
+                        // voient le même certificat.
+                        let participants: Vec<NativeAddress> = certificate
+                            .precommits
+                            .iter()
+                            .map(|e| e.validator_address)
+                            .collect();
+
+                        self.handle
+                            .with_node_mut(|n| n.apply_block(&block, &participants))?;
                         self.prune_mempool();
                         self.events.push(DriverEvent::Committed {
                             height,
