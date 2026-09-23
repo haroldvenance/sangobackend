@@ -89,6 +89,7 @@ USAGE:
 COMMANDES:
     new                                 Génère un nouveau keyfile
     address                             Affiche l'adresse locale
+    pubkey                              Affiche la clé publique Ed25519
     balance [ADDR]                      Affiche le solde (défaut : local)
     nonce [ADDR]                        Affiche le nonce
     info                                Informations sur la chaîne

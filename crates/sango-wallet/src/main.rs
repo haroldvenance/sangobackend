@@ -43,6 +43,7 @@ fn run(args: &[String]) -> Result<(), WalletError> {
     match cmd.as_str() {
         "new" => cmd_new(kf_path),
         "address" => cmd_address(kf_path),
+        "pubkey" => cmd_pubkey(kf_path),
         "balance" => cmd_balance(rpc_endpoint, kf_path, &rest),
         "nonce" => cmd_nonce(rpc_endpoint, kf_path, &rest),
         "info" => cmd_info(rpc_endpoint),
@@ -75,6 +76,12 @@ fn cmd_address(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
     Ok(())
 }
 
+fn cmd_pubkey(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
+    let kf = KeyFile::load(keyfile_path)?;
+    println!("0x{}", kf.public_key_hex()?);
+    Ok(())
+}
+
 fn cmd_balance(
     rpc_endpoint: &str,
     keyfile_path: &std::path::Path,
@@ -82,7 +89,7 @@ fn cmd_balance(
 ) -> Result<(), WalletError> {
     let addr = resolve_address(keyfile_path, args)?;
     let rpc = RpcClient::new(rpc_endpoint);
-    let (_, balance) = fetch_account(&rpc, &addr)?;
+    let (_, balance, _) = fetch_account(&rpc, &addr)?;
     println!(
         "{} base units ({} SANGO)",
         balance,
@@ -98,7 +105,7 @@ fn cmd_nonce(
 ) -> Result<(), WalletError> {
     let addr = resolve_address(keyfile_path, args)?;
     let rpc = RpcClient::new(rpc_endpoint);
-    let (nonce, _) = fetch_account(&rpc, &addr)?;
+    let (nonce, _, _) = fetch_account(&rpc, &addr)?;
     println!("{nonce}");
     Ok(())
 }
@@ -359,6 +366,9 @@ fn parse_address_arg(s: &str) -> Result<NativeAddress, WalletError> {
 }
 
 /// Soumet une transaction : remplit chain_id + nonce, signe, envoie.
+///
+/// Si le compte n'a pas encore de clé publique enregistrée, la transaction
+/// la déclare pour permettre le bootstrap (Freeze, sango-tx).
 fn submit_tx(
     rpc_endpoint: &str,
     keyfile_path: &std::path::Path,
@@ -367,14 +377,21 @@ fn submit_tx(
     let kf = KeyFile::load(keyfile_path)?;
     let rpc = RpcClient::new(rpc_endpoint);
 
-    // Récupérer chain_id et nonce courants.
+    // Récupérer chain_id, nonce et clé publique enregistrée.
     params.chain_id = fetch_chain_id(&rpc)?;
     let addr = kf.address()?;
-    let (nonce, _) = fetch_account(&rpc, &addr)?;
+    let (nonce, _, onchain_pk) = fetch_account(&rpc, &addr)?;
     params.nonce = nonce;
 
+    // Bootstrap : si le compte n'a pas encore de clé, déclarer la nôtre.
+    let declare_pk = if onchain_pk.is_none() {
+        Some(kf.public_key()?)
+    } else {
+        None
+    };
+
     // Signer et envoyer.
-    let tx = params.build_and_sign(&kf)?;
+    let tx = params.build_and_sign(&kf, declare_pk)?;
     let tx_hash = send_transaction(&rpc, &tx)?;
     println!("✓ Transaction envoyée");
     println!("  Hash : {tx_hash}");

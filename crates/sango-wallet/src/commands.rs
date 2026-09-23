@@ -1,7 +1,7 @@
 //! Commandes du wallet.
 
 use sango_codec::Encode;
-use sango_primitives::{Amount, ChainId32, NativeAddress, Signature};
+use sango_primitives::{Amount, ChainId32, NativeAddress, PublicKey, Signature};
 use sango_types::{Transaction, TxKind};
 
 use crate::error::WalletError;
@@ -9,8 +9,6 @@ use crate::keystore::KeyFile;
 use crate::rpc_client::RpcClient;
 
 /// Convertit un montant "humain" (ex. `1.5`) en base units (`u128`).
-///
-/// Accepte `"100"`, `"1.5"`, `"0.0000001"`. Refuse plus de 7 décimales.
 pub fn parse_sango_decimal(s: &str) -> Result<u128, WalletError> {
     let s = s.trim();
     if s.is_empty() {
@@ -21,7 +19,6 @@ pub fn parse_sango_decimal(s: &str) -> Result<u128, WalletError> {
         None => (s, ""),
     };
 
-    // Accepter uniquement des chiffres.
     for c in int_part.chars() {
         if !c.is_ascii_digit() {
             return Err(WalletError::InvalidAmount(format!("non-digit: {c}")));
@@ -80,17 +77,20 @@ pub fn format_base_units(u: u128) -> String {
     }
 }
 
-/// Lit le nonce et le solde d'une adresse via RPC.
+/// Lit le nonce, le solde et la clé publique enregistrée via RPC.
 ///
-/// Retourne `(nonce, balance_base_units)`. Si le compte n'existe pas,
-/// retourne `(0, 0)`.
-pub fn fetch_account(rpc: &RpcClient, address: &NativeAddress) -> Result<(u64, u128), WalletError> {
+/// Retourne `(nonce, balance_base_units, public_key)`.
+/// Si le compte n'existe pas : `(0, 0, None)`.
+pub fn fetch_account(
+    rpc: &RpcClient,
+    address: &NativeAddress,
+) -> Result<(u64, u128, Option<PublicKey>), WalletError> {
     let result = rpc.call(
         "sango_getAccount",
         serde_json::json!([format!("0x{}", address.to_hex())]),
     )?;
     if result.is_null() {
-        return Ok((0, 0));
+        return Ok((0, 0, None));
     }
     let nonce = result.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0);
     let balance = result
@@ -98,7 +98,11 @@ pub fn fetch_account(rpc: &RpcClient, address: &NativeAddress) -> Result<(u64, u
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<u128>().ok())
         .unwrap_or(0);
-    Ok((nonce, balance))
+    let pk = result
+        .get("publicKey")
+        .and_then(|v| v.as_str())
+        .and_then(|s| PublicKey::from_hex(s).ok());
+    Ok((nonce, balance, pk))
 }
 
 /// Paramètres de construction d'une transaction.
@@ -125,7 +129,15 @@ pub struct TxParams {
 
 impl TxParams {
     /// Construit et signe la transaction.
-    pub fn build_and_sign(self, kf: &KeyFile) -> Result<Transaction, WalletError> {
+    ///
+    /// `declare_public_key` est `Some(pk)` si le compte n'a pas encore de
+    /// clé publique enregistrée — la tx la déclare alors pour permettre le
+    /// bootstrap (voir documentation de `sango-tx`).
+    pub fn build_and_sign(
+        self,
+        kf: &KeyFile,
+        declare_public_key: Option<PublicKey>,
+    ) -> Result<Transaction, WalletError> {
         let kp = kf.keypair()?;
         let sender = kf.address()?;
         let chain_id = self.chain_id;
@@ -135,7 +147,7 @@ impl TxParams {
             chain_id,
             nonce: self.nonce,
             sender,
-            public_key: None, // déjà enregistrée normalement
+            public_key: declare_public_key,
             gas_limit: self.gas_limit,
             max_fee: self.max_fee,
             priority_fee: self.priority_fee,

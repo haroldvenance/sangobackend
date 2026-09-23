@@ -103,6 +103,17 @@ impl KeyFile {
         Ok(NativeKeypair::from_seed(seed))
     }
 
+    /// Clé publique Ed25519 encodée en hex (64 caractères).
+    pub fn public_key_hex(&self) -> Result<String, WalletError> {
+        let kp = self.keypair()?;
+        Ok(kp.public_key().to_hex())
+    }
+
+    /// Clé publique Ed25519.
+    pub fn public_key(&self) -> Result<sango_primitives::PublicKey, WalletError> {
+        Ok(self.keypair()?.public_key())
+    }
+
     /// Adresse native.
     pub fn address(&self) -> Result<NativeAddress, WalletError> {
         NativeAddress::from_hex(&self.address_hex)
