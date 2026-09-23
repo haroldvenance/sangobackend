@@ -7,3 +7,10 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+thiserror.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sango-primitives.workspace = true
+sango-codec.workspace = true
+sango-types.workspace = true

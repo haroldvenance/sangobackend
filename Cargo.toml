@@ -28,6 +28,8 @@ repository = "https://github.com/sango/sango"
 
 [workspace.dependencies]
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 hex = "0.4"
 hex-literal = "0.4"
 
@@ -42,3 +44,4 @@ sango-exec = { path = "crates/sango-exec" }
 sango-node = { path = "crates/sango-node" }
 sango-consensus = { path = "crates/sango-consensus" }
 sango-mempool = { path = "crates/sango-mempool" }
+sango-rpc = { path = "crates/sango-rpc" }
