@@ -464,6 +464,7 @@ mod tests {
     fn sample_block() -> Block {
         Block {
             header: sample_header(),
+            evidences: Vec::new(),
             transactions: Vec::new(),
         }
     }

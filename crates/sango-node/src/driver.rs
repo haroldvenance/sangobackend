@@ -7,7 +7,10 @@ use sango_consensus::{
     ValidatorSet,
 };
 use sango_primitives::{Epoch, Hash32, Height, NativeAddress, Round};
-use sango_types::{CommitCertificate, Precommit, Prevote, Proposal, Transaction};
+use sango_types::{
+    CommitCertificate, ConsensusMessage, ConsensusMessageType, Evidence, EvidenceType, Precommit,
+    Prevote, Proposal, Transaction,
+};
 
 use crate::base_fee::INITIAL_BASE_FEE;
 use crate::error::NodeError;
@@ -81,6 +84,8 @@ pub struct Driver {
     runner: RoundRunner,
     outbox: Vec<OutgoingMessage>,
     events: Vec<DriverEvent>,
+    /// Evidences détectées en attente d'inclusion dans un prochain bloc.
+    pending_evidences: Vec<Evidence>,
 }
 
 impl Driver {
@@ -116,6 +121,7 @@ impl Driver {
             runner,
             outbox: Vec::new(),
             events: Vec::new(),
+            pending_evidences: Vec::new(),
         })
     }
 
@@ -162,9 +168,16 @@ impl Driver {
         Ok(self.runner.is_proposer()?)
     }
 
+    /// Nombre d'evidences en attente d'inclusion.
+    #[must_use]
+    pub fn pending_evidence_count(&self) -> usize {
+        self.pending_evidences.len()
+    }
+
     // --- API principale ----------------------------------------------------
 
-    /// Propose un bloc (avec txs du mempool) si nous sommes le proposer.
+    /// Propose un bloc (avec txs du mempool + evidences) si nous sommes
+    /// le proposer.
     pub fn maybe_propose(&mut self) -> Result<(), DriverError> {
         if self.runner.step() != Step::Propose {
             return Ok(());
@@ -176,10 +189,13 @@ impl Driver {
         let id = self.local.as_ref().ok_or(DriverError::NoLocalIdentity)?;
         let proposer = id.address();
 
-        // 1. Récupérer les candidats du mempool, ordonnés par priorité.
+        // 1. Candidats du mempool.
         let candidates = self.collect_mempool_candidates();
 
-        // 2. Construire le bloc via Node (pré-validation + application trial).
+        // 2. Evidences en attente.
+        let evidences = std::mem::take(&mut self.pending_evidences);
+
+        // 3. Construction du bloc.
         let epoch = self.epoch;
         let round = self.runner.ctx().round;
         let height = self.runner.ctx().height;
@@ -192,6 +208,7 @@ impl Driver {
                 MAX_TXS_PER_BLOCK,
                 proposer,
                 timestamp,
+                evidences,
             )
         });
 
@@ -209,10 +226,19 @@ impl Driver {
     }
 
     /// Traite une prevote reçue du réseau.
+    ///
+    /// En cas de double-vote détecté, l'erreur `DoublePrevote` transporte
+    /// les deux messages complets — on construit une `Evidence` et on la
+    /// met en attente pour le prochain bloc.
     pub fn handle_prevote(&mut self, v: Prevote) -> Result<(), DriverError> {
         match self.runner.on_prevote(v) {
             Ok(()) => self.process_actions(),
             Err(e) if is_stale(&e) => Ok(()),
+            Err(ConsensusError::DoublePrevote { first, second, .. }) => {
+                let ev = build_double_prevote_evidence(&first, &second);
+                self.pending_evidences.push(ev);
+                Ok(())
+            }
             Err(e) => Err(DriverError::Consensus(e)),
         }
     }
@@ -222,6 +248,11 @@ impl Driver {
         match self.runner.on_precommit(c) {
             Ok(()) => self.process_actions(),
             Err(e) if is_stale(&e) => Ok(()),
+            Err(ConsensusError::DoublePrecommit { first, second, .. }) => {
+                let ev = build_double_precommit_evidence(&first, &second);
+                self.pending_evidences.push(ev);
+                Ok(())
+            }
             Err(e) => Err(DriverError::Consensus(e)),
         }
     }
@@ -251,11 +282,7 @@ impl Driver {
 
     /// Collecte les transactions candidates du mempool, ordonnées par
     /// priorité effective décroissante et FIFO.
-    ///
-    /// Le tri respecte les dépendances de nonce via
-    /// [`sango_mempool::Mempool::select_for_block`].
     fn collect_mempool_candidates(&self) -> Vec<Transaction> {
-        // 1. Sendors uniques présents dans le mempool.
         let senders: Vec<NativeAddress> = self.handle.with_mempool(|pool| {
             let mut s = HashSet::new();
             for h in pool.hashes() {
@@ -270,7 +297,6 @@ impl Driver {
             return Vec::new();
         }
 
-        // 2. Nonces courants dans l'état.
         let nonces: HashMap<NativeAddress, u64> = self.handle.with_node(|n| {
             senders
                 .iter()
@@ -278,7 +304,6 @@ impl Driver {
                 .collect()
         });
 
-        // 3. Sélection ordonnée.
         let entries = self
             .handle
             .with_mempool(|pool| pool.select_for_block(MAX_TXS_PER_BLOCK, &nonces));
@@ -287,11 +312,7 @@ impl Driver {
     }
 
     /// Purge le mempool après l'application d'un bloc.
-    ///
-    /// - retire les transactions dont le nonce est déjà appliqué ;
-    /// - retire celles dont `max_fee < new_base_fee`.
     fn prune_mempool(&self) {
-        // 1. Sendors uniques encore dans le mempool.
         let senders: Vec<NativeAddress> = self.handle.with_mempool(|pool| {
             let mut s = HashSet::new();
             for h in pool.hashes() {
@@ -302,7 +323,6 @@ impl Driver {
             s.into_iter().collect()
         });
 
-        // 2. Nonces courants + nouvelle base fee (state read lock).
         let (nonces, new_base_fee) = self.handle.with_node(|n| {
             let nonces: HashMap<NativeAddress, u64> = senders
                 .iter()
@@ -312,7 +332,6 @@ impl Driver {
             (nonces, bf)
         });
 
-        // 3. Prune + evict (mempool lock).
         self.handle.with_mempool(|pool| {
             let _ = pool.prune_below_nonces(&nonces);
             let _ = pool.evict_below_base_fee(new_base_fee);
@@ -348,9 +367,7 @@ impl Driver {
                             .map(|p| p.block.clone())
                             .ok_or(DriverError::MissingBlockForCommit)?;
 
-                        // Extraire les participants depuis le certificat
-                        // (précommits). Déterministe : tous les nœuds
-                        // voient le même certificat.
+                        // Participants = precommitters (pour le downtime).
                         let participants: Vec<NativeAddress> = certificate
                             .precommits
                             .iter()
@@ -383,6 +400,75 @@ impl Driver {
     }
 }
 
+impl std::fmt::Debug for Driver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Driver")
+            .field("height", &self.current_height())
+            .field("round", &self.current_round())
+            .field("step", &self.current_step())
+            .field("local", &self.local_address())
+            .field("pending_evidences", &self.pending_evidences.len())
+            .finish_non_exhaustive()
+    }
+}
+
+// --- Construction d'evidence (fonctions libres) ----------------------------
+
+/// Construit une `Evidence` de double-prevote à partir de deux votes
+/// contradictoires signés.
+///
+/// Chaque message contient son `canonical_payload` (l'encodage hors
+/// signature) et sa signature Ed25519. L'`Evidence` produite est
+/// **pleinement vérifiable** : un tiers peut décoder les payloads,
+/// vérifier les signatures, et constater que les deux `block_hash`
+/// diffèrent.
+#[must_use]
+fn build_double_prevote_evidence(first: &Prevote, second: &Prevote) -> Evidence {
+    Evidence {
+        version: sango_types::PROTOCOL_VERSION_V1,
+        evidence_type: EvidenceType::DoublePrevote,
+        chain_id: first.chain_id,
+        epoch: first.epoch,
+        height: first.height,
+        round: first.round,
+        validator_address: first.validator_address,
+        message_1: ConsensusMessage {
+            message_type: ConsensusMessageType::Prevote,
+            canonical_payload: first.encode_unsigned_to_vec(),
+            signature: first.validator_signature,
+        },
+        message_2: ConsensusMessage {
+            message_type: ConsensusMessageType::Prevote,
+            canonical_payload: second.encode_unsigned_to_vec(),
+            signature: second.validator_signature,
+        },
+    }
+}
+
+/// Idem pour un double-precommit.
+#[must_use]
+fn build_double_precommit_evidence(first: &Precommit, second: &Precommit) -> Evidence {
+    Evidence {
+        version: sango_types::PROTOCOL_VERSION_V1,
+        evidence_type: EvidenceType::DoublePrecommit,
+        chain_id: first.chain_id,
+        epoch: first.epoch,
+        height: first.height,
+        round: first.round,
+        validator_address: first.validator_address,
+        message_1: ConsensusMessage {
+            message_type: ConsensusMessageType::Precommit,
+            canonical_payload: first.encode_unsigned_to_vec(),
+            signature: first.validator_signature,
+        },
+        message_2: ConsensusMessage {
+            message_type: ConsensusMessageType::Precommit,
+            canonical_payload: second.encode_unsigned_to_vec(),
+            signature: second.validator_signature,
+        },
+    }
+}
+
 fn is_stale(e: &ConsensusError) -> bool {
     matches!(
         e,
@@ -391,15 +477,4 @@ fn is_stale(e: &ConsensusError) -> bool {
             | ConsensusError::EpochMismatch { .. }
             | ConsensusError::ChainIdMismatch { .. }
     )
-}
-
-impl std::fmt::Debug for Driver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Driver")
-            .field("height", &self.current_height())
-            .field("round", &self.current_round())
-            .field("step", &self.current_step())
-            .field("local", &self.local_address())
-            .finish_non_exhaustive()
-    }
 }

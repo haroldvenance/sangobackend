@@ -55,6 +55,7 @@ fn empty_block(height: u64, round: u64) -> Block {
             gas_limit: 30_000_000,
             base_fee: 1,
         },
+        evidences: Vec::new(),
         transactions: Vec::new(),
     }
 }

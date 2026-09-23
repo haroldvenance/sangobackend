@@ -187,6 +187,7 @@ impl Node {
     /// Le `Vec<ValidatedTransaction>` retourné correspond 1:1 aux txs du
     /// bloc, dans le même ordre.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_block_from_candidates(
         &self,
         epoch: Epoch,
@@ -195,6 +196,7 @@ impl Node {
         max_txs: usize,
         proposer: NativeAddress,
         timestamp: u64,
+        evidences: Vec<sango_types::Evidence>,
     ) -> (Block, Vec<ValidatedTransaction>) {
         use sango_exec::{apply_tx_no_rollback, gas_for, ExecutionContext, NATIVE_TRANSFER_GAS};
 
@@ -258,6 +260,7 @@ impl Node {
                 gas_limit: 30_000_000,
                 base_fee,
             },
+            evidences,
             transactions: accepted,
         };
         (block, validated)

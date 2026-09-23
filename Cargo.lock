@@ -542,6 +542,7 @@ version = "0.1.0"
 name = "sango-exec"
 version = "0.1.0"
 dependencies = [
+ "sango-codec",
  "sango-crypto",
  "sango-primitives",
  "sango-state",

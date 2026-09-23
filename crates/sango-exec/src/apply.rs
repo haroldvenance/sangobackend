@@ -280,6 +280,17 @@ pub fn apply_block(
 
     let snapshot = state.clone();
 
+    // 0a. Appliquer les evidences AVANT les transactions.
+    //
+    // Chaque evidence est un slashing déterministe. Comme elles font
+    // partie du `Block`, tous les nœuds observent les mêmes.
+    for evidence in &block.evidences {
+        if let Err(e) = crate::slashing::apply_evidence(state, evidence, ctx) {
+            *state = snapshot;
+            return Err(e);
+        }
+    }
+
     // 0. Suivi de la participation (downtime).
     //
     // Déterministe : tous les nœuds voient le même CommitCertificate (donc
@@ -882,6 +893,7 @@ mod tests {
         let mut state = NativeState::new();
         let block = Block {
             header: sample_header(),
+            evidences: Vec::new(),
             transactions: Vec::new(),
         };
         let r = apply_block(&mut state, &block, &[], &exec_ctx(), &[]).unwrap();
@@ -917,6 +929,7 @@ mod tests {
 
         let block = Block {
             header: sample_header(),
+            evidences: Vec::new(),
             transactions: vec![tx1.clone(), tx2.clone()],
         };
         let r = apply_block(&mut state, &block, &[v1, v2], &exec_ctx(), &[]).unwrap();
@@ -954,6 +967,7 @@ mod tests {
         let v = validate(&state, &tx).unwrap();
         let block = Block {
             header: sample_header(),
+            evidences: Vec::new(),
             transactions: vec![tx],
         };
         let initial = exec_ctx().initial_supply;
@@ -996,6 +1010,7 @@ mod tests {
 
         let block = Block {
             header: sample_header(),
+            evidences: Vec::new(),
             transactions: vec![tx1, tx2],
         };
         let err = apply_block(&mut state, &block, &[v1, v2], &exec_ctx(), &[]).unwrap_err();
@@ -1010,6 +1025,7 @@ mod tests {
         let mut state = NativeState::new();
         let block = Block {
             header: sample_header(),
+            evidences: Vec::new(),
             transactions: Vec::new(),
         };
         let kp = NativeKeypair::from_seed([0x42; 32]);
@@ -1047,6 +1063,7 @@ mod tests {
         let v = validate(&state, &tx).unwrap();
         let block = Block {
             header: sample_header(),
+            evidences: Vec::new(),
             transactions: vec![tx],
         };
         let r = apply_block(&mut state, &block, &[v], &exec_ctx(), &[]).unwrap();
@@ -1086,6 +1103,7 @@ mod tests {
         h.height = sango_primitives::Height::new(1);
         let block = Block {
             header: h,
+            evidences: Vec::new(),
             transactions: Vec::new(),
         };
 
@@ -1123,6 +1141,7 @@ mod tests {
         h.height = sango_primitives::Height::new(1);
         let block = Block {
             header: h,
+            evidences: Vec::new(),
             transactions: Vec::new(),
         };
         apply_block(&mut state, &block, &[], &exec_ctx(), &[]).unwrap();

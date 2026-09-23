@@ -86,6 +86,7 @@ fn apply_first_block_ok() {
 
     let block = Block {
         header: header(0, Hash32::ZERO, INITIAL_BASE_FEE),
+        evidences: Vec::new(),
         transactions: Vec::new(),
     };
     let r = node.apply_block(&block, &[]).unwrap();
@@ -105,6 +106,7 @@ fn first_block_wrong_parent_rejected() {
 
     let block = Block {
         header: header(0, Hash32::from_bytes([0xee; 32]), INITIAL_BASE_FEE),
+        evidences: Vec::new(),
         transactions: Vec::new(),
     };
     let err = node.apply_block(&block, &[]).unwrap_err();
@@ -121,6 +123,7 @@ fn first_block_wrong_height_rejected() {
 
     let block = Block {
         header: header(5, Hash32::ZERO, INITIAL_BASE_FEE),
+        evidences: Vec::new(),
         transactions: Vec::new(),
     };
     let err = node.apply_block(&block, &[]).unwrap_err();
@@ -134,6 +137,7 @@ fn first_block_wrong_base_fee_rejected() {
 
     let block = Block {
         header: header(0, Hash32::ZERO, 42),
+        evidences: Vec::new(),
         transactions: Vec::new(),
     };
     let err = node.apply_block(&block, &[]).unwrap_err();
@@ -149,6 +153,7 @@ fn apply_two_empty_blocks() {
 
     let b1 = Block {
         header: header(0, Hash32::ZERO, INITIAL_BASE_FEE),
+        evidences: Vec::new(),
         transactions: Vec::new(),
     };
     let h1 = b1.hash();
@@ -159,6 +164,7 @@ fn apply_two_empty_blocks() {
     let expected_bf = node.expected_base_fee().unwrap();
     let b2 = Block {
         header: header(1, h1, expected_bf),
+        evidences: Vec::new(),
         transactions: Vec::new(),
     };
     node.apply_block(&b2, &[]).unwrap();
@@ -175,12 +181,14 @@ fn second_block_wrong_parent_rejected() {
 
     let b1 = Block {
         header: header(0, Hash32::ZERO, INITIAL_BASE_FEE),
+        evidences: Vec::new(),
         transactions: Vec::new(),
     };
     node.apply_block(&b1, &[]).unwrap();
 
     let b2 = Block {
         header: header(1, Hash32::from_bytes([0xaa; 32]), INITIAL_BASE_FEE),
+        evidences: Vec::new(),
         transactions: Vec::new(),
     };
     let err = node.apply_block(&b2, &[]).unwrap_err();
@@ -201,6 +209,7 @@ fn chain_id_mismatch_rejected() {
     h.chain_id = ChainId32::from_bytes([0x99; 32]);
     let block = Block {
         header: h,
+        evidences: Vec::new(),
         transactions: Vec::new(),
     };
     let err = node.apply_block(&block, &[]).unwrap_err();
@@ -219,6 +228,7 @@ fn reject_unknown_sender_transaction() {
 
     let block = Block {
         header: header(0, Hash32::ZERO, INITIAL_BASE_FEE),
+        evidences: Vec::new(),
         transactions: vec![tx],
     };
 
@@ -241,6 +251,7 @@ fn reopen_preserves_tip() {
         let mut node = Node::open(dir.path(), chain(), initial_supply()).unwrap();
         let block = Block {
             header: header(0, Hash32::ZERO, INITIAL_BASE_FEE),
+            evidences: Vec::new(),
             transactions: Vec::new(),
         };
         let h = block.hash();
@@ -262,6 +273,7 @@ fn state_root_is_stable_across_reopen() {
         let mut node = Node::open(dir.path(), chain(), initial_supply()).unwrap();
         let block = Block {
             header: header(0, Hash32::ZERO, INITIAL_BASE_FEE),
+            evidences: Vec::new(),
             transactions: Vec::new(),
         };
         node.apply_block(&block, &[]).unwrap();

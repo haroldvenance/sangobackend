@@ -3,6 +3,7 @@
 use sango_codec::{CodecError, Decode, Decoder, Encode, Encoder};
 use sango_primitives::Hash32;
 
+use crate::evidence::Evidence;
 use crate::header::BlockHeader;
 use crate::transaction::Transaction;
 
@@ -21,6 +22,11 @@ use crate::transaction::Transaction;
 pub struct Block {
     /// En-tête du bloc.
     pub header: BlockHeader,
+    /// Evidences (double-sign) à appliquer avant les transactions.
+    ///
+    /// Chaque evidence déclenche un slashing déterministe. L'ordre est
+    /// canonique et fait partie du consensus.
+    pub evidences: Vec<Evidence>,
     /// Transactions du bloc, dans leur ordre canonique.
     pub transactions: Vec<Transaction>,
 }
@@ -42,6 +48,7 @@ impl Block {
 impl Encode for Block {
     fn encode(&self, enc: &mut Encoder) {
         self.header.encode(enc);
+        self.evidences.encode(enc);
         self.transactions.encode(enc);
     }
 }
@@ -50,6 +57,7 @@ impl Decode for Block {
     fn decode(dec: &mut Decoder<'_>) -> Result<Self, CodecError> {
         Ok(Self {
             header: BlockHeader::decode(dec)?,
+            evidences: Vec::<Evidence>::decode(dec)?,
             transactions: Vec::<Transaction>::decode(dec)?,
         })
     }
@@ -102,6 +110,7 @@ mod tests {
     fn empty_block_roundtrip() {
         let b = Block {
             header: header(),
+            evidences: Vec::new(),
             transactions: Vec::new(),
         };
         let bytes = b.encode_to_vec();
@@ -113,6 +122,7 @@ mod tests {
     fn block_with_transactions_roundtrip() {
         let b = Block {
             header: header(),
+            evidences: Vec::new(),
             transactions: vec![tx(0), tx(1), tx(2)],
         };
         let bytes = b.encode_to_vec();
@@ -124,6 +134,7 @@ mod tests {
     fn block_hash_equals_header_hash() {
         let b = Block {
             header: header(),
+            evidences: Vec::new(),
             transactions: vec![tx(0)],
         };
         assert_eq!(b.hash(), b.header.hash());
@@ -133,18 +144,54 @@ mod tests {
     fn tx_count() {
         let b = Block {
             header: header(),
+            evidences: Vec::new(),
             transactions: vec![tx(0), tx(1)],
         };
         assert_eq!(b.tx_count(), 2);
     }
 
     #[test]
+    fn block_with_evidence_roundtrip() {
+        use crate::evidence::{ConsensusMessage, ConsensusMessageType, EvidenceType};
+        use sango_primitives::{Epoch, Signature};
+
+        let ev = crate::evidence::Evidence {
+            version: 1,
+            evidence_type: EvidenceType::DoublePrevote,
+            chain_id: ChainId32::from_bytes([0x11; 32]),
+            epoch: Epoch::new(0),
+            height: Height::new(1),
+            round: Round::new(0),
+            validator_address: NativeAddress::from_bytes([0xaa; 20]),
+            message_1: ConsensusMessage {
+                message_type: ConsensusMessageType::Prevote,
+                canonical_payload: vec![1, 2, 3],
+                signature: Signature::ZERO,
+            },
+            message_2: ConsensusMessage {
+                message_type: ConsensusMessageType::Prevote,
+                canonical_payload: vec![4, 5, 6],
+                signature: Signature::ZERO,
+            },
+        };
+        let b = Block {
+            header: header(),
+            evidences: vec![ev],
+            transactions: Vec::new(),
+        };
+        let bytes = b.encode_to_vec();
+        let decoded = Block::decode_exact(&bytes).unwrap();
+        assert_eq!(decoded, b);
+    }
+
+    #[test]
     fn encoding_length_is_header_plus_txs() {
         let b = Block {
             header: header(),
+            evidences: Vec::new(),
             transactions: Vec::new(),
         };
-        // header = 248 bytes, tx count = 4 bytes (u32 LE) → 252
-        assert_eq!(b.encode_to_vec().len(), 252);
+        // header = 248 + evidences count (4) + tx count (4) = 256
+        assert_eq!(b.encode_to_vec().len(), 256);
     }
 }

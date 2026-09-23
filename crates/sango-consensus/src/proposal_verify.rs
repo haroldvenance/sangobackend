@@ -347,6 +347,7 @@ mod tests {
 
         let block = Block {
             header: h,
+            evidences: Vec::new(),
             transactions: Vec::new(),
         };
         let block_hash = block.hash();
@@ -548,6 +549,7 @@ mod tests {
         h.proposer_address = proposer_addr;
         let block = Block {
             header: h,
+            evidences: Vec::new(),
             transactions: Vec::new(),
         };
         let block_hash = block.hash();
@@ -628,6 +630,7 @@ mod tests {
         h.proposer_address = proposer_addr;
         let block = Block {
             header: h,
+            evidences: Vec::new(),
             transactions: Vec::new(),
         };
         let block_hash = block.hash();

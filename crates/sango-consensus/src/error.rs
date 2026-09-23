@@ -79,25 +79,28 @@ pub enum ConsensusError {
 
     // --- Votes ---------------------------------------------------------------
     /// Un validateur a émis deux prevotes contradictoires.
-    #[error("double prevote from {address}: first {first:?}, second {second:?}")]
+    ///
+    /// Les deux messages **complets** sont fournis, ce qui permet à
+    /// l'appelant de construire une `Evidence` pleinement vérifiable.
+    #[error("double prevote from {address}")]
     DoublePrevote {
         /// Validateur fautif.
         address: NativeAddress,
-        /// Premier `block_hash` (None = NIL).
-        first: Option<Hash32>,
-        /// Second `block_hash` (None = NIL).
-        second: Option<Hash32>,
+        /// Premier message (boxed pour limiter la taille du variant).
+        first: Box<sango_types::Prevote>,
+        /// Second message, contradictoire.
+        second: Box<sango_types::Prevote>,
     },
 
     /// Un validateur a émis deux precommits contradictoires.
-    #[error("double precommit from {address}: first {first:?}, second {second:?}")]
+    #[error("double precommit from {address}")]
     DoublePrecommit {
         /// Validateur fautif.
         address: NativeAddress,
-        /// Premier `block_hash` (None = NIL).
-        first: Option<Hash32>,
-        /// Second `block_hash` (None = NIL).
-        second: Option<Hash32>,
+        /// Premier message.
+        first: Box<sango_types::Precommit>,
+        /// Second message, contradictoire.
+        second: Box<sango_types::Precommit>,
     },
 
     // --- Proposer -----------------------------------------------------------

@@ -103,8 +103,8 @@ impl VoteTracker {
             }
             return Err(ConsensusError::DoublePrevote {
                 address: prevote.validator_address,
-                first: previous.block_hash,
-                second: prevote.block_hash,
+                first: Box::new(*previous),
+                second: Box::new(prevote),
             });
         }
 
@@ -185,8 +185,8 @@ impl VoteTracker {
             }
             return Err(ConsensusError::DoublePrecommit {
                 address: precommit.validator_address,
-                first: previous.block_hash,
-                second: precommit.block_hash,
+                first: Box::new(*previous),
+                second: Box::new(precommit),
             });
         }
 
