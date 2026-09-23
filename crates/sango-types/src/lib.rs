@@ -9,6 +9,7 @@ mod chain_tip;
 mod consensus;
 mod error;
 mod evidence;
+mod evidence_record;
 mod genesis;
 mod header;
 mod receipt;
@@ -24,6 +25,7 @@ pub use consensus::{
 };
 pub use error::TypeError;
 pub use evidence::{ConsensusMessage, ConsensusMessageType, Evidence, EvidenceType};
+pub use evidence_record::EvidenceRecord;
 pub use genesis::{
     Allocation, ConsensusConfig, EvmConfig, EvmVersion, FeeConfig, Genesis, GenesisValidator,
     LockSchedule,

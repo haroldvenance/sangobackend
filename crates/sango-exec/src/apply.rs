@@ -56,6 +56,9 @@ pub struct ExecutionContext {
     /// Timestamp Unix courant (secondes), utilisé pour les unbondings et
     /// les délais de commission.
     pub current_time: u64,
+    /// Hauteur du bloc en cours d'application. Utilisée pour les preuves
+    /// (`EvidenceRecord.applied_at_height`) et la distribution des rewards.
+    pub current_height: u64,
 }
 
 /// Détail de l'application d'une transaction.
@@ -585,6 +588,7 @@ mod tests {
             fee_recipient: validator(),
             initial_supply: Amount::from_sango(1_000_000_000).unwrap(),
             current_time: 1_700_000_000,
+            current_height: 0,
         }
     }
 

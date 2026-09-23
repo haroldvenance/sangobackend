@@ -424,6 +424,70 @@ impl NativeState {
         let key = Self::delegation_identifier(delegator, validator);
         self.remove_entry(Namespace::Delegation, &key)
     }
+
+    // --- Énumération (filtrage cryptographique) -----------------------------
+
+    /// Liste tous les validateurs enregistrés.
+    ///
+    /// Pour chaque entrée du SMT, on tente de décoder un `ValidatorInfo`,
+    /// puis on vérifie que `state_key_hash(Validator, info.address)`
+    /// correspond bien au `key_hash` de l'entrée. C'est une vérification
+    /// **cryptographique** : aucune ambiguïté possible avec un compte ou
+    /// une délégation.
+    #[must_use]
+    pub fn all_validators(&self) -> Vec<sango_types::ValidatorInfo> {
+        let mut out = Vec::new();
+        for (key_hash, value) in self.smt.iter() {
+            if let Ok(info) = sango_types::ValidatorInfo::decode_exact(value) {
+                let expected = state_key_hash(Namespace::Validator, info.address.as_bytes());
+                if expected == *key_hash {
+                    out.push(info);
+                }
+            }
+        }
+        out
+    }
+
+    /// Liste toutes les délégations vers un validateur donné.
+    #[must_use]
+    pub fn delegations_for(&self, validator: &NativeAddress) -> Vec<sango_types::Delegation> {
+        let mut out = Vec::new();
+        for (key_hash, value) in self.smt.iter() {
+            if let Ok(d) = sango_types::Delegation::decode_exact(value) {
+                if d.validator != *validator {
+                    continue;
+                }
+                let key = Self::delegation_identifier(&d.delegator, &d.validator);
+                let expected = state_key_hash(Namespace::Delegation, &key);
+                if expected == *key_hash {
+                    out.push(d);
+                }
+            }
+        }
+        out
+    }
+
+    // --- Evidence ----------------------------------------------------------
+
+    /// Lit un enregistrement d'evidence déjà appliquée.
+    #[must_use]
+    pub fn get_evidence(&self, evidence_id: &Hash32) -> Option<sango_types::EvidenceRecord> {
+        let bytes = self.get_entry(Namespace::Evidence, evidence_id.as_bytes())?;
+        sango_types::EvidenceRecord::decode_exact(bytes).ok()
+    }
+
+    /// Enregistre une evidence comme appliquée.
+    pub fn set_evidence(&mut self, record: sango_types::EvidenceRecord) {
+        let key = record.evidence_id;
+        let bytes = record.encode_to_vec();
+        self.put_entry(Namespace::Evidence, key.as_bytes(), bytes);
+    }
+
+    /// Vrai si une evidence a déjà été appliquée.
+    #[must_use]
+    pub fn has_evidence(&self, evidence_id: &Hash32) -> bool {
+        self.get_evidence(evidence_id).is_some()
+    }
 }
 
 #[cfg(test)]
@@ -993,5 +1057,66 @@ mod tests {
         });
 
         assert_eq!(s.get_account(&addr(0xaa)), account_before);
+    }
+
+    // --- Énumération / evidence ---------------------------------------------
+
+    #[test]
+    fn all_validators_returns_only_validators() {
+        use sango_types::ValidatorInfo;
+        let mut s = NativeState::new();
+        // Un compte normal (ne doit PAS apparaître).
+        s.credit(addr(0xaa), Amount::from_base_units(100)).unwrap();
+        // Un validateur.
+        s.set_validator(ValidatorInfo {
+            address: addr(0xbb),
+            public_key: PublicKey::from_bytes([0x01; 32]),
+            self_stake: Amount::from_sango(100_000).unwrap(),
+            total_delegated: Amount::ZERO,
+            commission_bps: 700,
+            pending_commission_bps: None,
+            pending_commission_at: None,
+            jailed: false,
+            jailed_until: None,
+        });
+        let vs = s.all_validators();
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].address, addr(0xbb));
+    }
+
+    #[test]
+    fn delegations_for_filters_by_validator() {
+        use sango_types::Delegation;
+        let mut s = NativeState::new();
+        s.set_delegation(Delegation::empty(addr(0x01), addr(0xaa)));
+        s.set_delegation(Delegation::empty(addr(0x02), addr(0xaa)));
+        s.set_delegation(Delegation::empty(addr(0x01), addr(0xbb)));
+        let d_aa = s.delegations_for(&addr(0xaa));
+        assert_eq!(d_aa.len(), 2);
+        let d_bb = s.delegations_for(&addr(0xbb));
+        assert_eq!(d_bb.len(), 1);
+    }
+
+    #[test]
+    fn evidence_absent_returns_none() {
+        let s = NativeState::new();
+        let id = Hash32::from_bytes([0xab; 32]);
+        assert!(s.get_evidence(&id).is_none());
+        assert!(!s.has_evidence(&id));
+    }
+
+    #[test]
+    fn evidence_roundtrip() {
+        use sango_types::EvidenceRecord;
+        let mut s = NativeState::new();
+        let record = EvidenceRecord {
+            evidence_id: Hash32::from_bytes([0xab; 32]),
+            validator_address: addr(0xaa),
+            applied_at_height: 42,
+            slashed: Amount::from_base_units(12345),
+        };
+        s.set_evidence(record);
+        assert!(s.has_evidence(&record.evidence_id));
+        assert_eq!(s.get_evidence(&record.evidence_id), Some(record));
     }
 }

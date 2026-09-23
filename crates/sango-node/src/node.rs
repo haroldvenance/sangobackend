@@ -214,6 +214,7 @@ impl Node {
                 fee_recipient: proposer,
                 initial_supply: self.initial_supply,
                 current_time: timestamp,
+                current_height: height,
             };
             if apply_tx_no_rollback(&mut trial, &tx, &v, gas_used, &exec_ctx).is_err() {
                 break;
@@ -360,6 +361,7 @@ impl Node {
             fee_recipient: block.header.proposer_address,
             initial_supply: self.initial_supply,
             current_time: block.header.timestamp,
+            current_height: block.header.height.get(),
         };
         let result = exec_apply_block(&mut self.state, block, &validated, &ctx)?;
 

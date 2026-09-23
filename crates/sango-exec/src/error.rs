@@ -152,4 +152,17 @@ pub enum ApplyError {
     /// Données de commission invalides (longueur incorrecte).
     #[error("invalid commission data")]
     InvalidCommissionData,
+
+    // --- Evidence / slashing ------------------------------------------------
+    /// Evidence déjà appliquée.
+    #[error("evidence already applied: {0}")]
+    EvidenceAlreadyApplied(sango_primitives::Hash32),
+
+    /// Evidence invalide (validation structurelle).
+    #[error("invalid evidence: {0}")]
+    InvalidEvidence(&'static str),
+
+    /// Validateur en jail mais pas encore expiré.
+    #[error("validator already jailed")]
+    AlreadyJailed(NativeAddress),
 }
