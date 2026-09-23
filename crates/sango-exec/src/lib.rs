@@ -5,6 +5,7 @@
 
 mod apply;
 mod error;
+pub mod rewards;
 pub mod slashing;
 pub mod staking;
 
@@ -14,5 +15,9 @@ pub use apply::{
     ExecutionContext, NATIVE_TRANSFER_GAS,
 };
 pub use error::ApplyError;
+pub use rewards::{
+    block_reward, distribute_block_rewards, max_pos_rewards, RewardDistribution, BLOCKS_PER_YEAR,
+    REWARD_YEARS,
+};
 pub use slashing::{apply_evidence, EvidenceApplied, DOUBLE_SIGN_JAIL_SECS};
 pub use staking::{apply_staking_no_rollback, gas_for};

@@ -12,6 +12,8 @@ pub enum MetadataKey {
     ///
     /// Encodage : `u64 (height) || Hash32 (block_hash) || u128 (base_fee)`.
     ChainTip = 0x03,
+    /// Cumul des récompenses PoS distribuées (base units, `u128` LE).
+    TotalPosRewards = 0x04,
 }
 
 impl MetadataKey {
@@ -32,6 +34,7 @@ mod tests {
             MetadataKey::TotalBurned,
             MetadataKey::TotalGasUsed,
             MetadataKey::ChainTip,
+            MetadataKey::TotalPosRewards,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate().skip(i + 1) {
@@ -45,5 +48,6 @@ mod tests {
         assert_eq!(MetadataKey::TotalBurned.tag(), 0x01);
         assert_eq!(MetadataKey::TotalGasUsed.tag(), 0x02);
         assert_eq!(MetadataKey::ChainTip.tag(), 0x03);
+        assert_eq!(MetadataKey::TotalPosRewards.tag(), 0x04);
     }
 }

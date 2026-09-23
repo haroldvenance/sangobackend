@@ -59,6 +59,11 @@ pub struct ExecutionContext {
     /// Hauteur du bloc en cours d'application. Utilisée pour les preuves
     /// (`EvidenceRecord.applied_at_height`) et la distribution des rewards.
     pub current_height: u64,
+    /// Active la distribution des récompenses PoS à la fin du bloc.
+    ///
+    /// `false` par défaut pour les tests unitaires et les premiers blocs
+    /// d'un réseau (avant que le pool ne soit activé par le Genesis).
+    pub rewards_enabled: bool,
 }
 
 /// Détail de l'application d'une transaction.
@@ -130,6 +135,9 @@ pub struct BlockExecutionResult {
     /// Racine des receipts dans le bloc. **Placeholder** (`Hash32::ZERO`)
     /// tant que le MPT EVM n'est pas implémenté.
     pub receipt_root: Hash32,
+    /// Récompense PoS distribuée au proposant pour ce bloc (`None` si
+    /// désactivé ou pool épuisé).
+    pub pos_rewards: Option<crate::rewards::RewardDistribution>,
 }
 
 // --- API mono-transaction --------------------------------------------------
@@ -313,6 +321,16 @@ pub fn apply_block(
         return Err(ApplyError::State(e));
     }
 
+    // 2bis. Distribuer les récompenses PoS au proposeur.
+    let pos_rewards = match crate::rewards::distribute_block_rewards(state, ctx.fee_recipient, ctx)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            *state = snapshot;
+            return Err(e);
+        }
+    };
+
     // 3. Générer les receipts (cumulative_gas_used par ordre).
     let mut receipts = Vec::with_capacity(applied.len());
     let mut cumulative: u64 = 0;
@@ -359,6 +377,7 @@ pub fn apply_block(
         native_state_root: state.native_state_root(),
         // TODO(MPT): à remplacer par le vrai MPT des receipts.
         receipt_root: Hash32::ZERO,
+        pos_rewards,
     })
 }
 
@@ -589,6 +608,7 @@ mod tests {
             initial_supply: Amount::from_sango(1_000_000_000).unwrap(),
             current_time: 1_700_000_000,
             current_height: 0,
+            rewards_enabled: false,
         }
     }
 

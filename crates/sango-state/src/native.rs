@@ -338,6 +338,38 @@ impl NativeState {
         Ok(())
     }
 
+    /// Cumul des récompenses PoS distribuées depuis le genesis.
+    #[must_use]
+    pub fn total_pos_rewards(&self) -> Amount {
+        match self.get_entry(Namespace::Metadata, &[MetadataKey::TotalPosRewards.tag()]) {
+            Some(bytes) => u128::decode_exact(bytes)
+                .map(Amount::from_base_units)
+                .unwrap_or(Amount::ZERO),
+            None => Amount::ZERO,
+        }
+    }
+
+    /// Ajoute un montant au cumul des récompenses PoS.
+    ///
+    /// # Erreurs
+    ///
+    /// Retourne [`StateError::TotalBurnedOverflow`] si le cumul dépasserait
+    /// `u128::MAX` (cas pathologique).
+    pub fn add_pos_rewards(&mut self, amount: Amount) -> Result<(), StateError> {
+        let current = self.total_pos_rewards().base_units();
+        let delta = amount.base_units();
+        let new = current
+            .checked_add(delta)
+            .ok_or(StateError::TotalBurnedOverflow { current, delta })?;
+        let bytes = Amount::from_base_units(new).encode_to_vec();
+        self.put_entry(
+            Namespace::Metadata,
+            &[MetadataKey::TotalPosRewards.tag()],
+            bytes,
+        );
+        Ok(())
+    }
+
     /// Calcule l'offre existante :
     ///
     /// ```text

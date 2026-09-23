@@ -21,6 +21,7 @@ pub struct Node {
     chain_id: ChainId32,
     initial_supply: Amount,
     tip: Option<ChainTip>,
+    rewards_enabled: bool,
 }
 
 impl Node {
@@ -63,7 +64,22 @@ impl Node {
             chain_id,
             initial_supply,
             tip,
+            rewards_enabled: false,
         })
+    }
+
+    /// Ouvre un nœud avec distribution PoS activée.
+    ///
+    /// Utilisé en production/testnet/mainnet après activation du pool
+    /// par le Genesis.
+    pub fn open_with_rewards(
+        path: impl AsRef<Path>,
+        chain_id: ChainId32,
+        initial_supply: Amount,
+    ) -> Result<Self, NodeError> {
+        let mut node = Self::open(path, chain_id, initial_supply)?;
+        node.rewards_enabled = true;
+        Ok(node)
     }
 
     /// Vue en lecture sur l'état.
@@ -215,6 +231,7 @@ impl Node {
                 initial_supply: self.initial_supply,
                 current_time: timestamp,
                 current_height: height,
+                rewards_enabled: self.rewards_enabled,
             };
             if apply_tx_no_rollback(&mut trial, &tx, &v, gas_used, &exec_ctx).is_err() {
                 break;
@@ -362,6 +379,7 @@ impl Node {
             initial_supply: self.initial_supply,
             current_time: block.header.timestamp,
             current_height: block.header.height.get(),
+            rewards_enabled: self.rewards_enabled,
         };
         let result = exec_apply_block(&mut self.state, block, &validated, &ctx)?;
 
