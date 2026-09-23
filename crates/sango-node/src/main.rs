@@ -146,16 +146,23 @@ fn run(args: &[String]) -> Result<(), String> {
         let svc = p2p_handle.service.clone();
 
         // Attendre un premier NewListenAddr pour l'afficher.
+        let local_peer = svc.local_peer_id();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut listen_addr: Option<Multiaddr> = None;
         loop {
             if let Some(P2pEvent::NewListenAddr(addr)) = svc.try_recv_event() {
-                println!("✓ P2P listening on {addr}");
+                listen_addr = Some(addr);
                 break;
             }
             if std::time::Instant::now() > deadline {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
+        }
+        println!("✓ P2P PeerId : {local_peer}");
+        if let Some(addr) = &listen_addr {
+            println!("✓ P2P listening on {addr}");
+            println!("  Full addr : {addr}/p2p/{local_peer}");
         }
 
         // Garder le runtime vivant.

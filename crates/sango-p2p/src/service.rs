@@ -17,20 +17,8 @@
 //!                                    │  └───────────────┘  │
 //!                                    └─────────────────────┘
 //! ```
-//!
-//! Le service tourne dans une tâche tokio dédiée. Le driver (synchrone)
-//! communique avec lui via deux canaux mpsc :
-//!
-//! - `P2pCommand` : driver → réseau (`broadcast_sync`, `dial`).
-//! - `P2pEvent` : réseau → driver (`try_recv_event`, ou `recv_event` async).
-//!
-//! ## Mode sync
-//!
-//! Le driver n'a pas besoin d'être async : `broadcast_sync` et
-//! `try_recv_event` sont non-bloquants et utilisables depuis un thread
-//! classique. `broadcast_sync` échoue si le canal interne est plein
-//! (1024 commandes).
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -51,6 +39,9 @@ use crate::topics;
 
 /// Capacité des canaux internes (commandes et événements).
 pub const CHANNEL_CAPACITY: usize = 1024;
+
+/// Intervalle de retry du dial bootstrap.
+const BOOTSTRAP_RETRY_SECS: u64 = 5;
 
 /// Événement produit par le service P2P.
 #[derive(Debug)]
@@ -84,19 +75,15 @@ pub enum P2pEvent {
 pub enum P2pCommand {
     /// Publier un message sur le topic approprié.
     ///
-    /// `Box` pour limiter la taille du variant : `NetworkMessage` peut
-    /// contenir un `Block` complet (jusqu'à 2 MiB).
+    /// `Box` pour limiter la taille du variant.
     Broadcast(Box<NetworkMessage>),
-    /// Se connecter à un peer (adresse + PeerId).
+    /// Se connecter à un peer.
     Dial(Multiaddr),
     /// Arrêter le service.
     Shutdown,
 }
 
 /// Handle clonable vers le service P2P.
-///
-/// Peut être utilisé depuis un thread synchrone (`broadcast_sync`,
-/// `try_recv_event`) ou un contexte async (`broadcast`, `dial`).
 #[derive(Clone)]
 pub struct P2pService {
     cmd_tx: mpsc::Sender<P2pCommand>,
@@ -112,8 +99,6 @@ impl P2pService {
     }
 
     /// Publie un message (variante async).
-    ///
-    /// Bloque si le canal interne est plein.
     pub async fn broadcast(&self, message: NetworkMessage) -> Result<(), P2pError> {
         self.cmd_tx
             .send(P2pCommand::Broadcast(Box::new(message)))
@@ -122,10 +107,6 @@ impl P2pService {
     }
 
     /// Publie un message (variante sync, non-bloquante).
-    ///
-    /// Utilisée par le driver. Retourne [`P2pError::ChannelFull`] si le
-    /// canal interne est plein, ou [`P2pError::ChannelClosed`] si le
-    /// service est arrêté.
     pub fn broadcast_sync(&self, message: NetworkMessage) -> Result<(), P2pError> {
         self.cmd_tx
             .try_send(P2pCommand::Broadcast(Box::new(message)))
@@ -154,8 +135,6 @@ impl P2pService {
     }
 
     /// Récupère un événement sans bloquer.
-    ///
-    /// Retourne `None` si la file est vide.
     pub fn try_recv_event(&self) -> Option<P2pEvent> {
         let mut rx = self.event_rx.lock().expect("event_rx mutex poisoned");
         rx.try_recv().ok()
@@ -169,7 +148,7 @@ impl P2pService {
             .map_err(|_| P2pError::ChannelClosed)
     }
 
-    /// Demande l'arrêt du service (sync, non-bloquant).
+    /// Demande l'arrêt du service (sync, non-bloquante).
     pub fn shutdown_sync(&self) -> Result<(), P2pError> {
         self.cmd_tx
             .try_send(P2pCommand::Shutdown)
@@ -197,21 +176,14 @@ pub struct P2pHandle {
 }
 
 /// Démarre le service P2P.
-///
-/// Crée le swarm, binde les adresses d'écoute, souscrit aux topics, et
-/// lance la boucle événementielle dans une tâche tokio.
-///
-/// # Erreurs
-///
-/// - [`P2pError::Transport`] si le swarm ne peut pas être créé.
-/// - [`P2pError::Subscription`] si la souscription gossipsub échoue.
 pub fn spawn(cfg: P2pConfig) -> Result<P2pHandle, P2pError> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<P2pCommand>(CHANNEL_CAPACITY);
     let (event_tx, event_rx) = mpsc::channel::<P2pEvent>(CHANNEL_CAPACITY);
 
-    let (swarm, local_peer_id) = build_swarm(&cfg)?;
+    let (swarm, local_peer_id, bootstrap_multiaddrs) = build_swarm(&cfg)?;
 
-    let task = tokio::spawn(async move { run_swarm(swarm, cmd_rx, event_tx).await });
+    let task =
+        tokio::spawn(async move { run_swarm(swarm, cmd_rx, event_tx, bootstrap_multiaddrs).await });
 
     Ok(P2pHandle {
         service: P2pService {
@@ -232,9 +204,9 @@ struct SangoBehaviour {
     ping: ping::Behaviour,
 }
 
-fn build_swarm(cfg: &P2pConfig) -> Result<(Swarm<SangoBehaviour>, PeerId), P2pError> {
-    // Identité P2P (Ed25519 par défaut libp2p). Distincte de l'identité
-    // validateur.
+fn build_swarm(
+    cfg: &P2pConfig,
+) -> Result<(Swarm<SangoBehaviour>, PeerId, Vec<Multiaddr>), P2pError> {
     let keypair = identity::Keypair::generate_ed25519();
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -290,14 +262,18 @@ fn build_swarm(cfg: &P2pConfig) -> Result<(Swarm<SangoBehaviour>, PeerId), P2pEr
             .map_err(|e| P2pError::Transport(format!("listen_on {addr}: {e}")))?;
     }
 
-    // Ajouter les peers bootstrap en explicit peers (permet gossipsub de
-    // les considérer même s'ils ne sont pas encore connectés).
-    for (_addr, peer_id) in &cfg.bootstrap_addrs {
+    // Enregistrer les peers bootstrap comme explicit peers et construire
+    // leurs multiaddrs complets (avec `/p2p/<PeerId>`).
+    let mut bootstrap_multiaddrs = Vec::with_capacity(cfg.bootstrap_addrs.len());
+    for (addr, peer_id) in &cfg.bootstrap_addrs {
         swarm.behaviour_mut().gossipsub.add_explicit_peer(peer_id);
+        let mut full = addr.clone();
+        full.push(libp2p::multiaddr::Protocol::P2p(*peer_id));
+        bootstrap_multiaddrs.push(full);
     }
 
     let local_peer_id = *swarm.local_peer_id();
-    Ok((swarm, local_peer_id))
+    Ok((swarm, local_peer_id, bootstrap_multiaddrs))
 }
 
 // --- Boucle événementielle --------------------------------------------------
@@ -306,7 +282,16 @@ async fn run_swarm(
     mut swarm: Swarm<SangoBehaviour>,
     mut cmd_rx: mpsc::Receiver<P2pCommand>,
     event_tx: mpsc::Sender<P2pEvent>,
+    bootstrap_multiaddrs: Vec<Multiaddr>,
 ) -> Result<(), P2pError> {
+    // Timer de retry pour les peers bootstrap.
+    // Le premier tick est immédiat (tokio::time::interval tick au démarrage).
+    let mut bootstrap_tick = tokio::time::interval(Duration::from_secs(BOOTSTRAP_RETRY_SECS));
+    bootstrap_tick.tick().await; // consommer le tick immédiat, on va dial dans le select.
+
+    // Suivi des peers connectés (pour ne pas dialer inutilement).
+    let mut connected_peers: HashSet<PeerId> = HashSet::new();
+
     loop {
         tokio::select! {
             // --- Commandes entrantes -----------------------------------------
@@ -337,9 +322,11 @@ async fn run_swarm(
                         let _ = event_tx.send(P2pEvent::NewListenAddr(address)).await;
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        connected_peers.insert(peer_id);
                         let _ = event_tx.send(P2pEvent::PeerConnected(peer_id)).await;
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        connected_peers.remove(&peer_id);
                         let _ = event_tx.send(P2pEvent::PeerDisconnected(peer_id)).await;
                     }
                     SwarmEvent::Behaviour(SangoBehaviourEvent::Mdns(
@@ -387,6 +374,23 @@ async fn run_swarm(
                         }).await;
                     }
                     _ => { /* ignorer les autres événements */ }
+                }
+            }
+
+            // --- Retry dial des peers bootstrap -----------------------------
+            _ = bootstrap_tick.tick() => {
+                for addr in &bootstrap_multiaddrs {
+                    // Extraire le peer_id pour skip si déjà connecté.
+                    let peer_id = match addr.iter().last() {
+                        Some(libp2p::multiaddr::Protocol::P2p(p)) => p,
+                        _ => continue,
+                    };
+                    if connected_peers.contains(&peer_id) {
+                        continue;
+                    }
+                    // Ignorer silencieusement les erreurs de dial : le peer
+                    // n'est peut-être pas encore prêt.
+                    let _ = swarm.dial(addr.clone());
                 }
             }
         }
