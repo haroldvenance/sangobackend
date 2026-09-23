@@ -315,7 +315,53 @@ impl Node {
         out
     }
 
-    /// Applique un bloc de bout en bout.
+    /// Initialise l'état à partir d'un Genesis (comptes + validateurs).
+    ///
+    /// Refuse si le nœud a déjà un tip (déjà initialisé).
+    /// Écrit dans RocksDB en un seul batch atomique.
+    pub fn initialize_genesis(
+        &mut self,
+        accounts: &[sango_types::NativeAccount],
+        validators: &[sango_types::ValidatorInfo],
+    ) -> Result<(), NodeError> {
+        if self.tip.is_some() {
+            return Err(NodeError::AlreadyInitialized);
+        }
+
+        // Appliquer sur une copie pour rester atomique.
+        let mut trial = self.state.clone();
+        for account in accounts {
+            trial.set_account(*account);
+        }
+        for v in validators {
+            trial.set_validator(*v);
+        }
+
+        // Diff → batch.
+        let diff = diff_state(&self.state, &trial);
+        let mut batch = Batch::new();
+        for (k, v) in &diff.inserts {
+            batch.put(Column::StateNative, k.as_bytes(), v.clone());
+        }
+        for (k, v) in &diff.updates {
+            batch.put(Column::StateNative, k.as_bytes(), v.clone());
+        }
+        for k in &diff.deletes {
+            batch.delete(Column::StateNative, k.as_bytes());
+        }
+
+        if let Err(e) = self.storage.write_batch(batch) {
+            return Err(NodeError::Storage(e));
+        }
+        if let Err(e) = self.storage.flush() {
+            return Err(NodeError::Storage(e));
+        }
+
+        self.state = trial;
+        Ok(())
+    }
+
+    /// Applique un bloc de bout en bout.    /// Applique un bloc de bout en bout.
     ///
     /// ## Vérifications
     ///

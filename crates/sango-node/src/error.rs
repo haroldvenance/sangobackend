@@ -73,4 +73,11 @@ pub enum NodeError {
         /// Base fee reçue.
         got: u128,
     },
+    /// Le nœud a déjà été initialisé (tip présent).
+    #[error("node already initialized")]
+    AlreadyInitialized,
+
+    /// Erreur de configuration / genesis.
+    #[error("config: {0}")]
+    Config(#[from] crate::config::ConfigError),
 }

@@ -1,0 +1,24 @@
+{
+  "_comment": "Devnet à un seul validateur. Les seeds sont PUBLIQUES — usage démo uniquement.",
+  "chain_id_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "initial_supply_sango": "1000000000",
+  "rewards_enabled": true,
+  "self_validator_seed_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+  "validators": [
+    {
+      "seed_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+      "voting_power_sango": "100000",
+      "commission_bps": 700
+    }
+  ],
+  "allocations": [
+    {
+      "address_hex": "1111111111111111111111111111111111111111",
+      "amount_sango": "500000000"
+    },
+    {
+      "address_hex": "2222222222222222222222222222222222222222",
+      "amount_sango": "500000000"
+    }
+  ]
+}

@@ -6,8 +6,19 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[lib]
+name = "sango_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sango-node"
+path = "src/main.rs"
+
 [dependencies]
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
 sango-primitives.workspace = true
 sango-codec.workspace = true
 sango-crypto.workspace = true
@@ -19,7 +30,7 @@ sango-exec.workspace = true
 sango-consensus.workspace = true
 sango-mempool.workspace = true
 sango-rpc.workspace = true
+sango-wallet.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-hex.workspace = true

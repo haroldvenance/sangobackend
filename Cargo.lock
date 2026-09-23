@@ -576,6 +576,9 @@ dependencies = [
  "sango-storage",
  "sango-tx",
  "sango-types",
+ "sango-wallet",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
