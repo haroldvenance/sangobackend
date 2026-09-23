@@ -101,11 +101,10 @@ impl RpcClient {
             .read_to_end(&mut response)
             .map_err(|e| WalletError::Rpc(format!("read response: {e}")))?;
 
-        // Trouver la fin des headers.
-        let split = find_header_end(&response)
+        // Trouver le début du corps.
+        let body_start = body_offset(&response)
             .ok_or_else(|| WalletError::Rpc("malformed response: no header end".into()))?;
-        let (headers, body_bytes) = response.split_at(split.0);
-        let body_start = split.1;
+        let headers = &response[..body_start];
 
         // Vérifier le statut.
         let header_str = String::from_utf8_lossy(headers);
@@ -115,16 +114,15 @@ impl RpcClient {
                 header_str.lines().next().unwrap_or("")
             )));
         }
-        Ok(body_bytes[body_start..].to_vec())
+        Ok(response[body_start..].to_vec())
     }
 }
 
-/// Retourne `(index_de_la_ligne_vide, index_du_corps)` dans une réponse HTTP.
-fn find_header_end(bytes: &[u8]) -> Option<(usize, usize)> {
-    // Cherche `\r\n\r\n`.
+/// Retourne l'index du premier byte du corps HTTP (après `\r\n\r\n`).
+fn body_offset(bytes: &[u8]) -> Option<usize> {
     for i in 0..bytes.len().saturating_sub(3) {
         if &bytes[i..i + 4] == b"\r\n\r\n" {
-            return Some((i + 2, i + 4));
+            return Some(i + 4);
         }
     }
     None
@@ -135,11 +133,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_header_end_basic() {
+    fn body_offset_basic() {
+        // Décompte :
+        //   "HTTP/1.1 200 OK"          15 bytes  (0..15)
+        //   "\r\n"                      2 bytes  (15..17)
+        //   "Content-Length: 4"        17 bytes  (17..34)
+        //   "\r\n"                      2 bytes  (34..36)
+        //   "\r\n"                      2 bytes  (36..38)
+        //   "body"                                (38..42)
         let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody";
-        let (h, b) = find_header_end(resp).unwrap();
-        assert_eq!(&resp[b..], b"body");
-        assert_eq!(h, 36);
+        let offset = body_offset(resp).unwrap();
+        assert_eq!(&resp[offset..], b"body");
+        assert_eq!(offset, 38);
+    }
+
+    #[test]
+    fn body_offset_missing() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n";
+        assert!(body_offset(resp).is_none());
     }
 
     #[test]
