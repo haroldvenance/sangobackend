@@ -7,3 +7,14 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+futures.workspace = true
+libp2p.workspace = true
+sango-primitives.workspace = true
+sango-codec.workspace = true
+sango-types.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+hex.workspace = true

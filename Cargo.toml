@@ -28,6 +28,16 @@ repository = "https://github.com/sango/sango"
 
 [workspace.dependencies]
 thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures = "0.3"
+libp2p = { version = "0.55", features = [
+    "tokio",
+    "quic",
+    "gossipsub",
+    "mdns",
+    "macros",
+    "ping",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
@@ -42,6 +52,7 @@ sango-tx = { path = "crates/sango-tx" }
 sango-state = { path = "crates/sango-state" }
 sango-exec = { path = "crates/sango-exec" }
 sango-node = { path = "crates/sango-node" }
+sango-p2p = { path = "crates/sango-p2p" }
 sango-consensus = { path = "crates/sango-consensus" }
 sango-mempool = { path = "crates/sango-mempool" }
 sango-rpc = { path = "crates/sango-rpc" }
