@@ -272,6 +272,7 @@ mod tests {
             current_time: now(),
             current_height: 1,
             rewards_enabled: false,
+            downtime_enabled: false,
         }
     }
 

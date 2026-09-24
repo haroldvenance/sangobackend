@@ -7,3 +7,17 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+thiserror.workspace = true
+rlp = "=0.5.2"
+sango-primitives.workspace = true
+sango-crypto.workspace = true
+sango-mpt = { path = "../sango-mpt" }
+sango-types = { path = "../sango-types" }
+
+# revm — fixé par Cargo.lock, pas de version flottante.
+alloy-primitives = "1"
+revm = { version = "42", default-features = false, features = ["std"] }
+alloy-eip2930 = "0.2"
+
+[dev-dependencies]
+hex = "0.4"

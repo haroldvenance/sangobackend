@@ -522,9 +522,14 @@ impl RoundRunner {
 
     /// Vérifie si un quorum precommit est atteint pour un bloc ; si oui,
     /// émet `Action::Committed`.
+    ///
+    /// **Idempotent** : une fois commité, un nouvel appel ne ré-émet rien.
+    /// Sans cette garde, un quorum re-observé (par exemple via un doublon
+    /// P2P) déclencherait un second `Committed` et le driver appliquerait
+    /// le bloc plusieurs fois — ce qui muterait l'état deux fois.
     fn check_precommit_quorum(&mut self) -> Result<(), ConsensusError> {
-        if self.committed || self.step == Step::Precommit {
-            // On peut être appelé depuis `Precommit` ou `Commit`.
+        if self.committed {
+            return Ok(());
         }
 
         // On cherche un `block_hash` non-NIL qui a le quorum.

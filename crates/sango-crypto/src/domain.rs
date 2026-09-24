@@ -33,6 +33,15 @@ pub const EVIDENCE_V1: &[u8] = b"SANGO/EVIDENCE/V1";
 /// Dérivation d’une adresse native.
 pub const ADDRESS_V1: &[u8] = b"SANGO/ADDRESS/V1";
 
+/// Dérivation de `prevrandao` EVM depuis le hash du bloc parent.
+///
+/// ```text
+/// prevrandao = Keccak256("SANGO/EVM/PREVRANDAO/V1" || parent_block_hash)
+/// ```
+///
+/// Déterministe et vérifiable par tout nœud. Aucune source de hasard locale.
+pub const EVM_PREVRANDAO_V1: &[u8] = b"SANGO/EVM/PREVRANDAO/V1";
+
 /// Combinaison des roots d’état (natif + EVM).
 pub const STATE_ROOT_V1: &[u8] = b"SANGO/STATE/ROOT/V1";
 
@@ -83,6 +92,7 @@ mod tests {
         EVM_LOG_V1,
         EVM_LOG_NODE_V1,
         EVM_LOG_EMPTY_V1,
+        EVM_PREVRANDAO_V1,
         NATIVE_STATE_KEY_V1,
         NATIVE_STATE_LEAF_V1,
         NATIVE_STATE_NODE_V1,

@@ -15,14 +15,16 @@
 //! Le namespace [`Namespace::Metadata`] porte les compteurs cumulés :
 //!
 //! - [`MetadataKey::TotalBurned`] : cumul des SANGO brûlés ;
-//! - [`MetadataKey::TotalGasUsed`] : cumul du gas consommé.
+//! - [`MetadataKey::TotalGasUsed`] : cumul du gas consommé ;
+//! - [`MetadataKey::TotalPosRewards`] : cumul des récompenses PoS ;
+//! - [`MetadataKey::NextUnbondingId`] : compteur monotone d'unbondings.
 //!
 //! Ces valeurs font partie du `native_state_root`.
 
 use sango_codec::{Decode, Encode};
 use sango_crypto::{derive_native_address, domain, hash_domain};
 use sango_primitives::{Amount, Hash32, NativeAddress, PublicKey};
-use sango_types::NativeAccount;
+use sango_types::{NativeAccount, PendingUnbonding};
 
 use crate::error::StateError;
 use crate::metadata::MetadataKey;
@@ -370,6 +372,72 @@ impl NativeState {
         Ok(())
     }
 
+    // --- Unbondings en attente ----------------------------------------------
+
+    /// Prochain identifiant d'unbonding à allouer (`0` si aucun).
+    #[must_use]
+    pub fn next_unbonding_id(&self) -> u64 {
+        match self.get_entry(Namespace::Metadata, &[MetadataKey::NextUnbondingId.tag()]) {
+            Some(bytes) => u64::decode_exact(bytes).unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// Alloue un nouvel identifiant monotone et l'incrémente dans l'état.
+    ///
+    /// # Erreurs
+    ///
+    /// [`StateError::UnbondingIdOverflow`] si `next_unbonding_id == u64::MAX`.
+    pub fn alloc_unbonding_id(&mut self) -> Result<u64, StateError> {
+        let id = self.next_unbonding_id();
+        let new = id.checked_add(1).ok_or(StateError::UnbondingIdOverflow)?;
+        self.put_entry(
+            Namespace::Metadata,
+            &[MetadataKey::NextUnbondingId.tag()],
+            new.encode_to_vec(),
+        );
+        Ok(id)
+    }
+
+    /// Écrit un événement d'unbonding en attente.
+    pub fn put_pending_unbonding(&mut self, p: PendingUnbonding) {
+        let id_bytes = p.id.to_be_bytes();
+        let value = p.encode_to_vec();
+        self.put_entry(Namespace::Unbonding, &id_bytes, value);
+    }
+
+    /// Lit un événement d'unbonding par id.
+    #[must_use]
+    pub fn get_pending_unbonding(&self, id: u64) -> Option<PendingUnbonding> {
+        let bytes = self.get_entry(Namespace::Unbonding, &id.to_be_bytes())?;
+        PendingUnbonding::decode_exact(bytes).ok()
+    }
+
+    /// Supprime un événement d'unbonding.
+    pub fn remove_pending_unbonding(&mut self, id: u64) -> Option<Vec<u8>> {
+        self.remove_entry(Namespace::Unbonding, &id.to_be_bytes())
+    }
+
+    /// Énumère tous les unbondings en attente, triés par id croissant.
+    ///
+    /// Utilise le même filtrage cryptographique que [`Self::all_validators`] :
+    /// on décode une valeur, puis on vérifie que son `id` reconstruit bien la
+    /// clé SMT attendue. Aucune ambiguïté possible avec un autre namespace.
+    #[must_use]
+    pub fn iter_pending_unbondings(&self) -> Vec<PendingUnbonding> {
+        let mut out = Vec::new();
+        for (key_hash, value) in self.smt.iter() {
+            if let Ok(p) = PendingUnbonding::decode_exact(value) {
+                let expected = state_key_hash(Namespace::Unbonding, &p.id.to_be_bytes());
+                if expected == *key_hash {
+                    out.push(p);
+                }
+            }
+        }
+        out.sort_by_key(|p| p.id);
+        out
+    }
+
     /// Calcule l'offre existante :
     ///
     /// ```text
@@ -540,7 +608,7 @@ mod tests {
         }
     }
 
-    // --- Tests existants ----------------------------------------------------
+    // --- Tests de base ------------------------------------------------------
 
     #[test]
     fn empty_state_is_empty() {
@@ -918,7 +986,6 @@ mod tests {
         s.add_burned(Amount::from_base_units(u128::MAX)).unwrap();
         let err = s.add_burned(Amount::from_base_units(1)).unwrap_err();
         assert!(matches!(err, StateError::TotalBurnedOverflow { .. }));
-        // La valeur n'a pas changé.
         assert_eq!(s.total_burned(), Amount::from_base_units(u128::MAX));
     }
 
@@ -950,7 +1017,6 @@ mod tests {
         s.credit(addr(0xaa), Amount::from_base_units(1_000))
             .unwrap();
         s.add_burned(Amount::from_base_units(50)).unwrap();
-        // total_burned n'est pas affecté par un crédit ultérieur.
         s.credit(addr(0xbb), Amount::from_base_units(500)).unwrap();
         assert_eq!(s.total_burned(), Amount::from_base_units(50));
         assert_eq!(s.balance_of(&addr(0xaa)), Amount::from_base_units(1_000));
@@ -1003,6 +1069,84 @@ mod tests {
         assert_eq!(clone.total_burned(), Amount::from_base_units(42));
         assert_eq!(clone.total_gas_used(), 100);
         assert_eq!(clone.native_state_root(), s.native_state_root());
+    }
+
+    // --- Pending unbondings -------------------------------------------------
+
+    #[test]
+    fn initial_next_unbonding_id_is_zero() {
+        let s = NativeState::new();
+        assert_eq!(s.next_unbonding_id(), 0);
+    }
+
+    #[test]
+    fn alloc_unbonding_id_is_monotone() {
+        let mut s = NativeState::new();
+        assert_eq!(s.alloc_unbonding_id().unwrap(), 0);
+        assert_eq!(s.alloc_unbonding_id().unwrap(), 1);
+        assert_eq!(s.alloc_unbonding_id().unwrap(), 2);
+        assert_eq!(s.next_unbonding_id(), 3);
+    }
+
+    #[test]
+    fn pending_unbonding_roundtrip() {
+        let mut s = NativeState::new();
+        let id = s.alloc_unbonding_id().unwrap();
+        let p = PendingUnbonding {
+            id,
+            delegator: addr(0xaa),
+            validator: addr(0xbb),
+            amount: Amount::from_sango(1_000).unwrap(),
+            mature_at: 1_800_000_000,
+        };
+        s.put_pending_unbonding(p);
+        assert_eq!(s.get_pending_unbonding(id), Some(p));
+    }
+
+    #[test]
+    fn iter_pending_unbondings_is_sorted_by_id() {
+        let mut s = NativeState::new();
+        for i in 0..5 {
+            let id = s.alloc_unbonding_id().unwrap();
+            s.put_pending_unbonding(PendingUnbonding {
+                id,
+                delegator: addr(0xaa),
+                validator: addr(0xbb),
+                amount: Amount::from_base_units(100 * (i as u128 + 1)),
+                mature_at: 1_800_000_000 + i as u64,
+            });
+        }
+        let all = s.iter_pending_unbondings();
+        assert_eq!(all.len(), 5);
+        for (i, p) in all.iter().enumerate() {
+            assert_eq!(p.id, i as u64);
+        }
+    }
+
+    #[test]
+    fn remove_pending_unbonding_removes_entry() {
+        let mut s = NativeState::new();
+        let id = s.alloc_unbonding_id().unwrap();
+        s.put_pending_unbonding(PendingUnbonding {
+            id,
+            delegator: addr(0xaa),
+            validator: addr(0xbb),
+            amount: Amount::from_base_units(1),
+            mature_at: 1_800_000_000,
+        });
+        assert!(s.get_pending_unbonding(id).is_some());
+        s.remove_pending_unbonding(id);
+        assert!(s.get_pending_unbonding(id).is_none());
+        assert!(s.iter_pending_unbondings().is_empty());
+    }
+
+    #[test]
+    fn next_unbonding_id_survives_clone() {
+        let mut s = NativeState::new();
+        s.alloc_unbonding_id().unwrap();
+        s.alloc_unbonding_id().unwrap();
+        let c = s.clone();
+        assert_eq!(c.next_unbonding_id(), 2);
     }
 
     // --- Staking ------------------------------------------------------------
@@ -1064,9 +1208,7 @@ mod tests {
         let mut s = NativeState::new();
         let d = Delegation::empty(addr(0xbb), addr(0xaa));
         s.set_delegation(d);
-        // Interroger avec un delegator différent.
         assert!(s.get_delegation(&addr(0xcc), &addr(0xaa)).is_none());
-        // Interroger avec un validator différent.
         assert!(s.get_delegation(&addr(0xbb), &addr(0xcc)).is_none());
     }
 
@@ -1101,9 +1243,7 @@ mod tests {
     fn all_validators_returns_only_validators() {
         use sango_types::ValidatorInfo;
         let mut s = NativeState::new();
-        // Un compte normal (ne doit PAS apparaître).
         s.credit(addr(0xaa), Amount::from_base_units(100)).unwrap();
-        // Un validateur.
         s.set_validator(ValidatorInfo {
             address: addr(0xbb),
             public_key: PublicKey::from_bytes([0x01; 32]),

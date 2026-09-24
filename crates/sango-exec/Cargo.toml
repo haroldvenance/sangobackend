@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+
 [dependencies]
 thiserror.workspace = true
 sango-primitives.workspace = true
@@ -14,3 +15,5 @@ sango-crypto.workspace = true
 sango-types.workspace = true
 sango-tx.workspace = true
 sango-state.workspace = true
+sango-mpt = { path = "../sango-mpt" }
+sango-evm = { path = "../sango-evm" }

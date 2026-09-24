@@ -40,4 +40,11 @@ pub enum CodecError {
         /// Tag lu.
         tag: u8,
     },
+
+    /// Le payload d'un variant est malformé (ex. typed-tx EVM invalide).
+    #[error("malformed payload: {reason}")]
+    MalformedPayload {
+        /// Raison courte (statique).
+        reason: &'static str,
+    },
 }

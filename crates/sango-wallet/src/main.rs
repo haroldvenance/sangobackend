@@ -2,19 +2,20 @@
 
 use std::process::ExitCode;
 
-use sango_primitives::{Amount, NativeAddress};
+use sango_primitives::{Amount, EvmAddress, NativeAddress, U256};
 use sango_types::TxKind;
-use sango_wallet::cli::{parse_args, parse_flags, require_flag, HELP};
+use sango_wallet::cli::{optional_flag, parse_args, parse_flags, require_flag, HELP};
 use sango_wallet::commands::{
     fetch_account, fetch_chain_id, format_base_units, parse_sango_decimal, send_transaction,
     TxParams,
 };
+use sango_wallet::evm::{EvmTxBuilder, FeeType};
 use sango_wallet::keystore::KeyFile;
 use sango_wallet::rpc_client::RpcClient;
 use sango_wallet::WalletError;
 
 const DEFAULT_RPC: &str = "127.0.0.1:8545";
-const DEFAULT_MAX_FEE: u128 = 1_000_000; // 0.1 SANGO par gas max
+const DEFAULT_MAX_FEE: u128 = 1_000_000;
 const DEFAULT_PRIORITY_FEE: u128 = 0;
 
 fn main() -> ExitCode {
@@ -41,6 +42,7 @@ fn run(args: &[String]) -> Result<(), WalletError> {
     let kf_path = keyfile_path.as_path();
 
     match cmd.as_str() {
+        // --- Natif ---
         "new" => cmd_new(kf_path),
         "address" => cmd_address(kf_path),
         "pubkey" => cmd_pubkey(kf_path),
@@ -56,17 +58,27 @@ fn run(args: &[String]) -> Result<(), WalletError> {
         "register-validator" => cmd_register(rpc_endpoint, kf_path, &rest),
         "update-commission" => cmd_update_commission(rpc_endpoint, kf_path, &rest),
         "unjail" => cmd_unjail(rpc_endpoint, kf_path, &rest),
+
+        // --- EVM ---
+        "evm-new" => cmd_evm_new(kf_path),
+        "evm-address" => cmd_evm_address(kf_path),
+        "evm-balance" => cmd_evm_balance(rpc_endpoint, kf_path, &rest),
+        "evm-nonce" => cmd_evm_nonce(rpc_endpoint, kf_path, &rest),
+        "evm-call" => cmd_evm_call(rpc_endpoint, &rest),
+        "evm-sign" => cmd_evm_sign(rpc_endpoint, kf_path, &rest),
+
         other => Err(WalletError::Usage(format!("unknown command: {other}"))),
     }
 }
 
-// --- Commandes -------------------------------------------------------------
+// --- Commandes natives (inchangées) ---------------------------------------
 
 fn cmd_new(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
     let kf = KeyFile::create(keyfile_path)?;
     println!("✓ Keyfile créé : {}", keyfile_path.display());
-    println!("  Adresse : 0x{}", kf.address_hex);
+    println!("  Adresse native : 0x{}", kf.address_hex);
     println!("  ⚠ Sauvegardez ce fichier — sans lui, vos fonds sont perdus.");
+    println!("  (Ajoutez une clé EVM avec `sango-wallet evm-new`.)");
     Ok(())
 }
 
@@ -344,9 +356,181 @@ fn cmd_unjail(
     )
 }
 
+// --- Commandes EVM ---------------------------------------------------------
+
+fn cmd_evm_new(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
+    let mut kf = if keyfile_path.exists() {
+        KeyFile::load(keyfile_path)?
+    } else {
+        KeyFile::create(keyfile_path)?
+    };
+    if kf.has_evm_key() {
+        return Err(WalletError::InvalidKeyfile(
+            "EVM key already present in keyfile".into(),
+        ));
+    }
+    kf.attach_evm_key(keyfile_path)?;
+    let addr = kf.evm_address()?;
+    println!("✓ Clé EVM attachée au keyfile");
+    println!("  Adresse EVM : 0x{}", addr.to_hex());
+    Ok(())
+}
+
+fn cmd_evm_address(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
+    let kf = KeyFile::load(keyfile_path)?;
+    let addr = kf.evm_address()?;
+    println!("0x{}", addr.to_hex());
+    Ok(())
+}
+
+fn cmd_evm_balance(
+    rpc_endpoint: &str,
+    keyfile_path: &std::path::Path,
+    args: &[String],
+) -> Result<(), WalletError> {
+    let addr = resolve_evm_address(keyfile_path, args)?;
+    let rpc = RpcClient::new(rpc_endpoint);
+    let result = rpc.call(
+        "eth_getBalance",
+        serde_json::json!([format!("0x{}", addr.to_hex()), "latest"]),
+    )?;
+    let hex = result
+        .as_str()
+        .ok_or_else(|| WalletError::Rpc("eth_getBalance: expected hex string".into()))?;
+    println!("{hex}");
+    Ok(())
+}
+
+fn cmd_evm_nonce(
+    rpc_endpoint: &str,
+    keyfile_path: &std::path::Path,
+    args: &[String],
+) -> Result<(), WalletError> {
+    let addr = resolve_evm_address(keyfile_path, args)?;
+    let rpc = RpcClient::new(rpc_endpoint);
+    let result = rpc.call(
+        "eth_getTransactionCount",
+        serde_json::json!([format!("0x{}", addr.to_hex()), "latest"]),
+    )?;
+    let hex = result
+        .as_str()
+        .ok_or_else(|| WalletError::Rpc("eth_getTransactionCount: expected hex".into()))?;
+    println!("{hex}");
+    Ok(())
+}
+
+fn cmd_evm_call(rpc_endpoint: &str, args: &[String]) -> Result<(), WalletError> {
+    let flags = parse_flags(args)?;
+    let to = require_flag(&flags, "to")?;
+    let data = optional_flag(&flags, "data").unwrap_or("0x");
+    let value = optional_flag(&flags, "value").unwrap_or("0x0");
+
+    let rpc = RpcClient::new(rpc_endpoint);
+    let result = rpc.call(
+        "eth_call",
+        serde_json::json!([
+            {
+                "to": to,
+                "data": data,
+                "value": value,
+            },
+            "latest"
+        ]),
+    )?;
+    println!("{}", result.as_str().unwrap_or("0x"));
+    Ok(())
+}
+
+fn cmd_evm_sign(
+    rpc_endpoint: &str,
+    keyfile_path: &std::path::Path,
+    args: &[String],
+) -> Result<(), WalletError> {
+    let flags = parse_flags(args)?;
+    let to_str = require_flag(&flags, "to")?;
+    let to = EvmAddress::from_hex(&to_str)
+        .map_err(|e| WalletError::InvalidAddress(format!("{to_str}: {e}")))?;
+    let value = parse_u256_flag(&flags, "value").unwrap_or(U256::ZERO);
+
+    let data = match optional_flag(&flags, "data") {
+        Some(s) => hex::decode(s.strip_prefix("0x").unwrap_or(s))?,
+        None => Vec::new(),
+    };
+
+    let kf = KeyFile::load(keyfile_path)?;
+    let kp = kf.evm_keypair()?;
+    let addr = kp.address();
+
+    let rpc = RpcClient::new(rpc_endpoint);
+
+    // Chain ID EVM.
+    let chain_id_hex = rpc
+        .call("eth_chainId", serde_json::json!([]))?
+        .as_str()
+        .ok_or_else(|| WalletError::Rpc("eth_chainId: expected string".into()))?
+        .to_string();
+    let chain_id = u64::from_str_radix(chain_id_hex.trim_start_matches("0x"), 16)
+        .map_err(|e| WalletError::Rpc(format!("bad chainId: {e}")))?;
+
+    // Nonce.
+    let nonce_hex = rpc
+        .call(
+            "eth_getTransactionCount",
+            serde_json::json!([format!("0x{}", addr.to_hex()), "latest"]),
+        )?
+        .as_str()
+        .ok_or_else(|| WalletError::Rpc("nonce: expected string".into()))?
+        .to_string();
+    let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+
+    // Gas price (approximation depuis la base fee via eth_gasPrice).
+    let gas_price_hex = rpc
+        .call("eth_gasPrice", serde_json::json!([]))?
+        .as_str()
+        .ok_or_else(|| WalletError::Rpc("eth_gasPrice: expected string".into()))?
+        .to_string();
+    let gas_price_u128 =
+        u128::from_str_radix(gas_price_hex.trim_start_matches("0x"), 16).unwrap_or(1);
+
+    let gas_limit = match optional_flag(&flags, "gas") {
+        Some(s) => s.parse::<u64>().unwrap_or(21_000),
+        None => 21_000,
+    };
+
+    let fee = match optional_flag(&flags, "tx-type").unwrap_or("1559") {
+        "legacy" => FeeType::Legacy {
+            gas_price: U256::from(gas_price_u128),
+        },
+        "2930" => FeeType::Eip2930 {
+            gas_price: U256::from(gas_price_u128),
+        },
+        _ => FeeType::Eip1559 {
+            max_fee_per_gas: U256::from(gas_price_u128),
+            max_priority_fee_per_gas: U256::from(1_000_000u64),
+        },
+    };
+
+    let builder = EvmTxBuilder {
+        chain_id,
+        nonce,
+        gas_limit,
+        to: Some(to),
+        value,
+        data,
+        access_list: Vec::new(),
+        fee,
+    };
+    let tx = builder.sign(&kp)?;
+    let raw = tx.encode_ethereum_typed();
+    println!("0x{}", hex::encode(&raw));
+    eprintln!(
+        "(Signature produite localement. Broadcast via `eth_sendRawTransaction` non encore supporté — voir 4c.3.)"
+    );
+    Ok(())
+}
+
 // --- Helpers ---------------------------------------------------------------
 
-/// Résout une adresse depuis un argument optionnel, ou charge le keyfile.
 fn resolve_address(
     keyfile_path: &std::path::Path,
     args: &[String],
@@ -360,15 +544,41 @@ fn resolve_address(
     kf.address()
 }
 
-/// Parse `0x...` (ou sans préfixe) en `NativeAddress`.
+fn resolve_evm_address(
+    keyfile_path: &std::path::Path,
+    args: &[String],
+) -> Result<EvmAddress, WalletError> {
+    if let Some(arg) = args.first() {
+        if !arg.starts_with("--") {
+            return EvmAddress::from_hex(arg)
+                .map_err(|e| WalletError::InvalidAddress(format!("{arg}: {e}")));
+        }
+    }
+    let kf = KeyFile::load(keyfile_path)?;
+    kf.evm_address()
+}
+
 fn parse_address_arg(s: &str) -> Result<NativeAddress, WalletError> {
     NativeAddress::from_hex(s).map_err(|e| WalletError::InvalidAddress(format!("{s}: {e}")))
 }
 
-/// Soumet une transaction : remplit chain_id + nonce, signe, envoie.
-///
-/// Si le compte n'a pas encore de clé publique enregistrée, la transaction
-/// la déclare pour permettre le bootstrap (Freeze, sango-tx).
+fn parse_u256_flag(flags: &[(String, String)], name: &str) -> Option<U256> {
+    let s = optional_flag(flags, name)?;
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let padded = if s.len() % 2 == 1 {
+        format!("0{s}")
+    } else {
+        s.to_string()
+    };
+    let bytes = hex::decode(&padded).ok()?;
+    if bytes.len() > 32 {
+        return None;
+    }
+    let mut buf = [0u8; 32];
+    buf[32 - bytes.len()..].copy_from_slice(&bytes);
+    Some(U256::from_be_bytes::<32>(buf))
+}
+
 fn submit_tx(
     rpc_endpoint: &str,
     keyfile_path: &std::path::Path,
@@ -377,20 +587,17 @@ fn submit_tx(
     let kf = KeyFile::load(keyfile_path)?;
     let rpc = RpcClient::new(rpc_endpoint);
 
-    // Récupérer chain_id, nonce et clé publique enregistrée.
     params.chain_id = fetch_chain_id(&rpc)?;
     let addr = kf.address()?;
     let (nonce, _, onchain_pk) = fetch_account(&rpc, &addr)?;
     params.nonce = nonce;
 
-    // Bootstrap : si le compte n'a pas encore de clé, déclarer la nôtre.
     let declare_pk = if onchain_pk.is_none() {
         Some(kf.public_key()?)
     } else {
         None
     };
 
-    // Signer et envoyer.
     let tx = params.build_and_sign(&kf, declare_pk)?;
     let tx_hash = send_transaction(&rpc, &tx)?;
     println!("✓ Transaction envoyée");

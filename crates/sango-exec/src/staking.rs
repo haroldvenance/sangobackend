@@ -5,7 +5,9 @@
 use sango_primitives::{Amount, NativeAddress};
 use sango_state::NativeState;
 use sango_tx::ValidatedTransaction;
-use sango_types::{staking_params, Delegation, Transaction, TxKind, ValidatorInfo};
+use sango_types::{
+    staking_params, Delegation, PendingUnbonding, Transaction, TxKind, ValidatorInfo,
+};
 
 use crate::apply::AppliedTransaction;
 use crate::error::ApplyError;
@@ -189,7 +191,22 @@ fn apply_unbond(
     info.self_stake = Amount::from_base_units(remaining);
     state.set_validator(info);
 
-    // Ajouter à la file d'unbonding via `Delegation(sender, sender)`.
+    // Matérialité : enregistrer l'événement d'unbonding **avant** de
+    // mettre à jour l'agrégat pour rester atomic-safe si l'un des deux
+    // échoue.
+    let mature_at = ctx
+        .current_time
+        .saturating_add(staking_params::UNBONDING_PERIOD_SECS);
+    let id = state.alloc_unbonding_id().map_err(ApplyError::State)?;
+    state.put_pending_unbonding(PendingUnbonding {
+        id,
+        delegator: sender,
+        validator: sender,
+        amount: value,
+        mature_at,
+    });
+
+    // Agrégat pour affichage (bucket `Delegation(sender, sender)`).
     let mut unbond = state
         .get_delegation(&sender, &sender)
         .unwrap_or_else(|| Delegation::empty(sender, sender));
@@ -197,10 +214,11 @@ fn apply_unbond(
         .unbonding
         .checked_add(value)
         .ok_or(ApplyError::TotalFeeOverflow)?;
-    unbond.unbonding_until = Some(
-        ctx.current_time
-            .saturating_add(staking_params::UNBONDING_PERIOD_SECS),
-    );
+    // On garde le timestamp le plus tardif (informations utilisateur).
+    unbond.unbonding_until = Some(match unbond.unbonding_until {
+        Some(prev) => prev.max(mature_at),
+        None => mature_at,
+    });
     state.set_delegation(unbond);
 
     // Frais.
@@ -284,16 +302,31 @@ fn apply_undelegate(
         .unbonding
         .checked_add(value)
         .ok_or(ApplyError::TotalFeeOverflow)?;
-    d.unbonding_until = Some(
-        ctx.current_time
-            .saturating_add(staking_params::UNBONDING_PERIOD_SECS),
-    );
 
+    let mature_at = ctx
+        .current_time
+        .saturating_add(staking_params::UNBONDING_PERIOD_SECS);
+    d.unbonding_until = Some(match d.unbonding_until {
+        Some(prev) => prev.max(mature_at),
+        None => mature_at,
+    });
+
+    // Décision : conserver ou supprimer l'agrégat `Delegation`.
     if d.is_empty() {
         state.remove_delegation(&sender, &validator);
     } else {
         state.set_delegation(d);
     }
+
+    // Matérialité : enregistrer l'événement.
+    let id = state.alloc_unbonding_id().map_err(ApplyError::State)?;
+    state.put_pending_unbonding(PendingUnbonding {
+        id,
+        delegator: sender,
+        validator,
+        amount: value,
+        mature_at,
+    });
 
     // Mettre à jour le total délégué du validator.
     if let Some(mut info) = state.get_validator(&validator) {
@@ -517,6 +550,7 @@ mod tests {
             current_time: now(),
             current_height: 0,
             rewards_enabled: false,
+            downtime_enabled: false,
         }
     }
 
@@ -608,7 +642,6 @@ mod tests {
         assert_eq!(info.self_stake, Amount::from_sango(100_000).unwrap());
         assert_eq!(info.commission_bps, 700);
         assert!(!info.jailed);
-        // Solde débité de 100 000 SANGO + fees.
         let total_fee = 200_000u128 * 12;
         assert_eq!(
             state.balance_of(&addr).base_units(),
@@ -678,7 +711,6 @@ mod tests {
         let mut state = NativeState::new();
         let addr = funded_account(&mut state, &kp, 500_000);
 
-        // Enregistrer d'abord.
         state.set_validator(ValidatorInfo {
             address: addr,
             public_key: kp.public_key(),
@@ -741,7 +773,6 @@ mod tests {
             downtime_missed: 0,
         });
 
-        // Tentative d'unbond de 10 000 SANGO → resterait 90 000 < 100 000 min.
         let tx = sign_tx(
             &kp,
             Transaction {
@@ -766,6 +797,59 @@ mod tests {
             apply_staking_no_rollback(&mut state, &tx, &v, 50_000, &exec_ctx(fee_recipient()))
                 .unwrap_err();
         assert!(matches!(err, ApplyError::InsufficientSelfStake { .. }));
+    }
+
+    #[test]
+    fn unbond_creates_pending_unbonding() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let mut state = NativeState::new();
+        let addr = funded_account(&mut state, &kp, 300_000);
+
+        state.set_validator(ValidatorInfo {
+            address: addr,
+            public_key: kp.public_key(),
+            self_stake: Amount::from_sango(200_000).unwrap(),
+            total_delegated: Amount::ZERO,
+            commission_bps: 700,
+            pending_commission_bps: None,
+            pending_commission_at: None,
+            jailed: false,
+            jailed_until: None,
+            downtime_window_start: 0,
+            downtime_missed: 0,
+        });
+
+        let tx = sign_tx(
+            &kp,
+            Transaction {
+                version: 1,
+                chain_id: chain(),
+                nonce: 0,
+                sender: addr,
+                public_key: None,
+                gas_limit: 50_000,
+                max_fee: 20,
+                priority_fee: 2,
+                value: Amount::from_sango(50_000).unwrap(),
+                tx_kind: TxKind::Unbond,
+                recipient: None,
+                data: Vec::new(),
+                signature: Signature::ZERO,
+            },
+        );
+        let v = validate(&state, &tx).unwrap();
+        apply_staking_no_rollback(&mut state, &tx, &v, 50_000, &exec_ctx(fee_recipient())).unwrap();
+
+        let pending = state.iter_pending_unbondings();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delegator, addr);
+        assert_eq!(pending[0].validator, addr);
+        assert_eq!(pending[0].amount, Amount::from_sango(50_000).unwrap());
+        assert_eq!(
+            pending[0].mature_at,
+            now() + staking_params::UNBONDING_PERIOD_SECS
+        );
+        assert_eq!(state.next_unbonding_id(), 1);
     }
 
     // --- Delegate / Undelegate ---------------------------------------------
@@ -854,6 +938,67 @@ mod tests {
             state.get_validator(&validator).unwrap().total_delegated,
             Amount::from_sango(5_000).unwrap()
         );
+
+        // Vérifier le PendingUnbonding créé.
+        let pending = state.iter_pending_unbondings();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delegator, delegator);
+        assert_eq!(pending[0].validator, validator);
+        assert_eq!(pending[0].amount, Amount::from_sango(5_000).unwrap());
+    }
+
+    #[test]
+    fn undelegate_creates_pending_unbonding() {
+        let delegator_kp = NativeKeypair::from_seed([0x01; 32]);
+        let validator_kp = NativeKeypair::from_seed([0x02; 32]);
+        let mut state = NativeState::new();
+        let delegator = funded_account(&mut state, &delegator_kp, 100_000);
+        let validator = funded_account(&mut state, &validator_kp, 200_000);
+
+        state.set_validator(ValidatorInfo {
+            address: validator,
+            public_key: validator_kp.public_key(),
+            self_stake: Amount::from_sango(100_000).unwrap(),
+            total_delegated: Amount::from_sango(10_000).unwrap(),
+            commission_bps: 700,
+            pending_commission_bps: None,
+            pending_commission_at: None,
+            jailed: false,
+            jailed_until: None,
+            downtime_window_start: 0,
+            downtime_missed: 0,
+        });
+
+        let mut d = Delegation::empty(delegator, validator);
+        d.bonded = Amount::from_sango(10_000).unwrap();
+        state.set_delegation(d);
+
+        let tx = sign_tx(
+            &delegator_kp,
+            Transaction {
+                version: 1,
+                chain_id: chain(),
+                nonce: 0,
+                sender: delegator,
+                public_key: None,
+                gas_limit: 80_000,
+                max_fee: 20,
+                priority_fee: 2,
+                value: Amount::from_sango(5_000).unwrap(),
+                tx_kind: TxKind::Undelegate,
+                recipient: Some(validator),
+                data: Vec::new(),
+                signature: Signature::ZERO,
+            },
+        );
+        let v = validate(&state, &tx).unwrap();
+        apply_staking_no_rollback(&mut state, &tx, &v, 80_000, &exec_ctx(fee_recipient())).unwrap();
+
+        let pending = state.iter_pending_unbondings();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delegator, delegator);
+        assert_eq!(pending[0].validator, validator);
+        assert_eq!(pending[0].amount, Amount::from_sango(5_000).unwrap());
     }
 
     #[test]
@@ -947,7 +1092,7 @@ mod tests {
         apply_staking_no_rollback(&mut state, &tx, &v, 30_000, &exec_ctx(fee_recipient())).unwrap();
 
         let info = state.get_validator(&addr).unwrap();
-        assert_eq!(info.commission_bps, 700); // inchangé
+        assert_eq!(info.commission_bps, 700);
         assert_eq!(info.pending_commission_bps, Some(900));
         assert_eq!(
             info.pending_commission_at,

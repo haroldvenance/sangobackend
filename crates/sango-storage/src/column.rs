@@ -30,6 +30,28 @@ pub enum Column {
     Evidence,
     /// État consensus (lock, valid_round, etc.).
     Consensus,
+    /// Comptes EVM (state trie Ethereum).
+    ///
+    /// Clé = `Keccak256(evm_address)` (32 bytes).
+    /// Valeur = RLP `[nonce, balance, storage_root, code_hash]`.
+    EvmAccounts,
+    /// Storage EVM par compte.
+    ///
+    /// Clé = `Keccak256(evm_address) || Keccak256(slot_be_32)` (64 bytes).
+    /// Valeur = RLP `value_minimal_be`.
+    ///
+    /// Le préfixe `Keccak256(evm_address)` est **purement physique** : il
+    /// identifie le compte propriétaire dans le KV store. Il ne fait **pas**
+    /// partie de la clé du storage MPT (qui est `Keccak256(slot_be_32)`).
+    EvmStorage,
+    /// Code EVM (bytecode de contrat).
+    ///
+    /// Clé = `code_hash` (32 bytes) = `Keccak256(bytecode)`.
+    /// Valeur = bytecode brut (non préfixé, non RLP).
+    ///
+    /// **Invariant** : `Keccak256(value) == key`. Toute entrée qui ne
+    /// respecte pas cet invariant doit être rejetée à la lecture.
+    EvmCode,
     /// Métadonnées de chaîne (dernier bloc finalisé, etc.).
     Metadata,
 }
@@ -47,6 +69,9 @@ impl Column {
         Column::Staking,
         Column::Evidence,
         Column::Consensus,
+        Column::EvmAccounts,
+        Column::EvmStorage,
+        Column::EvmCode,
         Column::Metadata,
     ];
 
@@ -64,6 +89,9 @@ impl Column {
             Column::Staking => "staking",
             Column::Evidence => "evidence",
             Column::Consensus => "consensus",
+            Column::EvmAccounts => "evm_accounts",
+            Column::EvmStorage => "evm_storage",
+            Column::EvmCode => "evm_code",
             Column::Metadata => "metadata",
         }
     }
@@ -94,11 +122,14 @@ mod tests {
         assert_eq!(Column::Staking.name(), "staking");
         assert_eq!(Column::Evidence.name(), "evidence");
         assert_eq!(Column::Consensus.name(), "consensus");
+        assert_eq!(Column::EvmAccounts.name(), "evm_accounts");
+        assert_eq!(Column::EvmStorage.name(), "evm_storage");
+        assert_eq!(Column::EvmCode.name(), "evm_code");
         assert_eq!(Column::Metadata.name(), "metadata");
     }
 
     #[test]
     fn all_contains_every_variant() {
-        assert_eq!(Column::ALL.len(), 11);
+        assert_eq!(Column::ALL.len(), 14);
     }
 }

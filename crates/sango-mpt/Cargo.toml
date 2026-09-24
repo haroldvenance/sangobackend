@@ -1,0 +1,15 @@
+[package]
+name = "sango-mpt"
+version = "0.1.0"
+edition = "2021"
+description = "Ethereum-compatible Modified Merkle Patricia Trie for Sango V1"
+license = "Apache-2.0"
+
+[dependencies]
+rlp = "=0.5.2"
+thiserror = "1"
+sango-primitives = { path = "../sango-primitives" }
+sango-crypto = { path = "../sango-crypto" }
+
+[dev-dependencies]
+hex = "0.4"

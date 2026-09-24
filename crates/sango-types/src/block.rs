@@ -5,7 +5,7 @@ use sango_primitives::Hash32;
 
 use crate::evidence::Evidence;
 use crate::header::BlockHeader;
-use crate::transaction::Transaction;
+use crate::tx::Tx;
 
 /// Bloc Sango V1 (Freeze, section 26).
 ///
@@ -27,8 +27,15 @@ pub struct Block {
     /// Chaque evidence déclenche un slashing déterministe. L'ordre est
     /// canonique et fait partie du consensus.
     pub evidences: Vec<Evidence>,
-    /// Transactions du bloc, dans leur ordre canonique.
-    pub transactions: Vec<Transaction>,
+    /// Transactions du bloc (natives et/ou EVM), dans leur ordre
+    /// canonique.
+    ///
+    /// Depuis 4c.3.1b, ce champ est hétérogène : il peut contenir des
+    /// [`Tx::Native`] (transaction Sango Ed25519) et des [`Tx::Evm`]
+    /// (typed-transaction Ethereum secp256k1). Le codec du bloc écrit
+    /// un discriminant Sango (`0x01` / `0x02`) devant chaque entrée,
+    /// indépendant des types Ethereum typés.
+    pub transactions: Vec<Tx>,
 }
 
 impl Block {
@@ -58,7 +65,7 @@ impl Decode for Block {
         Ok(Self {
             header: BlockHeader::decode(dec)?,
             evidences: Vec::<Evidence>::decode(dec)?,
-            transactions: Vec::<Transaction>::decode(dec)?,
+            transactions: Vec::<Tx>::decode(dec)?,
         })
     }
 }
@@ -66,7 +73,7 @@ impl Decode for Block {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction::TxKind;
+    use crate::transaction::{Transaction, TxKind};
     use sango_primitives::{Amount, ChainId32, Epoch, Height, NativeAddress, Round, Signature};
 
     fn header() -> BlockHeader {
@@ -88,8 +95,8 @@ mod tests {
         }
     }
 
-    fn tx(nonce: u64) -> Transaction {
-        Transaction {
+    fn tx(nonce: u64) -> Tx {
+        Tx::Native(Transaction {
             version: 1,
             chain_id: ChainId32::from_bytes([0x11; 32]),
             nonce,
@@ -103,7 +110,7 @@ mod tests {
             recipient: Some(NativeAddress::from_bytes([0xbb; 20])),
             data: Vec::new(),
             signature: Signature::ZERO,
-        }
+        })
     }
 
     #[test]

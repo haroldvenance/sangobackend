@@ -11,6 +11,10 @@ thiserror.workspace = true
 sango-primitives.workspace = true
 sango-codec.workspace = true
 sango-crypto.workspace = true
+rlp = "=0.5.2"
 
 [dev-dependencies]
 hex-literal.workspace = true
+hex = "0.4"
+
+

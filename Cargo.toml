@@ -2,21 +2,21 @@
 resolver = "2"
 members = [
     "crates/sango-primitives",
-    "crates/sango-crypto",
     "crates/sango-codec",
+    "crates/sango-crypto",
     "crates/sango-types",
     "crates/sango-state",
+    "crates/sango-mpt",
     "crates/sango-storage",
     "crates/sango-tx",
-    "crates/sango-mempool",
-    "crates/sango-evm",
-    "crates/sango-staking",
+    "crates/sango-exec",
+    "crates/sango-evm",     # ← nouveau
     "crates/sango-consensus",
-    "crates/sango-p2p",
+    "crates/sango-mempool",
     "crates/sango-rpc",
     "crates/sango-node",
-    "crates/sango-exec",
     "crates/sango-wallet",
+    "crates/sango-p2p",
 ]
 
 [workspace.package]
@@ -50,7 +50,9 @@ sango-types = { path = "crates/sango-types" }
 sango-storage = { path = "crates/sango-storage" }
 sango-tx = { path = "crates/sango-tx" }
 sango-state = { path = "crates/sango-state" }
+sango-mpt = { path = "crates/sango-mpt" }
 sango-exec = { path = "crates/sango-exec" }
+sango-evm = { path = "crates/sango-evm" }
 sango-node = { path = "crates/sango-node" }
 sango-p2p = { path = "crates/sango-p2p" }
 sango-consensus = { path = "crates/sango-consensus" }

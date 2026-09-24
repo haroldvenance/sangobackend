@@ -36,6 +36,12 @@ pub struct KeyFile {
     pub address_hex: String,
     /// Timestamp Unix de création.
     pub created_at: u64,
+    /// Secret secp256k1 EVM (32 bytes hex), optionnel.
+    ///
+    /// Indépendant de la graine Ed25519 : les deux clés vivent dans des
+    /// espaces cryptographiques différents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_secret_hex: Option<String>,
 }
 
 impl KeyFile {
@@ -83,6 +89,7 @@ impl KeyFile {
             seed_hex: hex::encode(seed),
             address_hex: address.to_hex(),
             created_at: now_unix(),
+            evm_secret_hex: None,
         };
 
         kf.write_atomic(path)?;
@@ -118,6 +125,54 @@ impl KeyFile {
     pub fn address(&self) -> Result<NativeAddress, WalletError> {
         NativeAddress::from_hex(&self.address_hex)
             .map_err(|e| WalletError::InvalidKeyfile(format!("bad address: {e}")))
+    }
+
+    // --- EVM --------------------------------------------------------------
+
+    /// Vrai si une clé EVM est attachée.
+    #[must_use]
+    pub fn has_evm_key(&self) -> bool {
+        self.evm_secret_hex.is_some()
+    }
+
+    /// Génère et attache une clé EVM, puis réécrit le keyfile.
+    ///
+    /// # Erreurs
+    ///
+    /// [`WalletError::InvalidKeyfile`] si une clé EVM est déjà présente.
+    pub fn attach_evm_key(&mut self, path: &Path) -> Result<(), WalletError> {
+        if self.evm_secret_hex.is_some() {
+            return Err(WalletError::InvalidKeyfile(
+                "EVM key already present".into(),
+            ));
+        }
+        let kp = crate::evm::EvmKeypair::generate();
+        self.evm_secret_hex = Some(hex::encode(kp.secret_bytes()));
+        self.write_atomic(path)?;
+        Ok(())
+    }
+
+    /// Reconstruit la paire de clés EVM.
+    pub fn evm_keypair(&self) -> Result<crate::evm::EvmKeypair, WalletError> {
+        let hex_str = self
+            .evm_secret_hex
+            .as_ref()
+            .ok_or_else(|| WalletError::InvalidKeyfile("no EVM key in keyfile".into()))?;
+        let bytes = hex::decode(hex_str)?;
+        if bytes.len() != 32 {
+            return Err(WalletError::InvalidKeyfile(format!(
+                "EVM secret must be 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&bytes);
+        crate::evm::EvmKeypair::from_secret(secret)
+    }
+
+    /// Adresse EVM locale.
+    pub fn evm_address(&self) -> Result<sango_primitives::EvmAddress, WalletError> {
+        Ok(self.evm_keypair()?.address())
     }
 
     /// Écrit le keyfile avec permissions `0600`.

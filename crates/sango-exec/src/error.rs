@@ -12,6 +12,15 @@ pub enum ApplyError {
     #[error("tx_kind {0:?} is not supported by the native applier")]
     UnsupportedTxKind(TxKind),
 
+    /// Une transaction EVM a été rencontrée dans le bloc alors que le
+    /// pipeline EVM consensus-critical n'est pas encore branché.
+    ///
+    /// **4c.3.1b** : le format de bloc est hétérogène (`Vec<Tx>`), mais
+    /// seul `Tx::Native` est exécutable. Le câblage d'`evm_transact`
+    /// dans `apply_block` arrive en **4c.3.3**.
+    #[error("EVM tx not yet supported by the native apply pipeline (4c.3.3)")]
+    UnsupportedTxVariant,
+
     /// `TX_TRANSFER` sans destinataire.
     #[error("TX_TRANSFER requires a recipient")]
     MissingRecipient,

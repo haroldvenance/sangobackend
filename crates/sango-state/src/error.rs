@@ -83,4 +83,11 @@ pub enum StateError {
         /// Nom de la clé fautive.
         key: &'static str,
     },
+
+    /// Le compteur `next_unbonding_id` a atteint `u64::MAX`.
+    ///
+    /// Cas purement théorique (impossible à atteindre avec des ressources
+    /// physiques bornées) mais vérifié par prudence.
+    #[error("next_unbonding_id overflow")]
+    UnbondingIdOverflow,
 }

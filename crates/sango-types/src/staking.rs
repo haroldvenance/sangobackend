@@ -84,8 +84,9 @@ impl Decode for ValidatorInfo {
 
 /// Délégation d'un compte vers un validateur.
 ///
-/// Stocké dans le namespace `Delegation` sous la clé
-/// `delegator_address || validator_address`.
+/// Les champs `unbonding` / `unbonding_until` sont un **agrégat** pour
+/// affichage ; la vérité comptable vit dans le namespace `Unbonding`
+/// (voir [`PendingUnbonding`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Delegation {
     /// Adresse du délégateur.
@@ -96,7 +97,7 @@ pub struct Delegation {
     pub bonded: Amount,
     /// Montant en cours d'unbonding (base units).
     pub unbonding: Amount,
-    /// Timestamp Unix de libération du montant en unbonding.
+    /// Timestamp Unix du **plus tardif** des unbondings en attente.
     pub unbonding_until: Option<u64>,
     /// Récompenses accumulées non réclamées (base units).
     pub pending_rewards: Amount,
@@ -143,6 +144,59 @@ impl Decode for Delegation {
             unbonding: Amount::decode(dec)?,
             unbonding_until: Option::<u64>::decode(dec)?,
             pending_rewards: Amount::decode(dec)?,
+        })
+    }
+}
+
+/// Événement d'unbonding en attente de maturation.
+///
+/// Un événement est créé à chaque `unbond` (self-stake) ou `undelegate`.
+/// Il est stocké dans le namespace `Unbonding` sous la clé
+/// `state_key_hash(Unbonding, id.to_be_bytes())`.
+///
+/// À chaque bloc, [`sango_exec::process_matured_unbondings`] parcourt le
+/// namespace, libère les fonds des événements dont `mature_at <=
+/// ctx.current_time`, et supprime l'entrée.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingUnbonding {
+    /// Identifiant monotone global.
+    pub id: u64,
+    /// Compte bénéficiaire (self-stake : `delegator == validator`).
+    pub delegator: NativeAddress,
+    /// Validateur source.
+    pub validator: NativeAddress,
+    /// Montant à libérer (base units).
+    pub amount: Amount,
+    /// Timestamp Unix de maturité.
+    pub mature_at: u64,
+}
+
+impl PendingUnbonding {
+    /// Vrai si l'événement est mûr à `now`.
+    #[must_use]
+    pub const fn is_mature(&self, now: u64) -> bool {
+        self.mature_at <= now
+    }
+}
+
+impl Encode for PendingUnbonding {
+    fn encode(&self, enc: &mut Encoder) {
+        self.id.encode(enc);
+        self.delegator.encode(enc);
+        self.validator.encode(enc);
+        self.amount.encode(enc);
+        self.mature_at.encode(enc);
+    }
+}
+
+impl Decode for PendingUnbonding {
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            id: u64::decode(dec)?,
+            delegator: NativeAddress::decode(dec)?,
+            validator: NativeAddress::decode(dec)?,
+            amount: Amount::decode(dec)?,
+            mature_at: u64::decode(dec)?,
         })
     }
 }
@@ -264,6 +318,33 @@ mod tests {
     fn delegation_empty_is_empty() {
         let d = Delegation::empty(addr(0xbb), addr(0xaa));
         assert!(d.is_empty());
+    }
+
+    #[test]
+    fn pending_unbonding_roundtrip() {
+        let p = PendingUnbonding {
+            id: 42,
+            delegator: addr(0xaa),
+            validator: addr(0xbb),
+            amount: Amount::from_sango(1_234).unwrap(),
+            mature_at: 1_800_000_000,
+        };
+        let bytes = p.encode_to_vec();
+        assert_eq!(PendingUnbonding::decode_exact(&bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn pending_unbonding_is_mature() {
+        let p = PendingUnbonding {
+            id: 0,
+            delegator: addr(0xaa),
+            validator: addr(0xbb),
+            amount: Amount::from_sango(1).unwrap(),
+            mature_at: 100,
+        };
+        assert!(p.is_mature(100));
+        assert!(p.is_mature(200));
+        assert!(!p.is_mature(99));
     }
 
     #[test]

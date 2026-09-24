@@ -24,12 +24,32 @@
 //! Pour minimiser les écritures SMT, `apply_block` **agrège** les frais
 //! brûlés et le gas consommé sur l'ensemble du bloc, et effectue **un seul**
 //! appel à `add_burned` et `add_gas_used` en fin de traitement.
+//!
+//! ## Déterminisme
+//!
+//! `apply_block` doit produire **exactement** le même `native_state_root`
+//! sur tous les nœuds pour un bloc donné. En V1, deux sous-systèmes
+//! dépendent d'observations locales non déterministes :
+//!
+//! - le **downtime** dépend du `CommitCertificate`, dont la composition
+//!   exacte peut différer d'un nœud à l'autre (ordre réseau) ;
+//! - la **distribution des rewards PoS** dépend du pool et des
+//!   participants locaux.
+//!
+//! Les deux sont donc pilotés par des flags dans [`ExecutionContext`]
+//! (`downtime_enabled`, `rewards_enabled`) qui doivent rester `false`
+//! tant que ces données ne sont pas incluses *dans* le bloc.
+//!
+//! La finalisation des unbondings, en revanche, est **déterministe** : elle
+//! ne dépend que de `ctx.current_time` (issu du header du bloc) et de
+//! l'état. Elle est donc toujours activée.
 
+use sango_codec::Encode;
 use sango_crypto::derive_native_address;
 use sango_primitives::{Amount, ChainId32, Hash32, NativeAddress, PublicKey};
 use sango_state::{NativeState, StateError};
 use sango_tx::{split_fee, ValidatedTransaction};
-use sango_types::{Block, EvmLog, LogsBloom, Receipt, ReceiptStatus, Transaction, TxKind};
+use sango_types::{Block, EvmLog, LogsBloom, Receipt, ReceiptStatus, Transaction, Tx, TxKind};
 
 use crate::error::ApplyError;
 
@@ -61,9 +81,16 @@ pub struct ExecutionContext {
     pub current_height: u64,
     /// Active la distribution des récompenses PoS à la fin du bloc.
     ///
-    /// `false` par défaut pour les tests unitaires et les premiers blocs
-    /// d'un réseau (avant que le pool ne soit activé par le Genesis).
+    /// **Doit rester `false`** tant que la distribution dépend de données
+    /// locales (pool calculé localement, participants locaux) : sinon le
+    /// `state_root` diverge entre nœuds et le consensus se bloque.
     pub rewards_enabled: bool,
+    /// Active le suivi de la participation (downtime).
+    ///
+    /// **Doit rester `false`** tant que le `CommitCertificate` n'est pas
+    /// diffusé *dans le bloc* pour être identique partout : sinon le
+    /// `state_root` diverge.
+    pub downtime_enabled: bool,
 }
 
 /// Détail de l'application d'une transaction.
@@ -130,14 +157,164 @@ pub struct BlockExecutionResult {
     /// Offre courante après application :
     /// `initial_supply − total_burned`.
     pub current_supply: Amount,
-    /// Racine de l'état natif après application.
+    /// Racine de l'état natif (SMT Sango) après application.
     pub native_state_root: Hash32,
-    /// Racine des receipts dans le bloc. **Placeholder** (`Hash32::ZERO`)
-    /// tant que le MPT EVM n'est pas implémenté.
+    /// Racine MPT Ethereum de l'état EVM après application.
+    ///
+    /// En V1 (EVM non encore branché) : [`empty_evm_state_root`].
+    pub evm_state_root: Hash32,
+    /// `state_root` global du header :
+    ///
+    /// ```text
+    /// Keccak256("SANGO/STATE/ROOT/V1" || native_state_root || evm_state_root)
+    /// ```
+    pub state_root: Hash32,
+    /// Racine MPT Ethereum des transactions du bloc.
+    ///
+    /// Formule normative V1 (natif uniquement) :
+    ///
+    /// ```text
+    /// transaction_root = MPT_root({ RLP(index) → canonical_sango_tx_bytes })
+    /// ```
+    ///
+    /// Quand l'EVM arrivera, les txs EVM fourniront directement
+    /// `ethereum_typed_transaction_bytes` (déjà RLP), et la racine
+    /// deviendra un MPT Ethereum hétérogène natif/EVM.
+    pub transaction_root: Hash32,
+    /// Racine MPT Ethereum des receipts du bloc.
+    ///
+    /// **Placeholder** en V1 tant que le MPT des receipts n'est pas
+    /// implémenté (étape 3b). La valeur `Hash32::ZERO` n'est **pas** la
+    /// définition normative du root vide — c'est un marqueur provisoire
+    /// qui sera remplacé par `Keccak256(RLP(""))` une fois le calcul en
+    /// place.
     pub receipt_root: Hash32,
     /// Récompense PoS distribuée au proposant pour ce bloc (`None` si
     /// désactivé ou pool épuisé).
     pub pos_rewards: Option<crate::rewards::RewardDistribution>,
+}
+
+// --- Transaction root ------------------------------------------------------
+
+/// Calcule la racine MPT Ethereum-compatible des transactions du bloc.
+///
+/// ## Formule normative (V1, natif uniquement)
+///
+/// ```text
+/// key_i   = RLP(i)
+/// value_i = canonical_sango_tx_bytes(i)
+/// ```
+///
+/// **Pas** de RLP supplémentaire autour de `value` : en V1 les seules
+/// txs sont natives, et leur représentation canonique est celle du
+/// `sango-codec` (pas RLP). Quand les txs EVM arriveront, elles
+/// fourniront directement leurs bytes Ethereum typed (déjà RLP).
+///
+/// ## Ordre
+///
+/// L'ordre des transactions est **consensus-critical** : l'index `i`
+/// fait partie de la clé. On itère donc `txs` tel quel, sans tri.
+#[must_use]
+pub fn compute_transaction_root(txs: &[Tx]) -> Hash32 {
+    let values: Vec<Vec<u8>> = txs.iter().map(|tx| tx.canonical_bytes()).collect();
+    sango_mpt::transaction_root(&values)
+}
+
+// --- Receipts --------------------------------------------------------------
+
+/// Construit les receipts d'un bloc à partir des transactions appliquées.
+///
+/// `cumulative_gas_used` est calculé séquentiellement, dans l'ordre
+/// exact des transactions du bloc. C'est la sémantique Ethereum.
+///
+/// ## Source unique de vérité
+///
+/// Cette fonction est **partagée** entre le proposeur (qui simule
+/// l'exécution du bloc candidat) et le validateur (qui applique le
+/// bloc reçu). Les deux produisent donc exactement les mêmes receipts
+/// à partir de la même séquence d'`AppliedTransaction`, ce qui garantit
+/// que le `receipt_root` calculé par le proposeur est vérifiable par le
+/// validateur.
+///
+/// ## Défensive `saturating_add`
+///
+/// `apply_block` vérifie déjà que `total_gas_used` ne déborde pas
+/// `u64::MAX`. On utilise `saturating_add` par sûreté : un débordement
+/// silencieux vaut mieux qu'un panic dans du code consensus-critical, et
+/// ce cas ne peut se produire que si le calcul amont a un bug.
+#[must_use]
+pub fn build_receipts(applied: &[AppliedTransaction]) -> Vec<Receipt> {
+    let mut out = Vec::with_capacity(applied.len());
+    let mut cumulative: u64 = 0;
+    for a in applied {
+        cumulative = cumulative.saturating_add(a.gas_used);
+        out.push(Receipt {
+            tx_hash: a.tx_hash,
+            status: ReceiptStatus::Success,
+            cumulative_gas_used: cumulative,
+            gas_used: a.gas_used,
+            contract_address: None,
+            logs_bloom: LogsBloom::EMPTY,
+            logs: Vec::<EvmLog>::new(),
+        });
+    }
+    out
+}
+
+/// Calcule la racine MPT Ethereum-compatible des receipts du bloc.
+///
+/// ## Formule normative (V1)
+///
+/// ```text
+/// key_i   = RLP(i)
+/// value_i = canonical_sango_receipt_bytes(i)
+/// ```
+///
+/// Le format canonique d'un receipt est celui de `sango-codec` (pas RLP).
+/// Le MPT est Ethereum-compatible, mais la **valeur** de chaque feuille
+/// est le receipt Sango encodé tel quel — cohérent avec la décision de 3a
+/// pour les transactions natives.
+#[must_use]
+pub fn compute_receipt_root(receipts: &[Receipt]) -> Hash32 {
+    let values: Vec<Vec<u8>> = receipts.iter().map(|r| r.encode_to_vec()).collect();
+    sango_mpt::transaction_root(&values)
+}
+
+// --- EVM state root --------------------------------------------------------
+
+/// Calcule la racine MPT Ethereum d'un état EVM.
+///
+/// ## Contrat protocolaire
+///
+/// ```text
+/// compute_evm_state_root(state) = state.state_root()
+/// ```
+///
+/// **Pas de branche `is_empty`** : `EvmState::state_root()` retourne
+/// naturellement `sango_mpt::empty_root()` lorsque le trie des comptes est
+/// vide (`mpt_root(&[]) == empty_root()`). Une **unique** définition,
+/// sans branche spéciale.
+///
+/// ## Usage en V1
+///
+/// En V1, aucun compte EVM n'existe. `apply_block` appelle donc
+/// `compute_evm_state_root(&EvmState::new())`, qui retourne
+/// `empty_root()`. Quand l'EVM sera branché (4c), on passera un
+/// `EvmState` peuplé — **sans changement de formule**.
+#[must_use]
+pub fn compute_evm_state_root(state: &sango_evm::EvmState) -> Hash32 {
+    state.state_root()
+}
+
+/// Racine MPT Ethereum de l'état EVM **vide**.
+///
+/// Égale à `sango_mpt::empty_root()` = `Keccak256(RLP(""))`.
+///
+/// **Ce n'est PAS `Hash32::ZERO`.** Voir [`compute_evm_state_root`] pour
+/// la formule normative.
+#[must_use]
+pub fn empty_evm_state_root() -> Hash32 {
+    compute_evm_state_root(&sango_evm::EvmState::new())
 }
 
 // --- API mono-transaction --------------------------------------------------
@@ -262,8 +439,17 @@ pub fn apply_block_transfers(
 ///
 /// - `TX_TRANSFER` et les `TxKind` de staking sont supportés.
 /// - Les `TX_CONTRACT_*` seront gérés par la couche EVM (à venir).
-/// - `receipt_root` est un placeholder `Hash32::ZERO` tant que le MPT EVM
-///   n'est pas implémenté.
+/// - `transaction_root` est calculé via un MPT Ethereum-compatible
+///   (voir [`compute_transaction_root`]).
+/// - `receipt_root` est calculé via un MPT Ethereum-compatible à partir
+///   des receipts construits par [`build_receipts`].
+///
+/// ## Déterminisme
+///
+/// Le `native_state_root` produit **doit** être identique sur tous les
+/// nœuds. Les sous-systèmes non déterministes (downtime, rewards) sont
+/// conditionnés par `ctx.downtime_enabled` / `ctx.rewards_enabled`. La
+/// libération des unbondings est toujours active (déterministe).
 pub fn apply_block(
     state: &mut NativeState,
     block: &Block,
@@ -291,13 +477,18 @@ pub fn apply_block(
         }
     }
 
-    // 0. Suivi de la participation (downtime).
+    // 0b. Suivi de la participation (downtime).
     //
-    // Déterministe : tous les nœuds voient le même CommitCertificate (donc
-    // les mêmes participants) et évaluent la même fenêtre au même moment.
-    // Fait **avant** l'application des txs pour utiliser l'ensemble actif
-    // tel qu'il était au début du bloc.
-    {
+    // **Désactivé par défaut** : en V1, `participants` provient du
+    // `CommitCertificate` local, dont la composition exacte (quels
+    // precommits ont été observés) peut différer d'un nœud à l'autre à
+    // cause du timing réseau. L'activer rendrait l'exécution non
+    // déterministe et ferait diverger les `state_root` — bloquant le
+    // consensus.
+    //
+    // À réactiver le jour où le certificat est **inclus dans le bloc**
+    // (donc identique partout).
+    if ctx.downtime_enabled {
         let active: Vec<NativeAddress> = state
             .all_validators()
             .into_iter()
@@ -310,6 +501,20 @@ pub fn apply_block(
         }
     }
 
+    // 0c. Libérer les unbondings mûrs.
+    //
+    // **Déterministe** : dépend uniquement de `ctx.current_time` (issu du
+    // header du bloc, donc identique sur tous les nœuds) et de l'état.
+    // Aucun flag nécessaire.
+    //
+    // Doit s'exécuter **avant** les transactions pour que les fonds
+    // libérés soient disponibles dans le même bloc si un tx veut les
+    // utiliser.
+    if let Err(e) = crate::unbonding::process_matured_unbondings(state, ctx) {
+        *state = snapshot;
+        return Err(e);
+    }
+
     // 1. Appliquer les transactions (sans toucher aux compteurs globaux).
     let mut applied: Vec<AppliedTransaction> = Vec::with_capacity(validated.len());
     let mut total_gas_used: u64 = 0;
@@ -318,8 +523,16 @@ pub fn apply_block(
     let mut total_burned: u128 = 0;
 
     for (tx, v) in block.transactions.iter().zip(validated.iter()) {
-        let gas_used = crate::staking::gas_for(tx.tx_kind).unwrap_or(NATIVE_TRANSFER_GAS);
-        match apply_tx_no_rollback(state, tx, v, gas_used, ctx) {
+        // 4c.3.1b : seules les transactions natives sont exécutables.
+        // Les txs EVM sont acceptées dans le **format** du bloc mais leur
+        // exécution sera branchée en 4c.3.3 (`evm_transact`).
+        let Tx::Native(native_tx) = tx else {
+            *state = snapshot;
+            return Err(ApplyError::UnsupportedTxVariant);
+        };
+        let gas_used =
+            crate::staking::gas_for(native_tx.tx_kind).unwrap_or(NATIVE_TRANSFER_GAS);
+        match apply_tx_no_rollback(state, native_tx, v, gas_used, ctx) {
             Ok(a) => {
                 total_gas_used = total_gas_used
                     .checked_add(a.gas_used)
@@ -353,32 +566,30 @@ pub fn apply_block(
     }
 
     // 2bis. Distribuer les récompenses PoS au proposeur.
-    let pos_rewards = match crate::rewards::distribute_block_rewards(state, ctx.fee_recipient, ctx)
-    {
-        Ok(r) => r,
-        Err(e) => {
-            *state = snapshot;
-            return Err(e);
+    //
+    // Comme pour le downtime, ceci doit rester **désactivé** tant que la
+    // distribution dépend de données locales (pool calculé localement,
+    // participants locaux). Sinon chaque nœud distribue différemment et
+    // les `state_root` divergent.
+    let pos_rewards = if ctx.rewards_enabled {
+        match crate::rewards::distribute_block_rewards(state, ctx.fee_recipient, ctx) {
+            Ok(r) => r,
+            Err(e) => {
+                *state = snapshot;
+                return Err(e);
+            }
         }
+    } else {
+        None
     };
 
-    // 3. Générer les receipts (cumulative_gas_used par ordre).
-    let mut receipts = Vec::with_capacity(applied.len());
-    let mut cumulative: u64 = 0;
-    for a in &applied {
-        cumulative = cumulative
-            .checked_add(a.gas_used)
-            .ok_or(ApplyError::TotalGasUsedOverflow)?;
-        receipts.push(Receipt {
-            tx_hash: a.tx_hash,
-            status: ReceiptStatus::Success,
-            cumulative_gas_used: cumulative,
-            gas_used: a.gas_used,
-            contract_address: None,
-            logs_bloom: LogsBloom::EMPTY,
-            logs: Vec::<EvmLog>::new(),
-        });
-    }
+    // 3. Générer les receipts via `build_receipts`.
+    //
+    // Cette fonction est partagée avec le proposeur (voir
+    // `Node::prepare_block_from_candidates`), ce qui garantit que les
+    // deux chemins produisent exactement les mêmes receipts — donc le
+    // même `receipt_root`.
+    let receipts = build_receipts(&applied);
 
     // 4. Offre courante après application.
     let total_burned_after = state.total_burned();
@@ -389,6 +600,28 @@ pub fn apply_block(
                 initial: ctx.initial_supply.base_units(),
                 burned: total_burned_after.base_units(),
             })?;
+
+    // 5. Racine MPT Ethereum des transactions du bloc.
+    //
+    // Formule V1 (natif uniquement) : key_i = RLP(i),
+    // value_i = canonical_sango_tx_bytes. L'ordre des txs est
+    // consensus-critical, donc on l'itère tel quel.
+    let transaction_root = compute_transaction_root(&block.transactions);
+
+    // 6. Racine MPT Ethereum des receipts du bloc.
+    //
+    // Formule V1 : key_i = RLP(i), value_i = canonical_sango_receipt_bytes.
+    let receipt_root = compute_receipt_root(&receipts);
+
+    // 7. Racines d'état.
+    //
+    // `native_state_root` : SMT Sango (déjà disponible).
+    // `evm_state_root`    : MPT Ethereum — vide en V1.
+    // `state_root`        : combinaison Sango-specific définie dans
+    //                       `sango_state::global_state_root`.
+    let native_state_root = state.native_state_root();
+    let evm_state_root = compute_evm_state_root(&sango_evm::EvmState::new());
+    let state_root = sango_state::global_state_root(native_state_root, evm_state_root);
 
     Ok(BlockExecutionResult {
         apply_result: BlockApplyResult {
@@ -405,9 +638,11 @@ pub fn apply_block(
         total_burned_after,
         total_gas_used_after: state.total_gas_used(),
         current_supply,
-        native_state_root: state.native_state_root(),
-        // TODO(MPT): à remplacer par le vrai MPT des receipts.
-        receipt_root: Hash32::ZERO,
+        native_state_root,
+        evm_state_root,
+        state_root,
+        transaction_root,
+        receipt_root,
         pos_rewards,
     })
 }
@@ -639,7 +874,19 @@ mod tests {
             initial_supply: Amount::from_sango(1_000_000_000).unwrap(),
             current_time: 1_700_000_000,
             current_height: 0,
+            // Désactivés par défaut : c'est ce qui rend `apply_block`
+            // déterministe dans le test multi-nœuds.
             rewards_enabled: false,
+            downtime_enabled: false,
+        }
+    }
+
+    /// Variante activant explicitement le suivi de participation
+    /// (uniquement pour les tests unitaires).
+    fn exec_ctx_with_downtime() -> ExecutionContext {
+        ExecutionContext {
+            downtime_enabled: true,
+            ..exec_ctx()
         }
     }
 
@@ -694,7 +941,6 @@ mod tests {
         assert_eq!(state.nonce_of(&sender), 1);
         assert_eq!(state.public_key_of(&sender), Some(pk));
 
-        // Compteurs globaux mis à jour.
         assert_eq!(state.total_burned(), Amount::from_base_units(25_200));
         assert_eq!(state.total_gas_used(), NATIVE_TRANSFER_GAS);
     }
@@ -826,7 +1072,6 @@ mod tests {
         assert_eq!(result.total_burned, 2 * 25_200);
         assert_eq!(state.nonce_of(&s1), 1);
         assert_eq!(state.nonce_of(&s2), 1);
-        // Compteurs agrégés sur le bloc.
         assert_eq!(state.total_burned(), Amount::from_base_units(2 * 25_200));
         assert_eq!(state.total_gas_used(), 2 * NATIVE_TRANSFER_GAS);
     }
@@ -904,7 +1149,9 @@ mod tests {
         assert_eq!(r.current_supply, exec_ctx().initial_supply);
         assert_eq!(r.total_burned_after, Amount::ZERO);
         assert_eq!(r.total_gas_used_after, 0);
-        assert_eq!(r.receipt_root, Hash32::ZERO);
+        // Un bloc vide a pour `receipt_root` la racine MPT vide,
+        // PAS `Hash32::ZERO`.
+        assert_eq!(r.receipt_root, compute_receipt_root(&[]));
     }
 
     #[test]
@@ -930,14 +1177,13 @@ mod tests {
         let block = Block {
             header: sample_header(),
             evidences: Vec::new(),
-            transactions: vec![tx1.clone(), tx2.clone()],
+            transactions: vec![Tx::Native(tx1.clone()), Tx::Native(tx2.clone())],
         };
         let r = apply_block(&mut state, &block, &[v1, v2], &exec_ctx(), &[]).unwrap();
 
         assert_eq!(r.receipts.len(), 2);
         assert_eq!(r.receipts[0].tx_hash, tx1.hash());
         assert_eq!(r.receipts[1].tx_hash, tx2.hash());
-        // cumulative_gas_used croissant.
         assert_eq!(r.receipts[0].cumulative_gas_used, NATIVE_TRANSFER_GAS);
         assert_eq!(r.receipts[1].cumulative_gas_used, 2 * NATIVE_TRANSFER_GAS);
         assert_eq!(r.receipts[0].gas_used, NATIVE_TRANSFER_GAS);
@@ -968,7 +1214,7 @@ mod tests {
         let block = Block {
             header: sample_header(),
             evidences: Vec::new(),
-            transactions: vec![tx],
+            transactions: vec![Tx::Native(tx)],
         };
         let initial = exec_ctx().initial_supply;
         let r = apply_block(&mut state, &block, &[v], &exec_ctx(), &[]).unwrap();
@@ -1011,7 +1257,7 @@ mod tests {
         let block = Block {
             header: sample_header(),
             evidences: Vec::new(),
-            transactions: vec![tx1, tx2],
+            transactions: vec![Tx::Native(tx1), Tx::Native(tx2)],
         };
         let err = apply_block(&mut state, &block, &[v1, v2], &exec_ctx(), &[]).unwrap_err();
         assert!(matches!(err, ApplyError::InsufficientBalance { .. }));
@@ -1050,6 +1296,18 @@ mod tests {
     }
 
     #[test]
+    fn empty_evm_state_root_is_mpt_empty_root() {
+        assert_eq!(empty_evm_state_root(), sango_mpt::empty_root());
+        // Pas d'ambiguïté : ce n'est PAS Hash32::ZERO.
+        assert_ne!(empty_evm_state_root(), Hash32::ZERO);
+        // `compute_evm_state_root` délègue à `EvmState::state_root()`.
+        assert_eq!(
+            compute_evm_state_root(&sango_evm::EvmState::new()),
+            sango_mpt::empty_root()
+        );
+    }
+
+    #[test]
     fn apply_block_state_root_matches_native_root() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let sender = derive_native_address(&kp.public_key());
@@ -1064,16 +1322,20 @@ mod tests {
         let block = Block {
             header: sample_header(),
             evidences: Vec::new(),
-            transactions: vec![tx],
+            transactions: vec![Tx::Native(tx)],
         };
         let r = apply_block(&mut state, &block, &[v], &exec_ctx(), &[]).unwrap();
 
         assert_eq!(r.native_state_root, state.native_state_root());
+        assert_eq!(r.evm_state_root, empty_evm_state_root());
+        assert_eq!(
+            r.state_root,
+            sango_state::global_state_root(r.native_state_root, r.evm_state_root)
+        );
     }
 
     #[test]
     fn apply_block_integrated_downtime() {
-        // Vérifie que apply_block déclenche bien le suivi de participation.
         use sango_types::ValidatorInfo;
 
         let kp_a = NativeKeypair::from_seed([0xa1; 32]);
@@ -1098,7 +1360,6 @@ mod tests {
         state.set_validator(mk(a, kp_a.public_key()));
         state.set_validator(mk(b, kp_b.public_key()));
 
-        // Bloc vide, seul A participe.
         let mut h = sample_header();
         h.height = sango_primitives::Height::new(1);
         let block = Block {
@@ -1107,7 +1368,7 @@ mod tests {
             transactions: Vec::new(),
         };
 
-        let ctx = exec_ctx();
+        let ctx = exec_ctx_with_downtime();
         apply_block(&mut state, &block, &[], &ctx, &[a]).unwrap();
 
         let info_a = state.get_validator(&a).unwrap();
@@ -1144,8 +1405,51 @@ mod tests {
             evidences: Vec::new(),
             transactions: Vec::new(),
         };
-        apply_block(&mut state, &block, &[], &exec_ctx(), &[]).unwrap();
+        let ctx = exec_ctx_with_downtime();
+        apply_block(&mut state, &block, &[], &ctx, &[]).unwrap();
 
         assert_eq!(state.get_validator(&addr).unwrap().downtime_missed, 1);
+    }
+
+    /// Vérifie explicitement le déterminisme.
+    ///
+    /// Deux `apply_block` sur le même bloc, avec les flags par défaut
+    /// (`downtime_enabled == false`, `rewards_enabled == false`),
+    /// produisent **exactement** le même `native_state_root`.
+    #[test]
+    fn apply_block_is_deterministic_with_defaults() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let sender = derive_native_address(&kp.public_key());
+
+        let mk_state = || {
+            let mut s = NativeState::new();
+            s.credit(sender, Amount::from_base_units(1_000_000))
+                .unwrap();
+            s
+        };
+
+        let mut state_a = mk_state();
+        let mut state_b = mk_state();
+
+        let tx = bootstrap_tx(&kp, 0, 100);
+        let v = validate(&state_a, &tx).unwrap();
+        let block = Block {
+            header: sample_header(),
+            evidences: Vec::new(),
+            transactions: vec![Tx::Native(tx)],
+        };
+
+        // Variante A : participants = [sender].
+        let ra = apply_block(&mut state_a, &block, std::slice::from_ref(&v), &exec_ctx(), &[sender]).unwrap();
+
+        // Variante B : participants = [] (comme si un autre nœud avait vu
+        // un `CommitCertificate` différent). Doit donner le **même** root,
+        // car le downtime est désactivé.
+        let rb = apply_block(&mut state_b, &block, &[v], &exec_ctx(), &[]).unwrap();
+
+        assert_eq!(
+            ra.native_state_root, rb.native_state_root,
+            "avec downtime désactivé, les participants ne doivent PAS influencer le root"
+        );
     }
 }

@@ -14,6 +14,11 @@ pub enum MetadataKey {
     ChainTip = 0x03,
     /// Cumul des récompenses PoS distribuées (base units, `u128` LE).
     TotalPosRewards = 0x04,
+    /// Prochain identifiant d'unbonding (`u64` LE).
+    ///
+    /// Compteur monotone. Chaque `unbond` / `undelegate` alloue un id et
+    /// écrit un `PendingUnbonding` sous `Namespace::Unbonding, id.to_be_bytes()`.
+    NextUnbondingId = 0x05,
 }
 
 impl MetadataKey {
@@ -35,6 +40,7 @@ mod tests {
             MetadataKey::TotalGasUsed,
             MetadataKey::ChainTip,
             MetadataKey::TotalPosRewards,
+            MetadataKey::NextUnbondingId,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate().skip(i + 1) {
@@ -49,5 +55,6 @@ mod tests {
         assert_eq!(MetadataKey::TotalGasUsed.tag(), 0x02);
         assert_eq!(MetadataKey::ChainTip.tag(), 0x03);
         assert_eq!(MetadataKey::TotalPosRewards.tag(), 0x04);
+        assert_eq!(MetadataKey::NextUnbondingId.tag(), 0x05);
     }
 }

@@ -1,10 +1,11 @@
 //! Implémentation de `sango_rpc::RpcBackend` pour un nœud Sango.
 //!
 //! Le backend lit l'état via un [`NodeHandle`] partagé avec le `Driver`.
-//! `send_transaction` pousse dans le mempool.
+//! `send_transaction` pousse dans le mempool ; `eth_call` exécute une
+//! transaction EVM read-only sur un clone de l'`EvmState`.
 
-use sango_primitives::{Amount, ChainId32, Hash32, NativeAddress};
-use sango_rpc::{RpcBackend, RpcError};
+use sango_primitives::{Amount, ChainId32, EvmAddress, Hash32, NativeAddress, U256};
+use sango_rpc::{EthCallRequest, EthCallResult, RpcBackend, RpcError};
 use sango_types::{Block, NativeAccount, Transaction, ValidatorInfo};
 
 use crate::base_fee::INITIAL_BASE_FEE;
@@ -30,6 +31,8 @@ impl NodeBackend {
 }
 
 impl RpcBackend for NodeBackend {
+    // --- Natif -------------------------------------------------------------
+
     fn chain_id(&self) -> ChainId32 {
         self.handle.with_node(|n| n.chain_id())
     }
@@ -56,18 +59,65 @@ impl RpcBackend for NodeBackend {
     }
 
     fn send_transaction(&self, tx: &Transaction) -> Result<Hash32, RpcError> {
-        // (1) Contexte : base fee courante + nonce du sender.
         let (base_fee, sender_nonce) = self.handle.with_node(|n| {
             let bf = n.expected_base_fee().unwrap_or(INITIAL_BASE_FEE);
             let sn = n.state().nonce_of(&tx.sender);
             (bf, sn)
         });
 
-        // (2) Admission au mempool.
         self.handle.with_mempool(|pool| {
             pool.add(tx.clone(), base_fee, sender_nonce)
                 .map_err(|e| RpcError::TransactionRejected(e.to_string()))
         })
+    }
+
+    // --- EVM ---------------------------------------------------------------
+
+    fn eth_chain_id(&self) -> u64 {
+        self.handle.with_node(|n| n.evm_chain_id())
+    }
+
+    fn eth_gas_price(&self) -> U256 {
+        self.handle.with_node(|n| {
+            let base_fee = n.expected_base_fee().unwrap_or(INITIAL_BASE_FEE);
+            U256::from(base_fee)
+        })
+    }
+
+    fn eth_get_balance(&self, address: &EvmAddress) -> U256 {
+        self.handle.with_node(|n| n.evm_get_balance(address))
+    }
+
+    fn eth_get_transaction_count(&self, address: &EvmAddress) -> u64 {
+        self.handle.with_node(|n| n.evm_get_nonce(address))
+    }
+
+    fn eth_get_code(&self, address: &EvmAddress) -> Vec<u8> {
+        self.handle.with_node(|n| n.evm_get_code(address))
+    }
+
+    fn eth_get_storage_at(&self, address: &EvmAddress, slot: U256) -> U256 {
+        self.handle.with_node(|n| n.evm_get_storage(address, slot))
+    }
+
+    fn eth_call(&self, req: &EthCallRequest) -> Result<EthCallResult, RpcError> {
+        let outcome = self.handle.with_node(|n| {
+            n.evm_call_readonly(req)
+                .map_err(|e| RpcError::Internal(format!("evm_call: {e}")))
+        })?;
+        Ok(EthCallResult {
+            success: outcome.success,
+            output: outcome.output,
+            gas_used: outcome.gas_used,
+        })
+    }
+
+    fn eth_estimate_gas(&self, req: &EthCallRequest) -> Result<u64, RpcError> {
+        let outcome = self.handle.with_node(|n| {
+            n.evm_call_readonly(req)
+                .map_err(|e| RpcError::Internal(format!("evm_estimate: {e}")))
+        })?;
+        Ok(outcome.gas_used)
     }
 }
 
@@ -76,7 +126,3 @@ impl std::fmt::Debug for NodeBackend {
         f.debug_struct("NodeBackend").finish_non_exhaustive()
     }
 }
-
-// Marqueur pour éviter les imports inutilisés en cas de refactor.
-#[allow(dead_code)]
-fn _marker(_: Hash32) {}

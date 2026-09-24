@@ -3,12 +3,15 @@
 use std::path::Path;
 
 use sango_codec::{Decode, Encode};
+use sango_evm::{evm_transact, EvmBlockEnv, EvmOutcome, EvmState, TxEnvExtras};
 use sango_exec::{apply_block as exec_apply_block, BlockExecutionResult, ExecutionContext};
-use sango_primitives::{Amount, ChainId32, Epoch, Hash32, Height, NativeAddress, Round};
+use sango_primitives::{
+    Amount, ChainId32, Epoch, EvmAddress, Hash32, Height, NativeAddress, Round, U256,
+};
 use sango_state::{MetadataKey, NativeState};
 use sango_storage::{metadata_key, Batch, Column, Storage};
 use sango_tx::{validate_transaction, SenderInfo, ValidatedTransaction, ValidationContext};
-use sango_types::{Block, BlockHeader, ChainTip, Transaction};
+use sango_types::{Block, BlockHeader, ChainTip, Transaction, Tx};
 
 use crate::base_fee::{next_base_fee, INITIAL_BASE_FEE};
 use crate::diff::diff_state;
@@ -18,7 +21,17 @@ use crate::error::NodeError;
 pub struct Node {
     storage: Storage,
     state: NativeState,
+    /// État EVM (accounts + storage + code).
+    ///
+    /// En V1, aucun bloc ne contient encore de transaction EVM exécutée,
+    /// donc cet état reste vide. Il est exposé aux RPC `eth_*` (lecture)
+    /// et sera peuplé en 4c.3 quand EVM sera branché dans `apply_block`.
+    evm: EvmState,
     chain_id: ChainId32,
+    /// Chain ID EVM (`u64`), pour les RPC `eth_*` et le bridge revm.
+    ///
+    /// Valeur par défaut : `0x53414e47_4f` (« SANGO » en ASCII).
+    evm_chain_id: u64,
     initial_supply: Amount,
     tip: Option<ChainTip>,
     rewards_enabled: bool,
@@ -61,7 +74,9 @@ impl Node {
         Ok(Self {
             storage,
             state,
+            evm: EvmState::new(),
             chain_id,
+            evm_chain_id: DEFAULT_EVM_CHAIN_ID,
             initial_supply,
             tip,
             rewards_enabled: false,
@@ -171,18 +186,22 @@ impl Node {
     ///
     /// ## Comportement
     ///
-    /// - Clone l'état courant pour **ne pas le muter**.
-    /// - Valide puis applique chaque candidate sur la copie.
-    /// - **S'arrête au premier échec** : la dépendance de nonce impose
-    ///   qu'un tx en échec bloque les suivants.
-    /// - Construit un `Block` avec les txs acceptées et le gas cumulé.
+    /// 1. **Pré-filtrage** tx par tx sur un clone jetable de l'état : ne
+    ///    garde que celles qui passent validation + application.
+    /// 2. **Simulation** complète du bloc candidat via `apply_block` sur
+    ///    un **second** clone jetable. Cela donne les vraies roots
+    ///    (`transaction_root`, `receipt_root`, `state_root`) calculées
+    ///    exactement comme le fera le validateur.
+    /// 3. **Construction** du header final avec ces roots.
     ///
-    /// ## Placeholders V1
+    /// ## Roots V1
     ///
-    /// - `transaction_root`, `state_root`, `receipt_root` restent à
-    ///   `Hash32::ZERO` tant que les MPT ne sont pas implémentés.
-    /// - `Node::apply_block` ne vérifie **pas** ces trois roots (limite
-    ///   documentée).
+    /// - `transaction_root` : MPT Ethereum-compatible
+    ///   (`RLP(i) → canonical_sango_tx_bytes`).
+    /// - `receipt_root` : MPT Ethereum-compatible
+    ///   (`RLP(i) → canonical_sango_receipt_bytes`).
+    /// - `state_root` : `Keccak256("SANGO/STATE/ROOT/V1" || native || evm)`
+    ///   avec `evm_state_root = empty_evm_state_root()` en V1.
     ///
     /// Le `Vec<ValidatedTransaction>` retourné correspond 1:1 aux txs du
     /// bloc, dans le même ordre.
@@ -200,8 +219,9 @@ impl Node {
     ) -> (Block, Vec<ValidatedTransaction>) {
         use sango_exec::{apply_tx_no_rollback, gas_for, ExecutionContext, NATIVE_TRANSFER_GAS};
 
-        let mut trial = self.state.clone();
-
+        // ------------------------------------------------------------------
+        // Phase 1 — pré-filtrage tx par tx.
+        // ------------------------------------------------------------------
         let (parent_hash, height) = match self.tip {
             Some(t) => (t.block_hash, t.height.get() + 1),
             None => (Hash32::ZERO, 0),
@@ -210,12 +230,12 @@ impl Node {
             .expected_base_fee()
             .unwrap_or(crate::base_fee::INITIAL_BASE_FEE);
 
+        let mut trial_filter = self.state.clone();
         let mut accepted: Vec<Transaction> = Vec::new();
         let mut validated: Vec<ValidatedTransaction> = Vec::new();
-        let mut total_gas: u64 = 0;
 
         for tx in candidates.into_iter().take(max_txs) {
-            let sender = Self::sender_info_from_state(&trial, tx.sender);
+            let sender = Self::sender_info_from_state(&trial_filter, tx.sender);
             let vctx = ValidationContext {
                 expected_chain_id: self.chain_id,
                 base_fee,
@@ -234,36 +254,87 @@ impl Node {
                 current_time: timestamp,
                 current_height: height,
                 rewards_enabled: self.rewards_enabled,
+                downtime_enabled: false,
             };
-            if apply_tx_no_rollback(&mut trial, &tx, &v, gas_used, &exec_ctx).is_err() {
+            if apply_tx_no_rollback(&mut trial_filter, &tx, &v, gas_used, &exec_ctx).is_err() {
                 break;
             }
-            total_gas = total_gas.saturating_add(gas_used);
             accepted.push(tx);
             validated.push(v);
         }
 
-        let block = Block {
-            header: BlockHeader {
-                version: sango_types::PROTOCOL_VERSION_V1,
-                chain_id: self.chain_id,
-                epoch,
-                height: Height::new(height),
-                round,
-                previous_block_hash: parent_hash,
-                timestamp,
-                proposer_address: proposer,
-                transaction_root: Hash32::ZERO,
-                state_root: Hash32::ZERO,
-                receipt_root: Hash32::ZERO,
-                gas_used: total_gas,
-                gas_limit: 30_000_000,
-                base_fee,
-            },
-            evidences,
-            transactions: accepted,
+        // ------------------------------------------------------------------
+        // Phase 2 — simulation complète via `apply_block` sur trial.
+        //
+        // Le header préliminaire n'est **pas** lu par `apply_block` (les
+        // roots ne sont utilisées ni en entrée ni en vérification pendant
+        // l'exécution). On met des valeurs nulles par sécurité.
+        //
+        // En V1, `downtime_enabled = false` → `participants` n'est pas lu.
+        // On passe un slice vide pour rester cohérent avec le chemin de
+        // validation (`apply_block` appelé avec `&[]` dans les tests).
+        // ------------------------------------------------------------------
+        let prelim_header = BlockHeader {
+            version: sango_types::PROTOCOL_VERSION_V1,
+            chain_id: self.chain_id,
+            epoch,
+            height: Height::new(height),
+            round,
+            previous_block_hash: parent_hash,
+            timestamp,
+            proposer_address: proposer,
+            transaction_root: Hash32::ZERO,
+            state_root: Hash32::ZERO,
+            receipt_root: Hash32::ZERO,
+            gas_used: 0,
+            gas_limit: 30_000_000,
+            base_fee,
         };
-        (block, validated)
+        let prelim_block = Block {
+            header: prelim_header,
+            evidences: evidences.clone(),
+            transactions: accepted.iter().cloned().map(Tx::Native).collect(),
+        };
+
+        let mut trial_sim = self.state.clone();
+        let sim_ctx = ExecutionContext {
+            chain_id: self.chain_id,
+            base_fee,
+            fee_recipient: proposer,
+            initial_supply: self.initial_supply,
+            current_time: timestamp,
+            current_height: height,
+            rewards_enabled: self.rewards_enabled,
+            downtime_enabled: false,
+        };
+        let sim_result = exec_apply_block(&mut trial_sim, &prelim_block, &validated, &sim_ctx, &[])
+            .expect("block simulation must succeed (txs were pre-filtered)");
+
+        // ------------------------------------------------------------------
+        // Phase 3 — header final avec les roots calculées par la simulation.
+        // ------------------------------------------------------------------
+        let final_header = BlockHeader {
+            version: sango_types::PROTOCOL_VERSION_V1,
+            chain_id: self.chain_id,
+            epoch,
+            height: Height::new(height),
+            round,
+            previous_block_hash: parent_hash,
+            timestamp,
+            proposer_address: proposer,
+            transaction_root: sim_result.transaction_root,
+            state_root: sim_result.state_root,
+            receipt_root: sim_result.receipt_root,
+            gas_used: sim_result.gas_used,
+            gas_limit: 30_000_000,
+            base_fee,
+        };
+        let final_block = Block {
+            header: final_header,
+            evidences,
+            transactions: accepted.into_iter().map(Tx::Native).collect(),
+        };
+        (final_block, validated)
     }
 
     /// Lit un bloc par hauteur.
@@ -291,15 +362,6 @@ impl Node {
     }
 
     /// Liste tous les validateurs enregistrés.
-    ///
-    /// Itère toutes les entrées d'état et filtre celles qui, une fois
-    /// décodées comme `ValidatorInfo`, ont un `key_hash` qui correspond
-    /// exactement à `state_key_hash(Validator, info.address)`. C'est une
-    /// vérification cryptographique : aucune ambiguïté possible avec un
-    /// compte ou une délégation.
-    ///
-    /// Complexité : `O(n)` sur le nombre d'entrées d'état. Acceptable pour
-    /// V1 (les validateurs sont peu nombreux et l'appel est rare).
     #[must_use]
     pub fn all_validators(&self) -> Vec<sango_types::ValidatorInfo> {
         use sango_state::{state_key_hash, Namespace};
@@ -316,9 +378,6 @@ impl Node {
     }
 
     /// Initialise l'état à partir d'un Genesis (comptes + validateurs).
-    ///
-    /// Refuse si le nœud a déjà un tip (déjà initialisé).
-    /// Écrit dans RocksDB en un seul batch atomique.
     pub fn initialize_genesis(
         &mut self,
         accounts: &[sango_types::NativeAccount],
@@ -328,7 +387,6 @@ impl Node {
             return Err(NodeError::AlreadyInitialized);
         }
 
-        // Appliquer sur une copie pour rester atomique.
         let mut trial = self.state.clone();
         for account in accounts {
             trial.set_account(*account);
@@ -337,7 +395,6 @@ impl Node {
             trial.set_validator(*v);
         }
 
-        // Diff → batch.
         let diff = diff_state(&self.state, &trial);
         let mut batch = Batch::new();
         for (k, v) in &diff.inserts {
@@ -361,7 +418,7 @@ impl Node {
         Ok(())
     }
 
-    /// Applique un bloc de bout en bout.    /// Applique un bloc de bout en bout.
+    /// Applique un bloc de bout en bout.
     ///
     /// ## Vérifications
     ///
@@ -369,12 +426,27 @@ impl Node {
     /// 2. `previous_block_hash` correspond au tip (ou `ZERO` si vierge).
     /// 3. `height` vaut `tip.height + 1` (ou `0`/`1` si vierge).
     /// 4. `base_fee` correspond au calcul EIP-1559.
-    /// 5. Chaque transaction est validée.
+    /// 5. `transaction_root` correspond au recalcul local via MPT
+    ///    Ethereum-compatible.
+    /// 6. `receipt_root` correspond au recalcul local via MPT
+    ///    Ethereum-compatible à partir des receipts d'exécution.
+    /// 7. `state_root` correspond au recalcul local
+    ///    `Keccak256("SANGO/STATE/ROOT/V1" || native || evm)` avec
+    ///    `evm_state_root = empty_evm_state_root()` en V1.
+    /// 8. Chaque transaction est validée.
     pub fn apply_block(
         &mut self,
         block: &Block,
         participants: &[NativeAddress],
     ) -> Result<BlockExecutionResult, NodeError> {
+        // (0) Guard d'idempotence.
+        let block_hash = block.hash();
+        if let Some(tip) = self.tip {
+            if tip.block_hash == block_hash {
+                return Err(NodeError::AlreadyApplied { hash: block_hash });
+            }
+        }
+
         // (1) chain_id.
         if block.header.chain_id != self.chain_id {
             return Err(NodeError::ChainIdMismatch);
@@ -409,16 +481,32 @@ impl Node {
             });
         }
 
+        // (3b) `transaction_root`.
+        let computed_tx_root = sango_exec::compute_transaction_root(&block.transactions);
+        if computed_tx_root != block.header.transaction_root {
+            return Err(NodeError::TransactionRootMismatch {
+                expected: computed_tx_root,
+                got: block.header.transaction_root,
+            });
+        }
+
         // (4) Validation par transaction.
+        //
+        // 4c.3.1b : seules les txs natives sont validées/exécutables. Les
+        // txs EVM sont acceptées dans le **format** du bloc mais leur
+        // validation + exécution arrivent en 4c.3.3.
         let mut validated = Vec::with_capacity(block.transactions.len());
         for (index, tx) in block.transactions.iter().enumerate() {
-            let sender = self.sender_info(tx.sender);
+            let Tx::Native(native) = tx else {
+                return Err(NodeError::UnsupportedTxVariant { index });
+            };
+            let sender = self.sender_info(native.sender);
             let vctx = ValidationContext {
                 expected_chain_id: self.chain_id,
                 base_fee: block.header.base_fee,
                 sender: &sender,
             };
-            let v = validate_transaction(tx, &vctx)
+            let v = validate_transaction(native, &vctx)
                 .map_err(|e| NodeError::Validation { index, source: e })?;
             validated.push(v);
         }
@@ -433,14 +521,35 @@ impl Node {
             current_time: block.header.timestamp,
             current_height: block.header.height.get(),
             rewards_enabled: self.rewards_enabled,
+            downtime_enabled: false,
         };
         let result = exec_apply_block(&mut self.state, block, &validated, &ctx, participants)?;
+
+        // (5b) Vérification du `receipt_root`.
+        if result.receipt_root != block.header.receipt_root {
+            self.state = state_before;
+            return Err(NodeError::ReceiptRootMismatch {
+                expected: result.receipt_root,
+                got: block.header.receipt_root,
+            });
+        }
+
+        // (5c) Vérification du `state_root` global.
+        //
+        // `state_root = Keccak256("SANGO/STATE/ROOT/V1" || native || evm)`.
+        // En V1 : `evm_state_root = empty_evm_state_root()`.
+        if result.state_root != block.header.state_root {
+            self.state = state_before;
+            return Err(NodeError::StateRootMismatch {
+                expected: result.state_root,
+                got: block.header.state_root,
+            });
+        }
 
         // (6) Diff.
         let diff = diff_state(&state_before, &self.state);
 
         // (7) Batch.
-        let block_hash = block.hash();
         let mut batch = Batch::new();
         batch.put(Column::Blocks, block_hash.as_bytes(), block.encode_to_vec());
         batch.put(
@@ -484,7 +593,6 @@ impl Node {
             result.total_gas_used_after.encode_to_vec(),
         );
 
-        // Tip.
         let new_tip = ChainTip {
             height: block.header.height,
             block_hash,
@@ -502,13 +610,143 @@ impl Node {
             return Err(NodeError::Storage(e));
         }
         if let Err(e) = self.storage.flush() {
+            self.state = state_before;
             return Err(NodeError::Storage(e));
         }
 
-        // (9) Mise à jour du tip en mémoire.
+        // (9) Tip.
         self.tip = Some(new_tip);
 
         Ok(result)
+    }
+}
+
+/// Chain ID EVM par défaut (« SANGO » en ASCII).
+pub const DEFAULT_EVM_CHAIN_ID: u64 = 0x53_41_4e_47_4f;
+
+impl Node {
+    // --- EVM --------------------------------------------------------------
+
+    /// Vue en lecture sur l'état EVM.
+    #[must_use]
+    pub fn evm(&self) -> &EvmState {
+        &self.evm
+    }
+
+    /// Vue en écriture sur l'état EVM. **Usage tests uniquement**.
+    #[doc(hidden)]
+    pub fn evm_mut_for_test(&mut self) -> &mut EvmState {
+        &mut self.evm
+    }
+
+    /// Chain ID EVM.
+    #[must_use]
+    pub fn evm_chain_id(&self) -> u64 {
+        self.evm_chain_id
+    }
+
+    /// Force le chain ID EVM (appelé depuis `main.rs` après chargement du
+    /// Genesis).
+    pub fn set_evm_chain_id(&mut self, id: u64) {
+        self.evm_chain_id = id;
+    }
+
+    /// Solde EVM d'une adresse.
+    #[must_use]
+    pub fn evm_get_balance(&self, addr: &EvmAddress) -> U256 {
+        self.evm.get_account(addr).map_or(U256::ZERO, |a| a.balance)
+    }
+
+    /// Nonce EVM d'une adresse.
+    #[must_use]
+    pub fn evm_get_nonce(&self, addr: &EvmAddress) -> u64 {
+        self.evm.get_account(addr).map_or(0, |a| a.nonce)
+    }
+
+    /// Bytecode EVM d'un compte.
+    #[must_use]
+    pub fn evm_get_code(&self, addr: &EvmAddress) -> Vec<u8> {
+        match self.evm.get_account(addr) {
+            Some(acc) => self
+                .evm
+                .get_code(&acc.code_hash)
+                .map(|s| s.to_vec())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Valeur d'un slot de storage EVM.
+    #[must_use]
+    pub fn evm_get_storage(&self, addr: &EvmAddress, slot: U256) -> U256 {
+        self.evm.get_storage(addr, slot)
+    }
+
+    /// Construit un `EvmBlockEnv` pour simuler la **prochaine** hauteur.
+    ///
+    /// Utilise `tip` (si présent) comme parent :
+    /// - `number = tip.height + 1` ;
+    /// - `timestamp = parent.timestamp + 1` ;
+    /// - `base_fee = next_base_fee(parent)` ;
+    /// - `prevrandao = derive_prevrandao(tip.block_hash)`.
+    pub fn evm_block_env(&self) -> Result<EvmBlockEnv, NodeError> {
+        let (number, timestamp, base_fee_u128, parent_hash) = match self.tip {
+            Some(t) => {
+                let parent = self.load_header(&t.block_hash)?;
+                (
+                    t.height.get() + 1,
+                    parent.timestamp.saturating_add(1),
+                    next_base_fee(&parent),
+                    t.block_hash,
+                )
+            }
+            None => (0, 1_700_000_000u64, INITIAL_BASE_FEE, Hash32::ZERO),
+        };
+        Ok(EvmBlockEnv {
+            chain_id: self.evm_chain_id,
+            number,
+            timestamp,
+            gas_limit: sango_types::EVM_GAS_LIMIT,
+            base_fee: U256::from(base_fee_u128),
+            coinbase: EvmAddress::ZERO,
+            prevrandao: sango_exec::derive_prevrandao(parent_hash),
+            parent_block_hash: parent_hash,
+        })
+    }
+
+    /// Exécution EVM read-only (`eth_call`).
+    ///
+    /// Clone `self.evm`, exécute la transaction, retourne le résultat —
+    /// **l'état n'est pas modifié**. Utilisé par `NodeBackend::eth_call`.
+    pub fn evm_call_readonly(
+        &self,
+        req: &sango_rpc::EthCallRequest,
+    ) -> Result<EvmOutcome, NodeError> {
+        let block_env = self.evm_block_env()?;
+        let effective_gas_price = req.gas_price.unwrap_or(block_env.base_fee);
+        let gas_limit = req.gas.unwrap_or(sango_types::EVM_GAS_LIMIT);
+        let nonce = self.evm_get_nonce(&req.from);
+
+        let tx = sango_types::EvmTx::Legacy {
+            chain_id: block_env.chain_id,
+            nonce,
+            gas_price: effective_gas_price,
+            gas_limit,
+            to: req.to,
+            value: req.value,
+            data: req.data.clone(),
+            y_parity: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let extras = TxEnvExtras {
+            caller: req.from,
+            effective_gas_price,
+        };
+
+        let mut trial = self.evm.clone();
+        evm_transact(&mut trial, &tx, &block_env, extras).map_err(NodeError::Evm)
     }
 }
 

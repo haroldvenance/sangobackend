@@ -211,3 +211,23 @@ impl Decode for bool {
         }
     }
 }
+
+// --- U256 (32 bytes big-endian, forme canonique Sango) ----------------------
+//
+// Note : l'encodage RLP d'un U256 (utilisé dans les MPT Ethereum) est
+// différent : byte string big-endian **minimal** (zéros de tête retirés).
+// Cette impl `Encode`/`Decode` produit une forme **canonique Sango** sur
+// 32 bytes fixes, adaptée au stockage interne et à l'usage hors RLP.
+
+impl Encode for sango_primitives::U256 {
+    fn encode(&self, enc: &mut Encoder) {
+        enc.write_raw(&self.to_be_bytes::<32>());
+    }
+}
+
+impl Decode for sango_primitives::U256 {
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, CodecError> {
+        let raw = dec.read_fixed::<32>()?;
+        Ok(Self::from_be_bytes(raw))
+    }
+}

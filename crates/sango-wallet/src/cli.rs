@@ -86,23 +86,30 @@ sango-wallet — wallet CLI pour Sango V1
 USAGE:
     sango-wallet [--rpc URL] [--keyfile PATH] <commande> [--flags...]
 
-COMMANDES:
+COMMANDES NATIVES:
     new                                 Génère un nouveau keyfile
-    address                             Affiche l'adresse locale
+    address                             Affiche l'adresse native
     pubkey                              Affiche la clé publique Ed25519
-    balance [ADDR]                      Affiche le solde (défaut : local)
-    nonce [ADDR]                        Affiche le nonce
-    info                                Informations sur la chaîne
-
-    send --to ADDR --amount SANGO       Transfert
-    stake --amount SANGO                Top-up self-stake
-    unstake --amount SANGO              Retrait de self-stake
-    delegate --validator ADDR --amount SANGO
-    undelegate --validator ADDR --amount SANGO
+    balance [ADDR]                      Solde natif
+    nonce [ADDR]                        Nonce natif
+    info                                Informations chaîne
+    send --to ADDR --amount SANGO       Transfert natif
+    stake|unstake --amount SANGO
+    delegate|undelegate --validator ADDR --amount SANGO
     claim --validator ADDR
     register-validator --commission-bps N --amount SANGO
     update-commission --new-bps N
     unjail
+
+COMMANDES EVM:
+    evm-new                             Attache une clé secp256k1
+    evm-address                         Adresse EVM locale
+    evm-balance [ADDR]                  Solde EVM (eth_getBalance)
+    evm-nonce [ADDR]                    Nonce EVM
+    evm-call --to ADDR [--data HEX] [--value N]
+    evm-sign --to ADDR --value N [--data HEX]
+             [--tx-type legacy|2930|1559] [--gas N]
+             Produit une tx EVM signée (hex) sans broadcaster
 
 OPTIONS GLOBALES:
     --rpc URL          Endpoint RPC (défaut : 127.0.0.1:8545)

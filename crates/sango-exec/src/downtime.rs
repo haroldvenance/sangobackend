@@ -146,6 +146,7 @@ mod tests {
             current_time: 1_700_000_000 + height * 5,
             current_height: height,
             rewards_enabled: false,
+            downtime_enabled: false,
         }
     }
 

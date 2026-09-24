@@ -27,6 +27,7 @@ sango-state.workspace = true
 sango-storage.workspace = true
 sango-tx.workspace = true
 sango-exec.workspace = true
+sango-evm.workspace = true
 sango-consensus.workspace = true
 sango-mempool.workspace = true
 sango-p2p.workspace = true

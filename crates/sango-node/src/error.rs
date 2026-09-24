@@ -23,6 +23,18 @@ pub enum NodeError {
         source: TxValidationError,
     },
 
+    /// Une transaction EVM a été rencontrée dans un bloc alors que le
+    /// pipeline EVM consensus-critical n'est pas encore branché.
+    ///
+    /// **4c.3.1b** : le format du bloc est hétérogène (`Vec<Tx>`), mais
+    /// `Node::apply_block` ne sait valider/exécuter que `Tx::Native`.
+    /// Le support EVM arrive en **4c.3.3**.
+    #[error("EVM tx at index {index} not yet supported by this node (4c.3.3)")]
+    UnsupportedTxVariant {
+        /// Index de la transaction dans le bloc.
+        index: usize,
+    },
+
     /// Erreur d'application d'un bloc.
     #[error("apply: {0}")]
     Apply(#[from] ApplyError),
@@ -73,6 +85,37 @@ pub enum NodeError {
         /// Base fee reçue.
         got: u128,
     },
+
+    /// Le `transaction_root` du header ne correspond pas au contenu réel
+    /// du bloc (MPT Ethereum recalculé localement).
+    #[error("transaction_root mismatch: expected {expected}, got {got}")]
+    TransactionRootMismatch {
+        /// Racine recalculée depuis les transactions du bloc.
+        expected: Hash32,
+        /// Racine déclarée dans le header.
+        got: Hash32,
+    },
+
+    /// Le `receipt_root` du header ne correspond pas aux receipts
+    /// d'exécution recalculés localement (MPT Ethereum).
+    #[error("receipt_root mismatch: expected {expected}, got {got}")]
+    ReceiptRootMismatch {
+        /// Racine recalculée depuis les receipts d'exécution.
+        expected: Hash32,
+        /// Racine déclarée dans le header.
+        got: Hash32,
+    },
+
+    /// Le `state_root` du header ne correspond pas au recalcul local
+    /// (`Keccak256("SANGO/STATE/ROOT/V1" || native || evm)`).
+    #[error("state_root mismatch: expected {expected}, got {got}")]
+    StateRootMismatch {
+        /// Racine recalculée depuis l'état natif + l'état EVM.
+        expected: Hash32,
+        /// Racine déclarée dans le header.
+        got: Hash32,
+    },
+
     /// Le nœud a déjà été initialisé (tip présent).
     #[error("node already initialized")]
     AlreadyInitialized,
@@ -80,4 +123,15 @@ pub enum NodeError {
     /// Erreur de configuration / genesis.
     #[error("config: {0}")]
     Config(#[from] crate::config::ConfigError),
+
+    /// Erreur d'exécution EVM (revm bridge).
+    #[error("evm: {0}")]
+    Evm(#[from] sango_evm::EvmError),
+
+    /// Le bloc a déjà été appliqué (le tip pointe dessus).
+    #[error("block already applied: {hash}")]
+    AlreadyApplied {
+        /// Hash du bloc déjà appliqué.
+        hash: sango_primitives::Hash32,
+    },
 }

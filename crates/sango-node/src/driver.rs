@@ -1,4 +1,17 @@
 //! Driver événementiel pour la participation au consensus.
+//!
+//! Le driver relie la machine d'état [`RoundRunner`] (pure) au monde
+//! extérieur : il exécute les [`Action`]s (broadcast P2P, application de
+//! bloc, persistance) et achemine les événements réseau vers le runner.
+//!
+//! ## Buffer de messages futurs
+//!
+//! Un pair peut commiter la hauteur `h` avant nous et diffuser la
+//! proposition `h+1` pendant qu'on termine `h`. Sans buffer, on jetterait
+//! ce message ([`is_stale`]) et on ne voterait jamais pour `h+1` — le
+//! consensus se bloquerait. Les messages reçus à une hauteur strictement
+//! supérieure à la hauteur courante sont donc mis de côté et réinjectés
+//! après chaque `reset_for_round` (voir `drain_buffered_for_current_height`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,6 +35,12 @@ pub const MAX_TXS_PER_BLOCK: usize = 1024;
 
 /// Nombre maximal d'itérations dans `process_actions`.
 const MAX_ACTION_LOOPS: usize = 32;
+
+/// Borne du buffer de messages futurs (anti-DoS mémoire).
+///
+/// Au-delà, les messages excédentaires sont silencieusement jetés : un
+/// pair malveillant ne peut pas saturer la mémoire du nœud.
+const MAX_BUFFERED_PER_KIND: usize = 1024;
 
 /// Message réseau sortant produit par le driver.
 #[derive(Clone, Debug)]
@@ -90,10 +109,22 @@ pub struct Driver {
     /// Service P2P (optionnel). Si `None`, le driver fonctionne en mode
     /// autonome (self-loopback pur, utile pour les tests).
     p2p: Option<P2pService>,
+
+    // --- Buffer des messages reçus à une hauteur future ---
+    //
+    // Un pair peut commit h avant nous et diffuser h+1 pendant qu'on
+    // termine h. Sans ce buffer, on jette le message et on ne vote
+    // jamais pour h+1 — le consensus se bloque.
+    buffered_proposals: Vec<Proposal>,
+    buffered_prevotes: Vec<Prevote>,
+    buffered_precommits: Vec<Precommit>,
 }
 
 impl Driver {
     /// Construit un driver à partir d'un `NodeHandle`.
+    ///
+    /// La hauteur initiale est `tip.height + 1` (ou `0` si aucun tip) :
+    /// le driver propose le **prochain** bloc, pas celui déjà appliqué.
     pub fn new(
         handle: NodeHandle,
         validator_set: ValidatorSet,
@@ -127,6 +158,9 @@ impl Driver {
             events: Vec::new(),
             pending_evidences: Vec::new(),
             p2p: None,
+            buffered_proposals: Vec::new(),
+            buffered_prevotes: Vec::new(),
+            buffered_precommits: Vec::new(),
         })
     }
 
@@ -144,7 +178,7 @@ impl Driver {
         &self.validator_set
     }
 
-    /// Hauteur courante.
+    /// Hauteur courante (celle du prochain bloc à proposer).
     #[must_use]
     pub fn current_height(&self) -> Height {
         self.runner.ctx().height
@@ -183,12 +217,10 @@ impl Driver {
 
     /// Attache un service P2P au driver.
     ///
-    /// Une fois attaché :
-    ///
-    /// - les messages sortants sont publiés sur le réseau **en plus**
-    ///   d'être poussés dans `outbox` (self-loopback local) ;
-    /// - `drain_p2p_events()` doit être appelé régulièrement pour
-    ///   consommer les messages entrants.
+    /// Une fois attaché, les messages sortants sont publiés sur le réseau
+    /// **en plus** d'être poussés dans `outbox` (self-loopback local), et
+    /// `drain_p2p_events()` doit être appelé régulièrement pour consommer
+    /// les messages entrants.
     ///
     /// Peut être appelé plusieurs fois ; le service précédent est remplacé.
     pub fn attach_p2p(&mut self, svc: P2pService) {
@@ -227,9 +259,6 @@ impl Driver {
                     NetworkMessage::Precommit(c) => {
                         let _ = self.handle_precommit(c);
                     }
-                    // Les transactions et blocs ne sont pas traités par
-                    // le driver consensus (ils le seront par le mempool
-                    // et le module de sync).
                     NetworkMessage::Transaction(_) | NetworkMessage::Block(_) => {}
                 },
                 P2pEvent::PeerConnected(peer) => {
@@ -258,6 +287,9 @@ impl Driver {
     /// le proposer.
     pub fn maybe_propose(&mut self) -> Result<(), DriverError> {
         if self.runner.step() != Step::Propose {
+            return Ok(());
+        }
+        if self.runner.current_proposal().is_some() {
             return Ok(());
         }
         if !self.runner.is_proposer()? {
@@ -291,7 +323,23 @@ impl Driver {
     }
 
     /// Traite une proposition reçue du réseau.
+    ///
+    /// **Buffering** : une proposition dont la hauteur dépasse la hauteur
+    /// courante est mise de côté jusqu'au commit en cours. Sans cela, on
+    /// la jetterait et le nœud ne voterait jamais pour la nouvelle
+    /// hauteur.
     pub fn handle_proposal(&mut self, p: Proposal) -> Result<(), DriverError> {
+        let current = self.runner.ctx().height;
+        if p.height > current {
+            if self.buffered_proposals.len() < MAX_BUFFERED_PER_KIND {
+                self.buffered_proposals.push(p);
+            }
+            return Ok(());
+        }
+        if p.height < current {
+            return Ok(());
+        }
+
         match self.runner.on_proposal(p) {
             Ok(()) => self.process_actions(),
             Err(e) if is_stale(&e) => Ok(()),
@@ -300,7 +348,20 @@ impl Driver {
     }
 
     /// Traite une prevote reçue du réseau.
+    ///
+    /// **Buffering** : même logique que pour les propositions.
     pub fn handle_prevote(&mut self, v: Prevote) -> Result<(), DriverError> {
+        let current = self.runner.ctx().height;
+        if v.height > current {
+            if self.buffered_prevotes.len() < MAX_BUFFERED_PER_KIND {
+                self.buffered_prevotes.push(v);
+            }
+            return Ok(());
+        }
+        if v.height < current {
+            return Ok(());
+        }
+
         match self.runner.on_prevote(v) {
             Ok(()) => self.process_actions(),
             Err(e) if is_stale(&e) => Ok(()),
@@ -314,7 +375,20 @@ impl Driver {
     }
 
     /// Traite un precommit reçu du réseau.
+    ///
+    /// **Buffering** : même logique que pour les propositions.
     pub fn handle_precommit(&mut self, c: Precommit) -> Result<(), DriverError> {
+        let current = self.runner.ctx().height;
+        if c.height > current {
+            if self.buffered_precommits.len() < MAX_BUFFERED_PER_KIND {
+                self.buffered_precommits.push(c);
+            }
+            return Ok(());
+        }
+        if c.height < current {
+            return Ok(());
+        }
+
         match self.runner.on_precommit(c) {
             Ok(()) => self.process_actions(),
             Err(e) if is_stale(&e) => Ok(()),
@@ -415,8 +489,7 @@ impl Driver {
                 match action {
                     Action::BroadcastProposal(p) => {
                         if let Some(p2p) = &self.p2p {
-                            let msg = NetworkMessage::Proposal(p.clone());
-                            let _ = p2p.broadcast_sync(msg);
+                            let _ = p2p.broadcast_sync(NetworkMessage::Proposal(p.clone()));
                         }
                         self.outbox.push(OutgoingMessage::Proposal(p));
                     }
@@ -451,8 +524,16 @@ impl Driver {
                             .map(|e| e.validator_address)
                             .collect();
 
-                        self.handle
-                            .with_node_mut(|n| n.apply_block(&block, &participants))?;
+                        match self
+                            .handle
+                            .with_node_mut(|n| n.apply_block(&block, &participants))
+                        {
+                            Ok(_) => {}
+                            // Déjà appliqué (double Committed via doublon P2P) :
+                            // ce n'est pas fatal, on continue.
+                            Err(NodeError::AlreadyApplied { .. }) => {}
+                            Err(e) => return Err(DriverError::Node(e)),
+                        }
                         self.prune_mempool();
                         self.events.push(DriverEvent::Committed {
                             height,
@@ -463,17 +544,56 @@ impl Driver {
                         let next_height = Height::new(height.get() + 1);
                         self.runner
                             .reset_for_round(next_height, Round::new(0), block_hash);
+
+                        // Vider le buffer : les messages reçus en avance
+                        // pour la nouvelle hauteur sont maintenant acceptables.
+                        self.drain_buffered_for_current_height();
                     }
                     Action::StartRound(new_round) => {
                         self.events.push(DriverEvent::RoundAdvanced(new_round));
                         let height = self.runner.ctx().height;
                         let parent_hash = self.runner.ctx().parent_hash;
                         self.runner.reset_for_round(height, new_round, parent_hash);
+                        self.drain_buffered_for_current_height();
                     }
                 }
             }
         }
         Err(DriverError::TooManyActions)
+    }
+
+    /// Réinjecte les messages bufferisés dont la hauteur correspond
+    /// maintenant à la hauteur courante. Les autres restent en attente.
+    fn drain_buffered_for_current_height(&mut self) {
+        let target = self.runner.ctx().height;
+
+        let proposals = std::mem::take(&mut self.buffered_proposals);
+        for p in proposals {
+            if p.height == target {
+                let _ = self.handle_proposal(p);
+            } else if p.height > target {
+                self.buffered_proposals.push(p);
+            }
+            // p.height < target : obsolète, on jette.
+        }
+
+        let prevotes = std::mem::take(&mut self.buffered_prevotes);
+        for v in prevotes {
+            if v.height == target {
+                let _ = self.handle_prevote(v);
+            } else if v.height > target {
+                self.buffered_prevotes.push(v);
+            }
+        }
+
+        let precommits = std::mem::take(&mut self.buffered_precommits);
+        for c in precommits {
+            if c.height == target {
+                let _ = self.handle_precommit(c);
+            } else if c.height > target {
+                self.buffered_precommits.push(c);
+            }
+        }
     }
 }
 
@@ -485,6 +605,9 @@ impl std::fmt::Debug for Driver {
             .field("step", &self.current_step())
             .field("local", &self.local_address())
             .field("pending_evidences", &self.pending_evidences.len())
+            .field("buffered_proposals", &self.buffered_proposals.len())
+            .field("buffered_prevotes", &self.buffered_prevotes.len())
+            .field("buffered_precommits", &self.buffered_precommits.len())
             .field("p2p_attached", &self.p2p.is_some())
             .finish_non_exhaustive()
     }
