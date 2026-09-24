@@ -59,3 +59,5 @@ sango-consensus = { path = "crates/sango-consensus" }
 sango-mempool = { path = "crates/sango-mempool" }
 sango-rpc = { path = "crates/sango-rpc" }
 sango-wallet = { path = "crates/sango-wallet" }
+k256 = { version = "0.13", features = ["ecdsa"] }
+rlp = "0.5"

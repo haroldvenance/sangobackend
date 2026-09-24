@@ -453,6 +453,21 @@ impl Driver {
         entries.into_iter().map(|e| e.tx).collect()
     }
 
+    /// Collecte les candidats EVM pour le prochain bloc.
+    ///
+    /// **4c.3.2 — no-op volontaire** : aucun bloc n'inclut encore de txs
+    /// EVM. Ce point d'entrée existe pour préparer le câblage 4c.3.3
+    /// (`Vec<Tx>` hétérogène) sans introduire de changement de consensus
+    /// maintenant.
+    ///
+    /// Retourne toujours `Vec::new()` tant que l'exécution EVM dans
+    /// `apply_block` n'est pas branchée.
+    #[must_use]
+    pub fn collect_evm_candidates(&self) -> Vec<sango_types::EvmTx> {
+        let _ = self.handle.with_evm_mempool(|p| p.len());
+        Vec::new()
+    }
+
     fn prune_mempool(&self) {
         let senders: Vec<NativeAddress> = self.handle.with_mempool(|pool| {
             let mut s = HashSet::new();

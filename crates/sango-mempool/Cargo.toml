@@ -10,3 +10,6 @@ repository.workspace = true
 thiserror.workspace = true
 sango-primitives.workspace = true
 sango-types.workspace = true
+sango-crypto.workspace = true
+k256.workspace = true
+rlp.workspace = true

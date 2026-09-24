@@ -23,7 +23,12 @@
 #![warn(missing_docs)]
 
 mod error;
+mod evm_pool;
 mod pool;
 
-pub use error::MempoolError;
+pub use error::{EvmMempoolError, MempoolError};
+pub use evm_pool::{
+    effective_priority_fee, max_fee_per_gas, max_priority_fee, recover_sender, tx_hash,
+    EvmMempool, EvmMempoolConfig, EvmMempoolEntry,
+};
 pub use pool::{Mempool, MempoolConfig, MempoolEntry};

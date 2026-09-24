@@ -4363,6 +4363,9 @@ dependencies = [
 name = "sango-mempool"
 version = "0.1.0"
 dependencies = [
+ "k256",
+ "rlp",
+ "sango-crypto",
  "sango-primitives",
  "sango-types",
  "thiserror 2.0.20",

@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex, RwLock};
 
-use sango_mempool::Mempool;
+use sango_mempool::{EvmMempool, Mempool};
 
 use crate::node::Node;
 
@@ -22,6 +22,10 @@ use crate::node::Node;
 pub struct NodeHandle {
     node: Arc<RwLock<Node>>,
     mempool: Arc<Mutex<Mempool>>,
+    /// Mempool EVM (4c.3.2). Séparé du mempool natif — voir la doc de
+    /// `sango_mempool::EvmMempool`. Aucun bloc n'inclut encore de txs
+    /// EVM (câblage en 4c.3.3).
+    evm_mempool: Arc<Mutex<EvmMempool>>,
 }
 
 impl NodeHandle {
@@ -33,6 +37,7 @@ impl NodeHandle {
         Self {
             node: Arc::new(RwLock::new(node)),
             mempool: Arc::new(Mutex::new(Mempool::default())),
+            evm_mempool: Arc::new(Mutex::new(EvmMempool::default())),
         }
     }
 
@@ -42,6 +47,7 @@ impl NodeHandle {
         Self {
             node: Arc::new(RwLock::new(node)),
             mempool: Arc::new(Mutex::new(mempool)),
+            evm_mempool: Arc::new(Mutex::new(EvmMempool::default())),
         }
     }
 
@@ -75,6 +81,15 @@ impl NodeHandle {
         F: FnOnce(&mut Mempool) -> R,
     {
         let mut guard = self.mempool.lock().expect("mempool lock poisoned");
+        f(&mut guard)
+    }
+
+    /// Accès exclusif au mempool EVM (4c.3.2).
+    pub fn with_evm_mempool<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut EvmMempool) -> R,
+    {
+        let mut guard = self.evm_mempool.lock().expect("evm mempool lock poisoned");
         f(&mut guard)
     }
 
