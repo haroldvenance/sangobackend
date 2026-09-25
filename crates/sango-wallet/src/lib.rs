@@ -35,11 +35,13 @@
 
 pub mod cli;
 pub mod commands;
+pub mod crypto;
 mod error;
 pub mod evm;
 pub mod keystore;
 pub mod rpc_client;
 
+pub use crypto::KdfParams;
 pub use error::WalletError;
 pub use keystore::KeyFile;
 pub use rpc_client::RpcClient;

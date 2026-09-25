@@ -111,6 +111,15 @@ COMMANDES EVM:
              [--tx-type legacy|2930|1559] [--gas N]
              Produit une tx EVM signée (hex) sans broadcaster
 
+GESTION DU KEYFILE:
+    keyfile-encrypt                     Chiffre le keyfile (v1 → v2, Argon2id)
+    keyfile-decrypt                     Déchiffre le keyfile (v2 → v1, ⚠️ clair)
+    keyfile-info                        Affiche les métadonnées sans déchiffrer
+
+SÉCURITÉ:
+    La passphrase peut être fournie via $SANGO_WALLET_PASSPHRASE
+    (recommandé : utiliser le prompt interactif).
+
 OPTIONS GLOBALES:
     --rpc URL          Endpoint RPC (défaut : 127.0.0.1:8545)
     --keyfile PATH     Chemin du keyfile (défaut : ~/.sango/wallet.json)

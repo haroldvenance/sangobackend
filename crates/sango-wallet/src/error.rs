@@ -57,4 +57,29 @@ pub enum WalletError {
     /// Chaîne attendue en hex mais reçue autre chose.
     #[error("invalid hex string: {0}")]
     InvalidHex(String),
+
+    // --- Chiffrement keyfile -----------------------------------------------
+    /// La passphrase fournie est incorrecte (échec de déchiffrement ou MAC).
+    #[error("invalid passphrase")]
+    InvalidPassphrase,
+
+    /// Le keyfile est déjà chiffré.
+    #[error("keyfile is already encrypted")]
+    AlreadyEncrypted,
+
+    /// Le keyfile n'est pas chiffré (v1 en clair).
+    #[error("keyfile is not encrypted")]
+    NotEncrypted,
+
+    /// Erreur Argon2 (paramètres invalides, mémoire insuffisante).
+    #[error("argon2: {0}")]
+    Argon2(String),
+
+    /// Erreur AEAD (chiffrement / déchiffrement).
+    #[error("aead: {0}")]
+    Aead(String),
+
+    /// La passphrase est vide (interdit).
+    #[error("passphrase must not be empty")]
+    EmptyPassphrase,
 }

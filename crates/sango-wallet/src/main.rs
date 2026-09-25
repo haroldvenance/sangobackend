@@ -67,6 +67,11 @@ fn run(args: &[String]) -> Result<(), WalletError> {
         "evm-call" => cmd_evm_call(rpc_endpoint, &rest),
         "evm-sign" => cmd_evm_sign(rpc_endpoint, kf_path, &rest),
 
+        // --- Gestion du keyfile ---
+        "keyfile-encrypt" => cmd_keyfile_encrypt(kf_path),
+        "keyfile-decrypt" => cmd_keyfile_decrypt(kf_path),
+        "keyfile-info" => cmd_keyfile_info(kf_path),
+
         other => Err(WalletError::Usage(format!("unknown command: {other}"))),
     }
 }
@@ -78,7 +83,13 @@ fn cmd_new(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
     println!("✓ Keyfile créé : {}", keyfile_path.display());
     println!("  Adresse native : 0x{}", kf.address_hex);
     println!("  ⚠ Sauvegardez ce fichier — sans lui, vos fonds sont perdus.");
-    println!("  (Ajoutez une clé EVM avec `sango-wallet evm-new`.)");
+    println!();
+    println!("  SÉCURITÉ : ce keyfile est en clair. Chiffrez-le avec :");
+    println!(
+        "    sango-wallet --keyfile {} keyfile-encrypt",
+        keyfile_path.display()
+    );
+    println!("  (ou ajoutez une clé EVM avec `evm-new`.)");
     Ok(())
 }
 
@@ -359,20 +370,57 @@ fn cmd_unjail(
 // --- Commandes EVM ---------------------------------------------------------
 
 fn cmd_evm_new(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
-    let mut kf = if keyfile_path.exists() {
-        KeyFile::load(keyfile_path)?
-    } else {
-        KeyFile::create(keyfile_path)?
-    };
-    if kf.has_evm_key() {
-        return Err(WalletError::InvalidKeyfile(
-            "EVM key already present in keyfile".into(),
-        ));
+    if !keyfile_path.exists() {
+        // Nouveau keyfile v1 en clair (l'utilisateur pourra le chiffrer après).
+        let mut kf = KeyFile::create(keyfile_path)?;
+        kf.attach_evm_key(keyfile_path, None)?;
+        let addr = kf.evm_address()?;
+        println!("✓ Keyfile créé + clé EVM attachée");
+        println!("  Adresse EVM : 0x{}", addr.to_hex());
+        return Ok(());
     }
-    kf.attach_evm_key(keyfile_path)?;
-    let addr = kf.evm_address()?;
-    println!("✓ Clé EVM attachée au keyfile");
-    println!("  Adresse EVM : 0x{}", addr.to_hex());
+
+    // Keyfile existant : détecter la version.
+    // On regarde la version JSON sans charger (pour éviter de demander la
+    // passphrase inutilement).
+    let raw: serde_json::Value = {
+        let bytes = std::fs::read(keyfile_path)?;
+        serde_json::from_slice(&bytes)?
+    };
+    let version = raw.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    match version {
+        1 => {
+            let mut kf = KeyFile::load(keyfile_path)?;
+            if kf.has_evm_key() {
+                return Err(WalletError::InvalidKeyfile(
+                    "EVM key already present in keyfile".into(),
+                ));
+            }
+            kf.attach_evm_key(keyfile_path, None)?;
+            let addr = kf.evm_address()?;
+            println!("✓ Clé EVM attachée au keyfile v1");
+            println!("  Adresse EVM : 0x{}", addr.to_hex());
+        }
+        2 => {
+            let pass = read_passphrase("Passphrase (keyfile v2) : ")?;
+            let mut kf = KeyFile::load_encrypted(keyfile_path, &pass)?;
+            if kf.has_evm_key() {
+                return Err(WalletError::InvalidKeyfile(
+                    "EVM key already present in keyfile".into(),
+                ));
+            }
+            kf.attach_evm_key(keyfile_path, Some(&pass))?;
+            let addr = kf.evm_address()?;
+            println!("✓ Clé EVM attachée au keyfile v2");
+            println!("  Adresse EVM : 0x{}", addr.to_hex());
+        }
+        v => {
+            return Err(WalletError::InvalidKeyfile(format!(
+                "unsupported keyfile version: {v}"
+            )))
+        }
+    }
     Ok(())
 }
 
@@ -526,6 +574,100 @@ fn cmd_evm_sign(
     eprintln!(
         "(Signature produite localement. Broadcast via `eth_sendRawTransaction` non encore supporté — voir 4c.3.)"
     );
+    Ok(())
+}
+
+// --- Gestion keyfile -------------------------------------------------------
+
+/// Lit la passphrase depuis `SANGO_WALLET_PASSPHRASE`, sinon prompt.
+fn read_passphrase(prompt: &str) -> Result<Vec<u8>, WalletError> {
+    if let Ok(p) = std::env::var("SANGO_WALLET_PASSPHRASE") {
+        if p.is_empty() {
+            return Err(WalletError::EmptyPassphrase);
+        }
+        return Ok(p.into_bytes());
+    }
+    let pass = rpassword::prompt_password(prompt)
+        .map_err(|e| WalletError::Io(std::io::Error::other(e.to_string())))?;
+    if pass.is_empty() {
+        return Err(WalletError::EmptyPassphrase);
+    }
+    Ok(pass.into_bytes())
+}
+
+fn cmd_keyfile_encrypt(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
+    // Vérifier que le fichier est bien v1 en clair avant tout.
+    let kf = KeyFile::load(keyfile_path)?;
+    if kf.version != 1 {
+        return Err(WalletError::AlreadyEncrypted);
+    }
+
+    println!("⚠️  Cette opération va chiffrer votre keyfile avec une passphrase.");
+    println!("    La passphrase NE PEUT PAS être récupérée en cas d'oubli.");
+    println!();
+
+    let p1 = read_passphrase("Passphrase : ")?;
+    let p2 = read_passphrase("Confirmer  : ")?;
+    if p1 != p2 {
+        return Err(WalletError::Usage("passphrases do not match".into()));
+    }
+
+    let kf2 = KeyFile::encrypt_in_place(keyfile_path, &p1)?;
+    println!("✓ Keyfile chiffré (v2)");
+    println!("  Adresse : 0x{}", kf2.address_hex);
+    Ok(())
+}
+
+fn cmd_keyfile_decrypt(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
+    println!("⚠️  ATTENTION : cette opération va écrire votre seed EN CLAIR.");
+    println!("    Utilisez-la uniquement pour migrer vers un autre format.");
+    println!();
+
+    let pass = read_passphrase("Passphrase : ")?;
+    let kf1 = KeyFile::decrypt_in_place(keyfile_path, &pass)?;
+    println!("✓ Keyfile déchiffré (v1, ⚠️ en clair)");
+    println!("  Adresse : 0x{}", kf1.address_hex);
+    Ok(())
+}
+
+fn cmd_keyfile_info(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
+    use std::fs;
+    let bytes = fs::read(keyfile_path)?;
+    let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let version = raw.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+    let address_hex = raw
+        .get("address_hex")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let created_at = raw.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    println!("Keyfile : {}", keyfile_path.display());
+    println!("  version    : {version}");
+    println!("  address    : 0x{address_hex}");
+    println!("  created_at : {created_at}");
+    match version {
+        1 => {
+            println!("  chiffré    : ❌ NON (v1 en clair)");
+            println!("  → migration recommandée : `sango-wallet keyfile-encrypt`");
+        }
+        2 => {
+            let kdf = raw.get("kdf").and_then(|v| v.as_str()).unwrap_or("?");
+            let cipher = raw.get("cipher").and_then(|v| v.as_str()).unwrap_or("?");
+            println!("  chiffré    : ✅ OUI (v2)");
+            println!("  kdf        : {kdf}");
+            println!("  cipher     : {cipher}");
+            if let Some(params) = raw.get("kdf_params") {
+                let m = params
+                    .get("m_cost_kib")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let t = params.get("t_cost").and_then(|v| v.as_u64()).unwrap_or(0);
+                let p = params.get("p_cost").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("  argon2     : m={m} KiB, t={t}, p={p}");
+            }
+        }
+        _ => println!("  chiffré    : (version inconnue)"),
+    }
     Ok(())
 }
 
