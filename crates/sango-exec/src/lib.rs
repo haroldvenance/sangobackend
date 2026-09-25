@@ -1,4 +1,5 @@
 mod apply;
+pub mod commission;
 pub mod downtime;
 mod error;
 pub mod evm_fee;
@@ -15,6 +16,7 @@ pub use apply::{
     BlockApplyResult, BlockExecutionResult, ExecutionContext, ValidatedEvmTransaction,
     ValidatedTransaction, DEFAULT_EVM_CHAIN_ID, NATIVE_TRANSFER_GAS,
 };
+pub use commission::{process_pending_commissions, ActivatedCommission, CommissionReport};
 pub use downtime::{record_participation, ParticipationReport, DOWNTIME_WINDOW, MAX_MISSED};
 pub use error::ApplyError;
 pub use evm_fee::{effective_gas_price, EvmFeeError};

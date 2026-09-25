@@ -662,6 +662,20 @@ pub fn apply_block(
         return Err(e);
     }
 
+    // 0d. Activer les commissions arrivées à échéance.
+    //
+    // **Déterministe** : dépend uniquement de `ctx.current_time` (issu
+    // du header du bloc, donc identique sur tous les nœuds) et de
+    // l'état. Aucun flag nécessaire.
+    //
+    // Après les unbondings pour rester cohérent avec l'ordre de
+    // traitement « métadonnées de bloc » du Freeze (section 50 :
+    // unbonding puis commission, tous deux basés sur `current_time`).
+    if let Err(e) = crate::commission::process_pending_commissions(state, ctx) {
+        *state = snapshot;
+        return Err(e);
+    }
+
     // 1. Appliquer les transactions (sans toucher aux compteurs globaux).
     let mut applied: Vec<Applied> = Vec::with_capacity(validated.len());
     let mut total_gas_used: u64 = 0; // natif + EVM (pour le receipt)
