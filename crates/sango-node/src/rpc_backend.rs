@@ -6,7 +6,7 @@
 
 use sango_primitives::{Amount, ChainId32, EvmAddress, Hash32, NativeAddress, U256};
 use sango_rpc::{EthCallRequest, EthCallResult, RpcBackend, RpcError};
-use sango_types::{Block, NativeAccount, Transaction, ValidatorInfo};
+use sango_types::{Block, EvmTx, NativeAccount, Transaction, ValidatorInfo};
 
 use crate::base_fee::INITIAL_BASE_FEE;
 use crate::node_handle::NodeHandle;
@@ -118,6 +118,28 @@ impl RpcBackend for NodeBackend {
                 .map_err(|e| RpcError::Internal(format!("evm_estimate: {e}")))
         })?;
         Ok(outcome.gas_used)
+    }
+
+    fn eth_send_raw_transaction(&self, raw: &[u8]) -> Result<Hash32, RpcError> {
+        // (1) Décoder le typed-transaction Ethereum.
+        let tx = EvmTx::decode_ethereum_typed(raw)
+            .map_err(|e| RpcError::InvalidParams(format!("decode evm tx: {e}")))?;
+
+        // (2) Récupérer le sender cryptographiquement.
+        let sender = sango_evm::recover_sender(&tx)
+            .map_err(|_| RpcError::InvalidParams("invalid evm signature".into()))?;
+
+        // (3) base_fee + nonce EVM courants.
+        let (base_fee_u256, nonce) = self.handle.with_node(|n| {
+            let bf = U256::from(n.expected_base_fee().unwrap_or(INITIAL_BASE_FEE));
+            (bf, n.evm_get_nonce(&sender))
+        });
+
+        // (4) Push dans l'EvmMempool.
+        self.handle.with_evm_mempool(|pool| {
+            pool.add(tx, base_fee_u256, nonce)
+                .map_err(|e| RpcError::TransactionRejected(e.to_string()))
+        })
     }
 }
 

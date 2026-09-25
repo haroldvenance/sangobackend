@@ -121,4 +121,17 @@ pub trait RpcBackend: Send + Sync + 'static {
             "eth_estimateGas not supported by this backend".into(),
         ))
     }
+
+    /// Soumet une transaction EVM brute (typed-transaction Ethereum) au
+    /// mempool EVM (`eth_sendRawTransaction`). Défaut : non supporté.
+    ///
+    /// Le `raw` est décodé comme typed-transaction Ethereum
+    /// (`0x00`/`0x01`/`0x02`/`0x04 || RLP(...)`). Le sender est
+    /// **récupéré cryptographiquement** de la signature — il n'est jamais
+    /// fourni par l'appelant.
+    fn eth_send_raw_transaction(&self, _raw: &[u8]) -> Result<Hash32, RpcError> {
+        Err(RpcError::Internal(
+            "eth_sendRawTransaction not supported by this backend".into(),
+        ))
+    }
 }

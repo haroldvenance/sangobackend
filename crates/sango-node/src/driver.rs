@@ -20,10 +20,10 @@ use sango_consensus::{
     ValidatorSet,
 };
 use sango_p2p::{NetworkMessage, P2pEvent, P2pService};
-use sango_primitives::{Epoch, Hash32, Height, NativeAddress, Round};
+use sango_primitives::{Epoch, Hash32, Height, NativeAddress, Round, U256};
 use sango_types::{
-    CommitCertificate, ConsensusMessage, ConsensusMessageType, Evidence, EvidenceType, Precommit,
-    Prevote, Proposal, Transaction,
+    CommitCertificate, ConsensusMessage, ConsensusMessageType, Evidence, EvidenceType, EvmTx,
+    Precommit, Prevote, Proposal, Transaction, Tx,
 };
 
 use crate::base_fee::INITIAL_BASE_FEE;
@@ -299,7 +299,7 @@ impl Driver {
         let id = self.local.as_ref().ok_or(DriverError::NoLocalIdentity)?;
         let proposer = id.address();
 
-        let candidates = self.collect_mempool_candidates();
+        let candidates = self.collect_candidates();
         let evidences = std::mem::take(&mut self.pending_evidences);
 
         let epoch = self.epoch;
@@ -424,7 +424,7 @@ impl Driver {
 
     // --- Internes ----------------------------------------------------------
 
-    fn collect_mempool_candidates(&self) -> Vec<Transaction> {
+    fn collect_native_candidates(&self) -> Vec<Transaction> {
         let senders: Vec<NativeAddress> = self.handle.with_mempool(|pool| {
             let mut s = HashSet::new();
             for h in pool.hashes() {
@@ -455,20 +455,58 @@ impl Driver {
 
     /// Collecte les candidats EVM pour le prochain bloc.
     ///
-    /// **4c.3.2 — no-op volontaire** : aucun bloc n'inclut encore de txs
-    /// EVM. Ce point d'entrée existe pour préparer le câblage 4c.3.3
-    /// (`Vec<Tx>` hétérogène) sans introduire de changement de consensus
-    /// maintenant.
+    /// ## 4c.3.7
     ///
-    /// Retourne toujours `Vec::new()` tant que l'exécution EVM dans
-    /// `apply_block` n'est pas branchée.
+    /// Interroge l'`EvmMempool` avec la base fee courante et les nonces
+    /// EVM on-chain. Le pool calcule la priorité effective **à la
+    /// sélection** (pas à l'insertion) — voir
+    /// [`sango_mempool::EvmMempool::select_for_block`].
     #[must_use]
-    pub fn collect_evm_candidates(&self) -> Vec<sango_types::EvmTx> {
-        let _ = self.handle.with_evm_mempool(|p| p.len());
-        Vec::new()
+    pub fn collect_evm_candidates(&self) -> Vec<EvmTx> {
+        // Senders EVM actuellement dans le pool.
+        let senders: Vec<sango_primitives::EvmAddress> = self.handle.with_evm_mempool(|pool| {
+            let mut s = HashSet::new();
+            for h in pool.hashes() {
+                if let Some(e) = pool.get(&h) {
+                    s.insert(e.sender);
+                }
+            }
+            s.into_iter().collect()
+        });
+
+        if senders.is_empty() {
+            return Vec::new();
+        }
+
+        let (base_fee_u256, nonces) = self.handle.with_node(|n| {
+            let bf = U256::from(n.expected_base_fee().unwrap_or(INITIAL_BASE_FEE));
+            let nonces: HashMap<sango_primitives::EvmAddress, u64> =
+                senders.iter().map(|s| (*s, n.evm_get_nonce(s))).collect();
+            (bf, nonces)
+        });
+
+        let entries = self.handle.with_evm_mempool(|pool| {
+            pool.select_for_block(MAX_TXS_PER_BLOCK, &nonces, base_fee_u256)
+        });
+
+        entries.into_iter().map(|e| e.tx).collect()
     }
 
-    fn prune_mempool(&self) {
+    /// Collecte tous les candidats (natifs + EVM) dans l'ordre :
+    /// natifs d'abord, puis EVM. Cet ordre est arbitraire mais
+    /// déterministe.
+    fn collect_candidates(&self) -> Vec<Tx> {
+        let mut out = Vec::new();
+        for tx in self.collect_native_candidates() {
+            out.push(Tx::Native(tx));
+        }
+        for tx in self.collect_evm_candidates() {
+            out.push(Tx::Evm(tx));
+        }
+        out
+    }
+
+    fn prune_native_mempool(&self) {
         let senders: Vec<NativeAddress> = self.handle.with_mempool(|pool| {
             let mut s = HashSet::new();
             for h in pool.hashes() {
@@ -489,6 +527,37 @@ impl Driver {
         });
 
         self.handle.with_mempool(|pool| {
+            let _ = pool.prune_below_nonces(&nonces);
+            let _ = pool.evict_below_base_fee(new_base_fee);
+        });
+    }
+
+    /// Purge le mempool EVM après un commit : retire les txs dont le
+    /// nonce est déjà appliqué, et évince celles dont le max_fee est
+    /// passé sous la nouvelle base fee.
+    fn prune_evm_mempool(&self) {
+        let senders: Vec<sango_primitives::EvmAddress> = self.handle.with_evm_mempool(|pool| {
+            let mut s = HashSet::new();
+            for h in pool.hashes() {
+                if let Some(e) = pool.get(&h) {
+                    s.insert(e.sender);
+                }
+            }
+            s.into_iter().collect()
+        });
+
+        if senders.is_empty() {
+            return;
+        }
+
+        let (nonces, new_base_fee) = self.handle.with_node(|n| {
+            let nonces: HashMap<sango_primitives::EvmAddress, u64> =
+                senders.iter().map(|s| (*s, n.evm_get_nonce(s))).collect();
+            let bf = U256::from(n.expected_base_fee().unwrap_or(INITIAL_BASE_FEE));
+            (nonces, bf)
+        });
+
+        self.handle.with_evm_mempool(|pool| {
             let _ = pool.prune_below_nonces(&nonces);
             let _ = pool.evict_below_base_fee(new_base_fee);
         });
@@ -549,7 +618,8 @@ impl Driver {
                             Err(NodeError::AlreadyApplied { .. }) => {}
                             Err(e) => return Err(DriverError::Node(e)),
                         }
-                        self.prune_mempool();
+                        self.prune_native_mempool();
+                        self.prune_evm_mempool();
                         self.events.push(DriverEvent::Committed {
                             height,
                             round,

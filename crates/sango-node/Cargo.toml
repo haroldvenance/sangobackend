@@ -37,3 +37,5 @@ sango-wallet.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+k256.workspace = true
+rlp.workspace = true

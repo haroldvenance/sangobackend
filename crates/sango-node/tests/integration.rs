@@ -30,6 +30,8 @@ fn recipient() -> NativeAddress {
 /// proposeur en production — donc les roots (`transaction_root`,
 /// `receipt_root`, `state_root`) sont calculées correctement.
 fn build_block(node: &Node, candidates: Vec<Transaction>) -> Block {
+    // 4c.3.7 : `prepare_block_from_candidates` prend désormais `Vec<Tx>`.
+    let candidates: Vec<Tx> = candidates.into_iter().map(Tx::Native).collect();
     let (_, height) = match node.tip() {
         Some(t) => (t.block_hash, t.height.get() + 1),
         None => (Hash32::ZERO, 0),

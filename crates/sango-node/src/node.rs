@@ -14,7 +14,7 @@ use sango_primitives::{
 use sango_state::{MetadataKey, NativeState};
 use sango_storage::{metadata_key, Batch, Column, Storage};
 use sango_tx::{validate_transaction, SenderInfo, ValidationContext};
-use sango_types::{Block, BlockHeader, ChainTip, Transaction, Tx};
+use sango_types::{Block, BlockHeader, ChainTip, Tx};
 
 use crate::base_fee::{next_base_fee, INITIAL_BASE_FEE};
 use crate::diff::{diff_evm, diff_state, EvmDiff};
@@ -257,7 +257,7 @@ impl Node {
         &self,
         epoch: Epoch,
         round: Round,
-        candidates: Vec<Transaction>,
+        candidates: Vec<Tx>,
         max_txs: usize,
         proposer: NativeAddress,
         timestamp: u64,
@@ -277,40 +277,76 @@ impl Node {
             .unwrap_or(crate::base_fee::INITIAL_BASE_FEE);
 
         let mut trial_filter = self.state.clone();
-        let mut accepted: Vec<Transaction> = Vec::new();
+        let mut trial_evm = self.evm.clone();
+        let mut accepted: Vec<Tx> = Vec::new();
         let mut validated: Vec<ValidatedTransaction> = Vec::new();
 
+        // `EvmBlockEnv` commun à la pré-validation (phase 1) et à la
+        // simulation complète (phase 2). Doit être identique, sinon
+        // divergence du résultat revm.
+        let evm_block_env = EvmBlockEnv {
+            chain_id: self.evm_chain_id,
+            number: height,
+            timestamp,
+            gas_limit: 30_000_000,
+            base_fee: U256::from(base_fee),
+            coinbase: EvmAddress::ZERO,
+            prevrandao: sango_exec::derive_prevrandao(parent_hash),
+            parent_block_hash: parent_hash,
+        };
+
         for tx in candidates.into_iter().take(max_txs) {
-            let sender = Self::sender_info_from_state(&trial_filter, tx.sender);
-            let vctx = ValidationContext {
-                expected_chain_id: self.chain_id,
-                base_fee,
-                sender: &sender,
-            };
-            let v = match validate_transaction(&tx, &vctx) {
-                Ok(v) => ValidatedTransaction::Native(v),
-                Err(_) => break,
-            };
-            let gas_used = gas_for(tx.tx_kind).unwrap_or(NATIVE_TRANSFER_GAS);
-            let exec_ctx = ExecutionContext {
-                chain_id: self.chain_id,
-                base_fee,
-                fee_recipient: proposer,
-                initial_supply: self.initial_supply,
-                current_time: timestamp,
-                current_height: height,
-                rewards_enabled: self.rewards_enabled,
-                downtime_enabled: false,
-                evm_chain_id: self.evm_chain_id,
-            };
-            let ValidatedTransaction::Native(vn) = &v else {
-                unreachable!("pré-validation ne produit que des natifs");
-            };
-            if apply_tx_no_rollback(&mut trial_filter, &tx, vn, gas_used, &exec_ctx).is_err() {
-                break;
+            match tx {
+                Tx::Native(native) => {
+                    let sender = Self::sender_info_from_state(&trial_filter, native.sender);
+                    let vctx = ValidationContext {
+                        expected_chain_id: self.chain_id,
+                        base_fee,
+                        sender: &sender,
+                    };
+                    let vn = match validate_transaction(&native, &vctx) {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    let gas_used = gas_for(native.tx_kind).unwrap_or(NATIVE_TRANSFER_GAS);
+                    let exec_ctx = ExecutionContext {
+                        chain_id: self.chain_id,
+                        base_fee,
+                        fee_recipient: proposer,
+                        initial_supply: self.initial_supply,
+                        current_time: timestamp,
+                        current_height: height,
+                        rewards_enabled: self.rewards_enabled,
+                        downtime_enabled: false,
+                        evm_chain_id: self.evm_chain_id,
+                    };
+                    if apply_tx_no_rollback(&mut trial_filter, &native, &vn, gas_used, &exec_ctx)
+                        .is_err()
+                    {
+                        break;
+                    }
+                    accepted.push(Tx::Native(native));
+                    validated.push(ValidatedTransaction::Native(vn));
+                }
+                Tx::Evm(evm) => {
+                    let ve = match self.validate_evm_tx(&evm, base_fee) {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    let extras = TxEnvExtras {
+                        caller: ve.sender,
+                        effective_gas_price: ve.effective_gas_price,
+                    };
+                    // Un REVERT/HALT renvoie `Ok(outcome)` — on accepte la
+                    // tx (elle consomme du gas et laisse une trace). Un
+                    // `Err` (nonce invalide, fonds insuffisants…) rejette.
+                    if evm_transact(&mut trial_evm, &evm, &evm_block_env, extras).is_err() {
+                        break;
+                    }
+                    accepted.push(Tx::Evm(evm));
+                    validated.push(ValidatedTransaction::Evm(ve));
+                }
             }
-            accepted.push(tx);
-            validated.push(v);
         }
 
         // ------------------------------------------------------------------
@@ -343,7 +379,7 @@ impl Node {
         let prelim_block = Block {
             header: prelim_header,
             evidences: evidences.clone(),
-            transactions: accepted.iter().cloned().map(Tx::Native).collect(),
+            transactions: accepted.clone(),
         };
 
         let mut trial_sim = self.state.clone();
@@ -391,7 +427,7 @@ impl Node {
         let final_block = Block {
             header: final_header,
             evidences,
-            transactions: accepted.into_iter().map(Tx::Native).collect(),
+            transactions: accepted,
         };
         (final_block, validated)
     }

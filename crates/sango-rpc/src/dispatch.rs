@@ -50,6 +50,7 @@ fn handle<B: RpcBackend>(backend: &B, method: &str, params: &Value) -> Result<Va
         "eth_getStorageAt" => eth_get_storage_at(backend, params),
         "eth_call" => eth_call(backend, params),
         "eth_estimateGas" => eth_estimate_gas(backend, params),
+        "eth_sendRawTransaction" => eth_send_raw_transaction(backend, params),
 
         other => Err(RpcError::MethodNotFound(other.to_string())),
     }
@@ -211,6 +212,17 @@ fn eth_estimate_gas<B: RpcBackend>(backend: &B, params: &Value) -> Result<Value,
     let req = parse_eth_call_request(params)?;
     let gas = backend.eth_estimate_gas(&req)?;
     Ok(json!(format!("0x{gas:x}")))
+}
+
+fn eth_send_raw_transaction<B: RpcBackend>(backend: &B, params: &Value) -> Result<Value, RpcError> {
+    let raw_hex = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::InvalidParams("expected [raw_tx_hex]".into()))?;
+    let raw = decode_hex(raw_hex)?;
+    let hash = backend.eth_send_raw_transaction(&raw)?;
+    Ok(json!(format!("0x{}", hash.to_hex())))
 }
 
 // --- Helpers ---------------------------------------------------------------
@@ -445,6 +457,10 @@ mod tests {
         fn eth_estimate_gas(&self, _: &EthCallRequest) -> Result<u64, RpcError> {
             Ok(self.call_gas)
         }
+        fn eth_send_raw_transaction(&self, _raw: &[u8]) -> Result<Hash32, RpcError> {
+            // Mock : retourne un hash constant.
+            Ok(Hash32::from_bytes([0xab; 32]))
+        }
     }
 
     fn call<B: RpcBackend>(backend: &B, method: &str, params: Value) -> Value {
@@ -591,6 +607,13 @@ mod tests {
             ]),
         );
         assert_eq!(v, json!("0xdead"));
+    }
+
+    #[test]
+    fn eth_send_raw_transaction_routes_and_returns_hash() {
+        let b = MockBackend::default();
+        let v = call(&b, "eth_sendRawTransaction", json!(["0xdeadbeef"]));
+        assert_eq!(v, json!(format!("0x{}", "ab".repeat(32))));
     }
 
     #[test]
