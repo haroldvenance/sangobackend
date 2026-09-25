@@ -11,8 +11,9 @@ pub mod unbonding;
 pub use apply::{
     apply_block, apply_block_transfers, apply_transfer, apply_transfer_with_gas,
     apply_tx_no_rollback, build_receipts, compute_evm_state_root, compute_receipt_root,
-    compute_transaction_root, empty_evm_state_root, AppliedTransaction, BlockApplyResult,
-    BlockExecutionResult, ExecutionContext, NATIVE_TRANSFER_GAS,
+    compute_transaction_root, empty_evm_state_root, Applied, AppliedEvmTx, AppliedTransaction,
+    BlockApplyResult, BlockExecutionResult, ExecutionContext, ValidatedEvmTransaction,
+    ValidatedTransaction, DEFAULT_EVM_CHAIN_ID, NATIVE_TRANSFER_GAS,
 };
 pub use downtime::{record_participation, ParticipationReport, DOWNTIME_WINDOW, MAX_MISSED};
 pub use error::ApplyError;

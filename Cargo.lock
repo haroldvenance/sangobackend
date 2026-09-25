@@ -4335,6 +4335,7 @@ dependencies = [
  "alloy-eip2930",
  "alloy-primitives",
  "hex",
+ "k256",
  "revm",
  "rlp",
  "sango-crypto",

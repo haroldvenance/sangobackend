@@ -23,16 +23,13 @@ pub enum NodeError {
         source: TxValidationError,
     },
 
-    /// Une transaction EVM a été rencontrée dans un bloc alors que le
-    /// pipeline EVM consensus-critical n'est pas encore branché.
-    ///
-    /// **4c.3.1b** : le format du bloc est hétérogène (`Vec<Tx>`), mais
-    /// `Node::apply_block` ne sait valider/exécuter que `Tx::Native`.
-    /// Le support EVM arrive en **4c.3.3**.
-    #[error("EVM tx at index {index} not yet supported by this node (4c.3.3)")]
-    UnsupportedTxVariant {
+    /// Erreur de validation d'une transaction EVM.
+    #[error("evm validation failed for tx {index}: {reason}")]
+    EvmValidation {
         /// Index de la transaction dans le bloc.
         index: usize,
+        /// Raison courte.
+        reason: String,
     },
 
     /// Erreur d'application d'un bloc.

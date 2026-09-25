@@ -12,14 +12,27 @@ pub enum ApplyError {
     #[error("tx_kind {0:?} is not supported by the native applier")]
     UnsupportedTxKind(TxKind),
 
-    /// Une transaction EVM a été rencontrée dans le bloc alors que le
-    /// pipeline EVM consensus-critical n'est pas encore branché.
-    ///
-    /// **4c.3.1b** : le format de bloc est hétérogène (`Vec<Tx>`), mais
-    /// seul `Tx::Native` est exécutable. Le câblage d'`evm_transact`
-    /// dans `apply_block` arrive en **4c.3.3**.
-    #[error("EVM tx not yet supported by the native apply pipeline (4c.3.3)")]
-    UnsupportedTxVariant,
+    /// Le variant de `Tx` et celui de `ValidatedTransaction` ne
+    /// concordent pas (bug interne).
+    #[error("tx variant mismatch between Tx and ValidatedTransaction")]
+    VariantMismatch,
+
+    /// Erreur d'exécution EVM (revm bridge).
+    #[error("evm execution: {0}")]
+    EvmExecution(#[from] sango_evm::EvmError),
+
+    /// Une tx EVM référence un sender qui n'a pas de compte EVM.
+    #[error("evm sender has no account (validation error)")]
+    EvmSenderMissingAccount,
+
+    /// Le chain_id EVM de la tx ne correspond pas à celui du réseau.
+    #[error("evm chain_id mismatch: expected {expected}, got {got}")]
+    EvmChainIdMismatch {
+        /// Chain ID attendu.
+        expected: u64,
+        /// Chain ID reçu.
+        got: u64,
+    },
 
     /// `TX_TRANSFER` sans destinataire.
     #[error("TX_TRANSFER requires a recipient")]

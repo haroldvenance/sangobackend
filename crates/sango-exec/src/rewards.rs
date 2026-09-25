@@ -210,6 +210,7 @@ mod tests {
             current_time: 1_700_000_000,
             current_height: height,
             rewards_enabled,
+            evm_chain_id: crate::DEFAULT_EVM_CHAIN_ID,
             downtime_enabled: false,
         }
     }

@@ -50,4 +50,9 @@ pub enum EvmError {
     /// Erreur provenant de revm (formattée).
     #[error("revm: {0}")]
     Revm(String),
+
+    /// La signature secp256k1 d'une transaction EVM n'a pas pu être
+    /// récupérée ou vérifiée.
+    #[error("invalid evm signature (cannot recover sender)")]
+    InvalidSignature,
 }

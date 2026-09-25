@@ -46,12 +46,16 @@
 
 use sango_codec::Encode;
 use sango_crypto::derive_native_address;
-use sango_primitives::{Amount, ChainId32, Hash32, NativeAddress, PublicKey};
+use sango_evm::{evm_transact, EvmBlockEnv, EvmState, TxEnvExtras};
+use sango_primitives::{Amount, ChainId32, EvmAddress, Hash32, NativeAddress, PublicKey, U256};
 use sango_state::{NativeState, StateError};
-use sango_tx::{split_fee, ValidatedTransaction};
+use sango_tx::{split_fee, ValidatedTransaction as ValidatedNativeTransaction};
 use sango_types::{Block, EvmLog, LogsBloom, Receipt, ReceiptStatus, Transaction, Tx, TxKind};
 
 use crate::error::ApplyError;
+
+/// Chain ID EVM par défaut (« SANGO » en ASCII).
+pub const DEFAULT_EVM_CHAIN_ID: u64 = 0x53_41_4e_47_4f;
 
 /// Gas consommé par un transfert natif simple.
 ///
@@ -91,6 +95,11 @@ pub struct ExecutionContext {
     /// diffusé *dans le bloc* pour être identique partout : sinon le
     /// `state_root` diverge.
     pub downtime_enabled: bool,
+    /// Chain ID EVM (u64), utilisé par revm (`CfgEnv::chain_id`).
+    ///
+    /// Distinct du `chain_id` natif (32 bytes). En V1, valeur par défaut :
+    /// [`DEFAULT_EVM_CHAIN_ID`] (« SANGO » en ASCII).
+    pub evm_chain_id: u64,
 }
 
 /// Détail de l'application d'une transaction.
@@ -118,11 +127,125 @@ pub struct AppliedTransaction {
     pub bootstrap_public_key: Option<PublicKey>,
 }
 
+/// Résultat d'exécution d'une transaction EVM.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppliedEvmTx {
+    /// Hash canonique de la transaction.
+    pub tx_hash: Hash32,
+    /// Adresse EVM de l'émetteur (récupérée de la signature).
+    pub sender: EvmAddress,
+    /// Gas consommé par l'exécution.
+    pub gas_used: u64,
+    /// Prix effectif par unité de gas (règle Sango unifiée).
+    pub effective_gas_price: U256,
+    /// `gas_used * effective_gas_price`.
+    ///
+    /// **Note** : ce montant est **débité par revm** dans l'`EvmState`.
+    /// Il n'est **pas** reporté dans `NativeState.total_burned` — voir
+    /// [`BlockExecutionResult`] pour la sémantique exacte.
+    pub total_fee: u128,
+    /// Logs émis par l'exécution.
+    pub logs: Vec<EvmLog>,
+    /// Adresse du contrat créé, si applicable.
+    pub contract_address: Option<EvmAddress>,
+    /// Données de retour (call uniquement).
+    pub output: Vec<u8>,
+    /// Succès ou échec (REVERT / HALT).
+    pub success: bool,
+}
+
+/// Transaction appliquée : native ou EVM.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Applied {
+    /// Transaction native Sango.
+    Native(AppliedTransaction),
+    /// Transaction EVM.
+    Evm(AppliedEvmTx),
+}
+
+impl Applied {
+    /// Hash canonique.
+    #[must_use]
+    pub fn tx_hash(&self) -> Hash32 {
+        match self {
+            Applied::Native(a) => a.tx_hash,
+            Applied::Evm(a) => a.tx_hash,
+        }
+    }
+
+    /// Gas consommé.
+    #[must_use]
+    pub fn gas_used(&self) -> u64 {
+        match self {
+            Applied::Native(a) => a.gas_used,
+            Applied::Evm(a) => a.gas_used,
+        }
+    }
+
+    /// Frais totaux (`gas_used * effective_gas_price`).
+    ///
+    /// Pour les EVM, ce montant est débité dans l'`EvmState` par revm ;
+    /// il n'apparaît pas dans `NativeState`.
+    #[must_use]
+    pub fn total_fee(&self) -> u128 {
+        match self {
+            Applied::Native(a) => a.total_fee,
+            Applied::Evm(a) => a.total_fee,
+        }
+    }
+
+    /// Part validateur (90 %).
+    ///
+    /// Renvoie `0` pour les EVM : la répartition des frais EVM est gérée
+    /// par revm via le `coinbase`.
+    #[must_use]
+    pub fn validator_fee(&self) -> u128 {
+        match self {
+            Applied::Native(a) => a.validator_fee,
+            Applied::Evm(_) => 0,
+        }
+    }
+
+    /// Part brûlée (10 %).
+    ///
+    /// Renvoie `0` pour les EVM : voir [`Self::validator_fee`].
+    #[must_use]
+    pub fn burn_fee(&self) -> u128 {
+        match self {
+            Applied::Native(a) => a.burn_fee,
+            Applied::Evm(_) => 0,
+        }
+    }
+}
+
+/// Transaction EVM validée : contient les champs dérivés nécessaires à
+/// l'exécution revm.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedEvmTransaction {
+    /// Hash canonique de la tx.
+    pub tx_hash: Hash32,
+    /// Sender récupéré cryptographiquement de la signature.
+    pub sender: EvmAddress,
+    /// Prix effectif par unité de gas (règle Sango unifiée).
+    pub effective_gas_price: U256,
+}
+
+/// Transaction validée : native ou EVM.
+///
+/// Indexée **1:1** avec `block.transactions`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ValidatedTransaction {
+    /// Transaction native (validation via `sango-tx`).
+    Native(ValidatedNativeTransaction),
+    /// Transaction EVM (validation consensus minimale + recovery).
+    Evm(ValidatedEvmTransaction),
+}
+
 /// Résultat de l'application d'un ensemble de transactions.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BlockApplyResult {
     /// Transactions appliquées, dans l'ordre.
-    pub applied: Vec<AppliedTransaction>,
+    pub applied: Vec<Applied>,
     /// Somme des gas consommés.
     pub total_gas_used: u64,
     /// Somme des frais totaux.
@@ -243,20 +366,42 @@ pub fn compute_transaction_root(txs: &[Tx]) -> Hash32 {
 /// silencieux vaut mieux qu'un panic dans du code consensus-critical, et
 /// ce cas ne peut se produire que si le calcul amont a un bug.
 #[must_use]
-pub fn build_receipts(applied: &[AppliedTransaction]) -> Vec<Receipt> {
+pub fn build_receipts(applied: &[Applied]) -> Vec<Receipt> {
     let mut out = Vec::with_capacity(applied.len());
     let mut cumulative: u64 = 0;
     for a in applied {
-        cumulative = cumulative.saturating_add(a.gas_used);
-        out.push(Receipt {
-            tx_hash: a.tx_hash,
-            status: ReceiptStatus::Success,
-            cumulative_gas_used: cumulative,
-            gas_used: a.gas_used,
-            contract_address: None,
-            logs_bloom: LogsBloom::EMPTY,
-            logs: Vec::<EvmLog>::new(),
-        });
+        cumulative = cumulative.saturating_add(a.gas_used());
+        match a {
+            Applied::Native(n) => {
+                out.push(Receipt {
+                    tx_hash: n.tx_hash,
+                    status: ReceiptStatus::Success,
+                    cumulative_gas_used: cumulative,
+                    gas_used: n.gas_used,
+                    contract_address: None,
+                    logs_bloom: LogsBloom::EMPTY,
+                    logs: Vec::<EvmLog>::new(),
+                });
+            }
+            Applied::Evm(e) => {
+                let logs = e.logs.clone();
+                let bloom = LogsBloom::from_logs(&logs);
+                let status = if e.success {
+                    ReceiptStatus::Success
+                } else {
+                    ReceiptStatus::Failure
+                };
+                out.push(Receipt {
+                    tx_hash: e.tx_hash,
+                    status,
+                    cumulative_gas_used: cumulative,
+                    gas_used: e.gas_used,
+                    contract_address: e.contract_address,
+                    logs_bloom: bloom,
+                    logs,
+                });
+            }
+        }
     }
     out
 }
@@ -323,7 +468,7 @@ pub fn empty_evm_state_root() -> Hash32 {
 pub fn apply_transfer(
     state: &mut NativeState,
     tx: &Transaction,
-    validated: &ValidatedTransaction,
+    validated: &ValidatedNativeTransaction,
     fee_recipient: NativeAddress,
 ) -> Result<AppliedTransaction, ApplyError> {
     apply_transfer_with_gas(state, tx, validated, NATIVE_TRANSFER_GAS, fee_recipient)
@@ -337,7 +482,7 @@ pub fn apply_transfer(
 pub fn apply_transfer_with_gas(
     state: &mut NativeState,
     tx: &Transaction,
-    validated: &ValidatedTransaction,
+    validated: &ValidatedNativeTransaction,
     gas_used: u64,
     fee_recipient: NativeAddress,
 ) -> Result<AppliedTransaction, ApplyError> {
@@ -376,7 +521,7 @@ pub fn apply_transfer_with_gas(
 pub fn apply_block_transfers(
     state: &mut NativeState,
     txs: &[Transaction],
-    validated: &[ValidatedTransaction],
+    validated: &[ValidatedNativeTransaction],
     ctx: &ExecutionContext,
 ) -> Result<BlockApplyResult, ApplyError> {
     if txs.len() != validated.len() {
@@ -409,7 +554,7 @@ pub fn apply_block_transfers(
                     .total_burned
                     .checked_add(applied.burn_fee)
                     .ok_or(ApplyError::TotalFeeOverflow)?;
-                result.applied.push(applied);
+                result.applied.push(Applied::Native(applied));
             }
             Err(e) => {
                 *state = snapshot;
@@ -452,6 +597,7 @@ pub fn apply_block_transfers(
 /// libération des unbondings est toujours active (déterministe).
 pub fn apply_block(
     state: &mut NativeState,
+    evm_state: &mut EvmState,
     block: &Block,
     validated: &[ValidatedTransaction],
     ctx: &ExecutionContext,
@@ -465,6 +611,7 @@ pub fn apply_block(
     }
 
     let snapshot = state.clone();
+    let evm_snapshot = evm_state.clone();
 
     // 0a. Appliquer les evidences AVANT les transactions.
     //
@@ -516,25 +663,42 @@ pub fn apply_block(
     }
 
     // 1. Appliquer les transactions (sans toucher aux compteurs globaux).
-    let mut applied: Vec<AppliedTransaction> = Vec::with_capacity(validated.len());
-    let mut total_gas_used: u64 = 0;
+    let mut applied: Vec<Applied> = Vec::with_capacity(validated.len());
+    let mut total_gas_used: u64 = 0;    // natif + EVM (pour le receipt)
+    let mut total_gas_used_native: u64 = 0;  // natif uniquement (pour NativeState)
     let mut total_fee: u128 = 0;
     let mut total_validator_fee: u128 = 0;
     let mut total_burned: u128 = 0;
 
+    // `EvmBlockEnv` pour la totalité du bloc. Construit depuis le header.
+    let evm_block_env = EvmBlockEnv {
+        chain_id: ctx.evm_chain_id,
+        number: block.header.height.get(),
+        timestamp: block.header.timestamp,
+        gas_limit: block.header.gas_limit,
+        base_fee: U256::from(block.header.base_fee),
+        coinbase: EvmAddress::ZERO,
+        prevrandao: crate::derive_prevrandao(block.header.previous_block_hash),
+        parent_block_hash: block.header.previous_block_hash,
+    };
+
     for (tx, v) in block.transactions.iter().zip(validated.iter()) {
-        // 4c.3.1b : seules les transactions natives sont exécutables.
-        // Les txs EVM sont acceptées dans le **format** du bloc mais leur
-        // exécution sera branchée en 4c.3.3 (`evm_transact`).
-        let Tx::Native(native_tx) = tx else {
-            *state = snapshot;
-            return Err(ApplyError::UnsupportedTxVariant);
-        };
-        let gas_used =
-            crate::staking::gas_for(native_tx.tx_kind).unwrap_or(NATIVE_TRANSFER_GAS);
-        match apply_tx_no_rollback(state, native_tx, v, gas_used, ctx) {
-            Ok(a) => {
+        match (tx, v) {
+            (Tx::Native(native_tx), ValidatedTransaction::Native(vn)) => {
+                let gas_used =
+                    crate::staking::gas_for(native_tx.tx_kind).unwrap_or(NATIVE_TRANSFER_GAS);
+                let a = match apply_tx_no_rollback(state, native_tx, vn, gas_used, ctx) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        *state = snapshot;
+                        *evm_state = evm_snapshot;
+                        return Err(e);
+                    }
+                };
                 total_gas_used = total_gas_used
+                    .checked_add(a.gas_used)
+                    .ok_or(ApplyError::TotalGasUsedOverflow)?;
+                total_gas_used_native = total_gas_used_native
                     .checked_add(a.gas_used)
                     .ok_or(ApplyError::TotalGasUsedOverflow)?;
                 total_fee = total_fee
@@ -546,11 +710,51 @@ pub fn apply_block(
                 total_burned = total_burned
                     .checked_add(a.burn_fee)
                     .ok_or(ApplyError::TotalFeeOverflow)?;
-                applied.push(a);
+                applied.push(Applied::Native(a));
             }
-            Err(e) => {
+            (Tx::Evm(evm_tx), ValidatedTransaction::Evm(ve)) => {
+                let extras = TxEnvExtras {
+                    caller: ve.sender,
+                    effective_gas_price: ve.effective_gas_price,
+                };
+                let outcome = match evm_transact(evm_state, evm_tx, &evm_block_env, extras) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        *state = snapshot;
+                        *evm_state = evm_snapshot;
+                        return Err(ApplyError::EvmExecution(e));
+                    }
+                };
+                let total_fee_u256 =
+                    ve.effective_gas_price.saturating_mul(U256::from(outcome.gas_used));
+                let total_fee_u128 = u256_to_u128_saturating(total_fee_u256);
+
+                let a = AppliedEvmTx {
+                    tx_hash: ve.tx_hash,
+                    sender: ve.sender,
+                    gas_used: outcome.gas_used,
+                    effective_gas_price: ve.effective_gas_price,
+                    total_fee: total_fee_u128,
+                    logs: outcome.logs,
+                    contract_address: outcome.contract_address,
+                    output: outcome.output,
+                    success: outcome.success,
+                };
+
+                total_gas_used = total_gas_used
+                    .checked_add(a.gas_used)
+                    .ok_or(ApplyError::TotalGasUsedOverflow)?;
+                // NOTE : les fees EVM ne sont PAS reportées dans
+                // `total_fee`, `total_validator_fee`, `total_burned` — ces
+                // agrégats sont réservés aux effets Sango sur `NativeState`.
+                // Les fees EVM sont débitées par revm dans `EvmState`.
+
+                applied.push(Applied::Evm(a));
+            }
+            _ => {
                 *state = snapshot;
-                return Err(e);
+                *evm_state = evm_snapshot;
+                return Err(ApplyError::VariantMismatch);
             }
         }
     }
@@ -558,10 +762,12 @@ pub fn apply_block(
     // 2. Mettre à jour les compteurs globaux en une seule passe.
     if let Err(e) = state.add_burned(Amount::from_base_units(total_burned)) {
         *state = snapshot;
+        *evm_state = evm_snapshot;
         return Err(ApplyError::State(e));
     }
-    if let Err(e) = state.add_gas_used(total_gas_used) {
+    if let Err(e) = state.add_gas_used(total_gas_used_native) {
         *state = snapshot;
+        *evm_state = evm_snapshot;
         return Err(ApplyError::State(e));
     }
 
@@ -576,6 +782,7 @@ pub fn apply_block(
             Ok(r) => r,
             Err(e) => {
                 *state = snapshot;
+                *evm_state = evm_snapshot;
                 return Err(e);
             }
         }
@@ -620,7 +827,7 @@ pub fn apply_block(
     // `state_root`        : combinaison Sango-specific définie dans
     //                       `sango_state::global_state_root`.
     let native_state_root = state.native_state_root();
-    let evm_state_root = compute_evm_state_root(&sango_evm::EvmState::new());
+    let evm_state_root = compute_evm_state_root(evm_state);
     let state_root = sango_state::global_state_root(native_state_root, evm_state_root);
 
     Ok(BlockExecutionResult {
@@ -657,7 +864,7 @@ pub fn apply_block(
 pub(crate) fn apply_transfer_no_rollback(
     state: &mut NativeState,
     tx: &Transaction,
-    validated: &ValidatedTransaction,
+    validated: &ValidatedNativeTransaction,
     gas_used: u64,
     fee_recipient: NativeAddress,
 ) -> Result<AppliedTransaction, ApplyError> {
@@ -769,7 +976,7 @@ pub(crate) fn apply_transfer_no_rollback(
 pub fn apply_tx_no_rollback(
     state: &mut NativeState,
     tx: &Transaction,
-    validated: &ValidatedTransaction,
+    validated: &ValidatedNativeTransaction,
     gas_used: u64,
     ctx: &ExecutionContext,
 ) -> Result<AppliedTransaction, ApplyError> {
@@ -780,6 +987,16 @@ pub fn apply_tx_no_rollback(
         return crate::staking::apply_staking_no_rollback(state, tx, validated, gas_used, ctx);
     }
     Err(ApplyError::UnsupportedTxKind(tx.tx_kind))
+}
+
+/// Sature une `U256` en `u128`.
+#[must_use]
+fn u256_to_u128_saturating(v: U256) -> u128 {
+    if v > U256::from(u128::MAX) {
+        u128::MAX
+    } else {
+        v.to::<u128>()
+    }
 }
 
 fn map_state_error(e: StateError) -> ApplyError {
@@ -843,7 +1060,7 @@ mod tests {
     fn validate(
         state: &NativeState,
         tx: &Transaction,
-    ) -> Result<ValidatedTransaction, TxValidationError> {
+    ) -> Result<ValidatedNativeTransaction, TxValidationError> {
         let addr = tx.sender;
         let info = match state.get_account(&addr) {
             Some(acc) => SenderInfo {
@@ -878,6 +1095,7 @@ mod tests {
             // déterministe dans le test multi-nœuds.
             rewards_enabled: false,
             downtime_enabled: false,
+            evm_chain_id: DEFAULT_EVM_CHAIN_ID,
         }
     }
 
@@ -1141,7 +1359,7 @@ mod tests {
             evidences: Vec::new(),
             transactions: Vec::new(),
         };
-        let r = apply_block(&mut state, &block, &[], &exec_ctx(), &[]).unwrap();
+        let r = apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[], &exec_ctx(), &[]).unwrap();
         assert_eq!(r.apply_result.applied.len(), 0);
         assert_eq!(r.receipts.len(), 0);
         assert_eq!(r.gas_used, 0);
@@ -1179,7 +1397,7 @@ mod tests {
             evidences: Vec::new(),
             transactions: vec![Tx::Native(tx1.clone()), Tx::Native(tx2.clone())],
         };
-        let r = apply_block(&mut state, &block, &[v1, v2], &exec_ctx(), &[]).unwrap();
+        let r = apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[ValidatedTransaction::Native(v1), ValidatedTransaction::Native(v2)], &exec_ctx(), &[]).unwrap();
 
         assert_eq!(r.receipts.len(), 2);
         assert_eq!(r.receipts[0].tx_hash, tx1.hash());
@@ -1217,7 +1435,7 @@ mod tests {
             transactions: vec![Tx::Native(tx)],
         };
         let initial = exec_ctx().initial_supply;
-        let r = apply_block(&mut state, &block, &[v], &exec_ctx(), &[]).unwrap();
+        let r = apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[ValidatedTransaction::Native(v)], &exec_ctx(), &[]).unwrap();
 
         let expected_burned = Amount::from_base_units(25_200);
         assert_eq!(r.total_burned_after, expected_burned);
@@ -1259,7 +1477,7 @@ mod tests {
             evidences: Vec::new(),
             transactions: vec![Tx::Native(tx1), Tx::Native(tx2)],
         };
-        let err = apply_block(&mut state, &block, &[v1, v2], &exec_ctx(), &[]).unwrap_err();
+        let err = apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[ValidatedTransaction::Native(v1), ValidatedTransaction::Native(v2)], &exec_ctx(), &[]).unwrap_err();
         assert!(matches!(err, ApplyError::InsufficientBalance { .. }));
         assert_eq!(state.native_state_root(), root_before);
         assert_eq!(state.total_burned(), Amount::ZERO);
@@ -1277,15 +1495,15 @@ mod tests {
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let tx = bootstrap_tx(&kp, 0, 1);
         let _ = tx;
-        let v = ValidatedTransaction {
+        let v = ValidatedTransaction::Native(ValidatedNativeTransaction {
             tx_hash: Hash32::ZERO,
             sender: NativeAddress::from_bytes([0xaa; 20]),
             effective_gas_price: 12,
             max_total_fee: 252_000,
             value: 100,
             bootstrap_public_key: None,
-        };
-        let err = apply_block(&mut state, &block, &[v], &exec_ctx(), &[]).unwrap_err();
+        });
+        let err = apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[v], &exec_ctx(), &[]).unwrap_err();
         assert_eq!(
             err,
             ApplyError::LengthMismatch {
@@ -1324,7 +1542,7 @@ mod tests {
             evidences: Vec::new(),
             transactions: vec![Tx::Native(tx)],
         };
-        let r = apply_block(&mut state, &block, &[v], &exec_ctx(), &[]).unwrap();
+        let r = apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[ValidatedTransaction::Native(v)], &exec_ctx(), &[]).unwrap();
 
         assert_eq!(r.native_state_root, state.native_state_root());
         assert_eq!(r.evm_state_root, empty_evm_state_root());
@@ -1369,7 +1587,7 @@ mod tests {
         };
 
         let ctx = exec_ctx_with_downtime();
-        apply_block(&mut state, &block, &[], &ctx, &[a]).unwrap();
+        apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[], &ctx, &[a]).unwrap();
 
         let info_a = state.get_validator(&a).unwrap();
         let info_b = state.get_validator(&b).unwrap();
@@ -1406,7 +1624,7 @@ mod tests {
             transactions: Vec::new(),
         };
         let ctx = exec_ctx_with_downtime();
-        apply_block(&mut state, &block, &[], &ctx, &[]).unwrap();
+        apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[], &ctx, &[]).unwrap();
 
         assert_eq!(state.get_validator(&addr).unwrap().downtime_missed, 1);
     }
@@ -1440,12 +1658,12 @@ mod tests {
         };
 
         // Variante A : participants = [sender].
-        let ra = apply_block(&mut state_a, &block, std::slice::from_ref(&v), &exec_ctx(), &[sender]).unwrap();
+        let ra = apply_block(&mut state_a, &mut sango_evm::EvmState::new(), &block, &[ValidatedTransaction::Native(v.clone())], &exec_ctx(), &[sender]).unwrap();
 
         // Variante B : participants = [] (comme si un autre nœud avait vu
         // un `CommitCertificate` différent). Doit donner le **même** root,
         // car le downtime est désactivé.
-        let rb = apply_block(&mut state_b, &block, &[v], &exec_ctx(), &[]).unwrap();
+        let rb = apply_block(&mut state_b, &mut sango_evm::EvmState::new(), &block, &[ValidatedTransaction::Native(v)], &exec_ctx(), &[]).unwrap();
 
         assert_eq!(
             ra.native_state_root, rb.native_state_root,

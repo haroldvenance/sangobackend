@@ -145,6 +145,7 @@ mod tests {
             initial_supply: Amount::from_sango(1_000_000_000).unwrap(),
             current_time: 1_700_000_000 + height * 5,
             current_height: height,
+            evm_chain_id: crate::DEFAULT_EVM_CHAIN_ID,
             rewards_enabled: false,
             downtime_enabled: false,
         }

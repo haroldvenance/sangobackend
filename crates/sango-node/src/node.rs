@@ -4,13 +4,16 @@ use std::path::Path;
 
 use sango_codec::{Decode, Encode};
 use sango_evm::{evm_transact, EvmBlockEnv, EvmOutcome, EvmState, TxEnvExtras};
-use sango_exec::{apply_block as exec_apply_block, BlockExecutionResult, ExecutionContext};
+use sango_exec::{
+    apply_block as exec_apply_block, BlockExecutionResult, ExecutionContext,
+    ValidatedEvmTransaction, ValidatedTransaction,
+};
 use sango_primitives::{
     Amount, ChainId32, Epoch, EvmAddress, Hash32, Height, NativeAddress, Round, U256,
 };
 use sango_state::{MetadataKey, NativeState};
 use sango_storage::{metadata_key, Batch, Column, Storage};
-use sango_tx::{validate_transaction, SenderInfo, ValidatedTransaction, ValidationContext};
+use sango_tx::{validate_transaction, SenderInfo, ValidationContext};
 use sango_types::{Block, BlockHeader, ChainTip, Transaction, Tx};
 
 use crate::base_fee::{next_base_fee, INITIAL_BASE_FEE};
@@ -242,7 +245,7 @@ impl Node {
                 sender: &sender,
             };
             let v = match validate_transaction(&tx, &vctx) {
-                Ok(v) => v,
+                Ok(v) => ValidatedTransaction::Native(v),
                 Err(_) => break,
             };
             let gas_used = gas_for(tx.tx_kind).unwrap_or(NATIVE_TRANSFER_GAS);
@@ -255,8 +258,12 @@ impl Node {
                 current_height: height,
                 rewards_enabled: self.rewards_enabled,
                 downtime_enabled: false,
+                evm_chain_id: self.evm_chain_id,
             };
-            if apply_tx_no_rollback(&mut trial_filter, &tx, &v, gas_used, &exec_ctx).is_err() {
+            let ValidatedTransaction::Native(vn) = &v else {
+                unreachable!("pré-validation ne produit que des natifs");
+            };
+            if apply_tx_no_rollback(&mut trial_filter, &tx, vn, gas_used, &exec_ctx).is_err() {
                 break;
             }
             accepted.push(tx);
@@ -297,6 +304,7 @@ impl Node {
         };
 
         let mut trial_sim = self.state.clone();
+        let mut trial_evm = self.evm.clone();
         let sim_ctx = ExecutionContext {
             chain_id: self.chain_id,
             base_fee,
@@ -306,9 +314,17 @@ impl Node {
             current_height: height,
             rewards_enabled: self.rewards_enabled,
             downtime_enabled: false,
+            evm_chain_id: self.evm_chain_id,
         };
-        let sim_result = exec_apply_block(&mut trial_sim, &prelim_block, &validated, &sim_ctx, &[])
-            .expect("block simulation must succeed (txs were pre-filtered)");
+        let sim_result = exec_apply_block(
+            &mut trial_sim,
+            &mut trial_evm,
+            &prelim_block,
+            &validated,
+            &sim_ctx,
+            &[],
+        )
+        .expect("block simulation must succeed (txs were pre-filtered)");
 
         // ------------------------------------------------------------------
         // Phase 3 — header final avec les roots calculées par la simulation.
@@ -418,6 +434,68 @@ impl Node {
         Ok(())
     }
 
+    /// Valide une transaction EVM de manière **consensus minimale**.
+    ///
+    /// ## Contrat 4c.3.3
+    ///
+    /// Seuls ces checks sont faits **avant** `evm_transact` :
+    ///
+    /// 1. `chain_id` de la tx = `self.evm_chain_id` ;
+    /// 2. signature secp256k1 récupérable → `sender` ;
+    /// 3. `max_fee_per_gas >= base_fee` (sinon rejet immédiat) ;
+    ///
+    /// Le reste (nonce, balance, gas, code, storage…) est **rejeté ou
+    /// accepté par revm** lors de `evm_transact`. Ceci évite de dupliquer
+    /// la logique Ethereum dans Sango.
+    fn validate_evm_tx(
+        &self,
+        evm_tx: &sango_types::EvmTx,
+        base_fee: u128,
+    ) -> Result<ValidatedEvmTransaction, String> {
+        // (1) chain_id.
+        let tx_chain_id = match evm_tx {
+            sango_types::EvmTx::Legacy { chain_id, .. }
+            | sango_types::EvmTx::Eip2930 { chain_id, .. }
+            | sango_types::EvmTx::Eip1559 { chain_id, .. }
+            | sango_types::EvmTx::Eip7702 { chain_id, .. } => *chain_id,
+        };
+        if tx_chain_id != self.evm_chain_id {
+            return Err(format!(
+                "chain_id mismatch: expected {}, got {}",
+                self.evm_chain_id, tx_chain_id
+            ));
+        }
+
+        // (2) Recovery du sender.
+        let sender = sango_evm::recover_sender(evm_tx).map_err(|_| "invalid signature".to_string())?;
+
+        // (3) Fee minimale.
+        let max_fee = sango_evm::max_fee_per_gas(evm_tx);
+        let base_fee_u256 = U256::from(base_fee);
+        if max_fee < base_fee_u256 {
+            return Err("max_fee_per_gas < base_fee".to_string());
+        }
+
+        // (4) Prix effectif (règle Sango unifiée).
+        let effective_gas_price = sango_exec::effective_gas_price(
+            max_fee,
+            sango_evm::max_priority_fee(evm_tx),
+            base_fee_u256,
+        )
+        .map_err(|e| format!("effective_gas_price: {e}"))?;
+
+        Ok(ValidatedEvmTransaction {
+            tx_hash: self.evm_tx_hash(evm_tx),
+            sender,
+            effective_gas_price,
+        })
+    }
+
+    /// Hash canonique d'une tx EVM : `Keccak256(typed_tx_bytes)`.
+    fn evm_tx_hash(&self, evm_tx: &sango_types::EvmTx) -> Hash32 {
+        sango_crypto::keccak256(&evm_tx.encode_ethereum_typed())
+    }
+
     /// Applique un bloc de bout en bout.
     ///
     /// ## Vérifications
@@ -492,27 +570,36 @@ impl Node {
 
         // (4) Validation par transaction.
         //
-        // 4c.3.1b : seules les txs natives sont validées/exécutables. Les
-        // txs EVM sont acceptées dans le **format** du bloc mais leur
-        // validation + exécution arrivent en 4c.3.3.
-        let mut validated = Vec::with_capacity(block.transactions.len());
+        // 4c.3.3 : natifs validés via `sango-tx`, EVM via recovery de
+        // signature + checks consensus minimaux (revm reste l'autorité
+        // d'exécution pour le reste : balance, nonce, gas…).
+        let mut validated: Vec<ValidatedTransaction> =
+            Vec::with_capacity(block.transactions.len());
         for (index, tx) in block.transactions.iter().enumerate() {
-            let Tx::Native(native) = tx else {
-                return Err(NodeError::UnsupportedTxVariant { index });
-            };
-            let sender = self.sender_info(native.sender);
-            let vctx = ValidationContext {
-                expected_chain_id: self.chain_id,
-                base_fee: block.header.base_fee,
-                sender: &sender,
-            };
-            let v = validate_transaction(native, &vctx)
-                .map_err(|e| NodeError::Validation { index, source: e })?;
-            validated.push(v);
+            match tx {
+                Tx::Native(native) => {
+                    let sender = self.sender_info(native.sender);
+                    let vctx = ValidationContext {
+                        expected_chain_id: self.chain_id,
+                        base_fee: block.header.base_fee,
+                        sender: &sender,
+                    };
+                    let v = validate_transaction(native, &vctx)
+                        .map_err(|e| NodeError::Validation { index, source: e })?;
+                    validated.push(ValidatedTransaction::Native(v));
+                }
+                Tx::Evm(evm) => {
+                    let v = self.validate_evm_tx(evm, block.header.base_fee).map_err(|reason| {
+                        NodeError::EvmValidation { index, reason }
+                    })?;
+                    validated.push(ValidatedTransaction::Evm(v));
+                }
+            }
         }
 
         // (5) Snapshot + application.
         let state_before = self.state.clone();
+        let evm_before = self.evm.clone();
         let ctx = ExecutionContext {
             chain_id: self.chain_id,
             base_fee: block.header.base_fee,
@@ -522,12 +609,21 @@ impl Node {
             current_height: block.header.height.get(),
             rewards_enabled: self.rewards_enabled,
             downtime_enabled: false,
+            evm_chain_id: self.evm_chain_id,
         };
-        let result = exec_apply_block(&mut self.state, block, &validated, &ctx, participants)?;
+        let result = exec_apply_block(
+            &mut self.state,
+            &mut self.evm,
+            block,
+            &validated,
+            &ctx,
+            participants,
+        )?;
 
         // (5b) Vérification du `receipt_root`.
         if result.receipt_root != block.header.receipt_root {
             self.state = state_before;
+            self.evm = evm_before;
             return Err(NodeError::ReceiptRootMismatch {
                 expected: result.receipt_root,
                 got: block.header.receipt_root,
@@ -540,6 +636,7 @@ impl Node {
         // En V1 : `evm_state_root = empty_evm_state_root()`.
         if result.state_root != block.header.state_root {
             self.state = state_before;
+            self.evm = evm_before;
             return Err(NodeError::StateRootMismatch {
                 expected: result.state_root,
                 got: block.header.state_root,

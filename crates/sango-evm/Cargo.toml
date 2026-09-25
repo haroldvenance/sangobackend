@@ -14,6 +14,8 @@ sango-crypto.workspace = true
 sango-mpt = { path = "../sango-mpt" }
 sango-types = { path = "../sango-types" }
 
+k256.workspace = true
+
 # revm — fixé par Cargo.lock, pas de version flottante.
 alloy-primitives = "1"
 revm = { version = "42", default-features = false, features = ["std"] }
