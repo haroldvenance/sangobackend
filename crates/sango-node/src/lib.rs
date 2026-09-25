@@ -16,7 +16,7 @@ pub use base_fee::{
     next_base_fee, BASE_FEE_MAX_CHANGE_DENOMINATOR, INITIAL_BASE_FEE, MIN_BASE_FEE,
 };
 pub use config::{ConfigError, NodeConfig, RuntimeGenesis};
-pub use diff::{diff_state, StateDiff};
+pub use diff::{diff_evm, diff_state, EvmDiff, StateDiff};
 pub use driver::{Driver, DriverError, DriverEvent, OutgoingMessage};
 pub use error::NodeError;
 pub use node::Node;

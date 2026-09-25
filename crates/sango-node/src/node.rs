@@ -17,7 +17,7 @@ use sango_tx::{validate_transaction, SenderInfo, ValidationContext};
 use sango_types::{Block, BlockHeader, ChainTip, Transaction, Tx};
 
 use crate::base_fee::{next_base_fee, INITIAL_BASE_FEE};
-use crate::diff::diff_state;
+use crate::diff::{diff_evm, diff_state, EvmDiff};
 use crate::error::NodeError;
 
 /// Nœud Sango.
@@ -74,10 +74,53 @@ impl Node {
 
         let tip = storage.get_chain_tip()?;
 
+        // --- Restauration de l'EvmState ---
+        let mut evm = EvmState::new();
+
+        for (key_bytes, value) in storage.iter_column(Column::EvmAccounts)? {
+            if key_bytes.len() != 32 {
+                return Err(NodeError::CorruptedStateKey {
+                    got: key_bytes.len(),
+                });
+            }
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(&key_bytes);
+            evm.restore_account_entry(Hash32::from_bytes(raw), value);
+        }
+
+        for (key_bytes, value) in storage.iter_column(Column::EvmStorage)? {
+            if key_bytes.len() != 52 {
+                return Err(NodeError::CorruptedStateKey {
+                    got: key_bytes.len(),
+                });
+            }
+            let mut addr_raw = [0u8; 20];
+            addr_raw.copy_from_slice(&key_bytes[..20]);
+            let mut slot_raw = [0u8; 32];
+            slot_raw.copy_from_slice(&key_bytes[20..]);
+            evm.restore_storage_entry(
+                EvmAddress::from_bytes(addr_raw),
+                Hash32::from_bytes(slot_raw),
+                value,
+            );
+        }
+
+        for (key_bytes, value) in storage.iter_column(Column::EvmCode)? {
+            if key_bytes.len() != 32 {
+                return Err(NodeError::CorruptedStateKey {
+                    got: key_bytes.len(),
+                });
+            }
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(&key_bytes);
+            evm.restore_code_entry(Hash32::from_bytes(raw), value)
+                .map_err(NodeError::Evm)?;
+        }
+
         Ok(Self {
             storage,
             state,
-            evm: EvmState::new(),
+            evm,
             chain_id,
             evm_chain_id: DEFAULT_EVM_CHAIN_ID,
             initial_supply,
@@ -467,7 +510,8 @@ impl Node {
         }
 
         // (2) Recovery du sender.
-        let sender = sango_evm::recover_sender(evm_tx).map_err(|_| "invalid signature".to_string())?;
+        let sender =
+            sango_evm::recover_sender(evm_tx).map_err(|_| "invalid signature".to_string())?;
 
         // (3) Fee minimale.
         let max_fee = sango_evm::max_fee_per_gas(evm_tx);
@@ -573,8 +617,7 @@ impl Node {
         // 4c.3.3 : natifs validés via `sango-tx`, EVM via recovery de
         // signature + checks consensus minimaux (revm reste l'autorité
         // d'exécution pour le reste : balance, nonce, gas…).
-        let mut validated: Vec<ValidatedTransaction> =
-            Vec::with_capacity(block.transactions.len());
+        let mut validated: Vec<ValidatedTransaction> = Vec::with_capacity(block.transactions.len());
         for (index, tx) in block.transactions.iter().enumerate() {
             match tx {
                 Tx::Native(native) => {
@@ -589,9 +632,9 @@ impl Node {
                     validated.push(ValidatedTransaction::Native(v));
                 }
                 Tx::Evm(evm) => {
-                    let v = self.validate_evm_tx(evm, block.header.base_fee).map_err(|reason| {
-                        NodeError::EvmValidation { index, reason }
-                    })?;
+                    let v = self
+                        .validate_evm_tx(evm, block.header.base_fee)
+                        .map_err(|reason| NodeError::EvmValidation { index, reason })?;
                     validated.push(ValidatedTransaction::Evm(v));
                 }
             }
@@ -643,8 +686,11 @@ impl Node {
             });
         }
 
-        // (6) Diff.
+        // (6) Diff natif.
         let diff = diff_state(&state_before, &self.state);
+
+        // (6b) Diff EVM.
+        let evm_diff = diff_evm(&evm_before, &self.evm);
 
         // (7) Batch.
         let mut batch = Batch::new();
@@ -679,6 +725,7 @@ impl Node {
         for k in &diff.deletes {
             batch.delete(Column::StateNative, k.as_bytes());
         }
+        add_evm_diff_to_batch(&mut batch, &evm_diff);
         batch.put(
             Column::Metadata,
             metadata_key(MetadataKey::TotalBurned),
@@ -718,6 +765,46 @@ impl Node {
     }
 }
 
+/// Ajoute les écritures EVM d'un diff à un `Batch` existant.
+///
+/// ## Format des clés
+///
+/// - `EvmAccounts` : `keccak256(evm_addr)` (32 bytes)
+/// - `EvmStorage`  : `evm_addr(20) || slot_hash(32)` (52 bytes)
+/// - `EvmCode`     : `code_hash` (32 bytes)
+fn add_evm_diff_to_batch(batch: &mut Batch, diff: &EvmDiff) {
+    for (k, v) in &diff.account_inserts {
+        batch.put(Column::EvmAccounts, k.as_bytes(), v.clone());
+    }
+    for (k, v) in &diff.account_updates {
+        batch.put(Column::EvmAccounts, k.as_bytes(), v.clone());
+    }
+    for k in &diff.account_deletes {
+        batch.delete(Column::EvmAccounts, k.as_bytes());
+    }
+
+    // Storage : clé composite 20 || 32.
+    let storage_key = |addr: &EvmAddress, slot: &Hash32| -> [u8; 52] {
+        let mut k = [0u8; 52];
+        k[..20].copy_from_slice(addr.as_bytes());
+        k[20..].copy_from_slice(slot.as_bytes());
+        k
+    };
+    for (addr, slot, v) in &diff.storage_inserts {
+        batch.put(Column::EvmStorage, storage_key(addr, slot), v.clone());
+    }
+    for (addr, slot, v) in &diff.storage_updates {
+        batch.put(Column::EvmStorage, storage_key(addr, slot), v.clone());
+    }
+    for (addr, slot) in &diff.storage_deletes {
+        batch.delete(Column::EvmStorage, storage_key(addr, slot));
+    }
+
+    for (ch, bytecode) in &diff.code_inserts {
+        batch.put(Column::EvmCode, ch.as_bytes(), bytecode.clone());
+    }
+}
+
 /// Chain ID EVM par défaut (« SANGO » en ASCII).
 pub const DEFAULT_EVM_CHAIN_ID: u64 = 0x53_41_4e_47_4f;
 
@@ -746,6 +833,23 @@ impl Node {
     /// Genesis).
     pub fn set_evm_chain_id(&mut self, id: u64) {
         self.evm_chain_id = id;
+    }
+
+    /// **Tests uniquement** : persiste l'état EVM courant comme un diff
+    /// complet depuis un état vide.
+    ///
+    /// En production, `apply_block` écrit un **diff** incrémental via
+    /// [`add_evm_diff_to_batch`]. Cette méthode existe pour tester la
+    /// restauration RocksDB sans avoir à construire un bloc contenant des
+    /// transactions EVM.
+    #[doc(hidden)]
+    pub fn persist_evm_full_for_test(&mut self) -> Result<(), NodeError> {
+        let diff = diff_evm(&EvmState::new(), &self.evm);
+        let mut batch = Batch::new();
+        add_evm_diff_to_batch(&mut batch, &diff);
+        self.storage.write_batch(batch)?;
+        self.storage.flush()?;
+        Ok(())
     }
 
     /// Solde EVM d'une adresse.

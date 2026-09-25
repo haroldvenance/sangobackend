@@ -32,6 +32,4 @@ pub use revm_bridge::{
 };
 pub use state::{is_eoa_empty, EvmState};
 pub use storage::{decode_storage_value, encode_storage_value, slot_mpt_key, StorageTrie};
-pub use tx_recover::{
-    effective_priority_fee, max_fee_per_gas, max_priority_fee, recover_sender,
-};
+pub use tx_recover::{effective_priority_fee, max_fee_per_gas, max_priority_fee, recover_sender};

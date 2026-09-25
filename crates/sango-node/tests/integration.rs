@@ -4,9 +4,7 @@ use sango_crypto::{derive_native_address, NativeKeypair};
 use sango_exec::NATIVE_TRANSFER_GAS;
 use sango_node::{Node, INITIAL_BASE_FEE};
 use sango_primitives::{Amount, ChainId32, Epoch, Hash32, Height, NativeAddress, Round, Signature};
-use sango_types::{
-    Block, BlockHeader, LogsBloom, Receipt, ReceiptStatus, Transaction, Tx, TxKind,
-};
+use sango_types::{Block, BlockHeader, LogsBloom, Receipt, ReceiptStatus, Transaction, Tx, TxKind};
 
 const INITIAL_SUPPLY_SANGO: u128 = 1_000_000_000;
 

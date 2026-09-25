@@ -37,12 +37,16 @@ pub enum Column {
     EvmAccounts,
     /// Storage EVM par compte.
     ///
-    /// Clé = `Keccak256(evm_address) || Keccak256(slot_be_32)` (64 bytes).
+    /// Clé = `evm_address(20 bytes) || slot_hash(32 bytes)` (52 bytes).
     /// Valeur = RLP `value_minimal_be`.
     ///
-    /// Le préfixe `Keccak256(evm_address)` est **purement physique** : il
-    /// identifie le compte propriétaire dans le KV store. Il ne fait **pas**
-    /// partie de la clé du storage MPT (qui est `Keccak256(slot_be_32)`).
+    /// Le préfixe `evm_address` est **purement physique** : il identifie le
+    /// compte propriétaire dans le KV store. Il ne fait **pas** partie de
+    /// la clé du storage MPT (qui est `Keccak256(slot_be_32)`).
+    ///
+    /// **Pourquoi l'adresse en clair et pas `Keccak256(addr)` ?** Parce
+    /// que `Keccak256` n'est pas inversible, et le restore au démarrage a
+    /// besoin de l'adresse pour reconstruire l'`EvmState`.
     EvmStorage,
     /// Code EVM (bytecode de contrat).
     ///

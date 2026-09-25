@@ -47,15 +47,18 @@ pub fn recover_sender(tx: &EvmTx) -> Result<EvmAddress, EvmError> {
     sig_bytes[..32].copy_from_slice(&r.to_be_bytes::<32>());
     sig_bytes[32..].copy_from_slice(&s.to_be_bytes::<32>());
 
-    let signature = k256::ecdsa::Signature::from_slice(&sig_bytes)
-        .map_err(|_| EvmError::InvalidSignature)?;
+    let signature =
+        k256::ecdsa::Signature::from_slice(&sig_bytes).map_err(|_| EvmError::InvalidSignature)?;
 
-    let recovery_id = k256::ecdsa::RecoveryId::try_from(y_parity)
-        .map_err(|_| EvmError::InvalidSignature)?;
+    let recovery_id =
+        k256::ecdsa::RecoveryId::try_from(y_parity).map_err(|_| EvmError::InvalidSignature)?;
 
-    let verifying_key =
-        k256::ecdsa::VerifyingKey::recover_from_prehash(prehash.as_bytes(), &signature, recovery_id)
-            .map_err(|_| EvmError::InvalidSignature)?;
+    let verifying_key = k256::ecdsa::VerifyingKey::recover_from_prehash(
+        prehash.as_bytes(),
+        &signature,
+        recovery_id,
+    )
+    .map_err(|_| EvmError::InvalidSignature)?;
 
     let point = verifying_key.to_encoded_point(false);
     let encoded = point.as_bytes();
@@ -73,9 +76,12 @@ pub fn recover_sender(tx: &EvmTx) -> Result<EvmAddress, EvmError> {
 pub fn max_fee_per_gas(tx: &EvmTx) -> U256 {
     match tx {
         EvmTx::Legacy { gas_price, .. } | EvmTx::Eip2930 { gas_price, .. } => *gas_price,
-        EvmTx::Eip1559 { max_fee_per_gas, .. } | EvmTx::Eip7702 { max_fee_per_gas, .. } => {
-            *max_fee_per_gas
+        EvmTx::Eip1559 {
+            max_fee_per_gas, ..
         }
+        | EvmTx::Eip7702 {
+            max_fee_per_gas, ..
+        } => *max_fee_per_gas,
     }
 }
 
@@ -301,7 +307,9 @@ mod tests {
         };
         let payload = signing_payload(&unsigned);
         let prehash = keccak256(&payload);
-        let (sig, recid) = sk.sign_prehash_recoverable(prehash.as_bytes()).expect("sign");
+        let (sig, recid) = sk
+            .sign_prehash_recoverable(prehash.as_bytes())
+            .expect("sign");
         let sig_bytes = sig.to_bytes();
         let mut r = [0u8; 32];
         let mut s = [0u8; 32];

@@ -398,9 +398,12 @@ impl Default for EvmMempool {
 pub fn max_fee_per_gas(tx: &EvmTx) -> U256 {
     match tx {
         EvmTx::Legacy { gas_price, .. } | EvmTx::Eip2930 { gas_price, .. } => *gas_price,
-        EvmTx::Eip1559 { max_fee_per_gas, .. } | EvmTx::Eip7702 { max_fee_per_gas, .. } => {
-            *max_fee_per_gas
+        EvmTx::Eip1559 {
+            max_fee_per_gas, ..
         }
+        | EvmTx::Eip7702 {
+            max_fee_per_gas, ..
+        } => *max_fee_per_gas,
     }
 }
 
@@ -1034,10 +1037,7 @@ mod tests {
         let (tx2, _) = signed_legacy(&sk, 2, 100);
         pool.add(tx0, u(0), 0).unwrap();
         pool.add(tx1, u(0), 0).unwrap();
-        assert!(matches!(
-            pool.add(tx2, u(0), 0),
-            Err(EvmMempoolError::Full)
-        ));
+        assert!(matches!(pool.add(tx2, u(0), 0), Err(EvmMempoolError::Full)));
     }
 
     #[test]

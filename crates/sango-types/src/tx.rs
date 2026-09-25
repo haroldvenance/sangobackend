@@ -158,9 +158,7 @@ mod tests {
     use super::*;
     use crate::evm::{EvmAccessListItem, EvmAuthorization};
     use crate::transaction::TxKind;
-    use sango_primitives::{
-        Amount, ChainId32, EvmAddress, NativeAddress, Signature, U256,
-    };
+    use sango_primitives::{Amount, ChainId32, EvmAddress, NativeAddress, Signature, U256};
 
     fn native_tx(nonce: u64) -> Transaction {
         Transaction {

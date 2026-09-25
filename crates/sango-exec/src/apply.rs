@@ -664,8 +664,8 @@ pub fn apply_block(
 
     // 1. Appliquer les transactions (sans toucher aux compteurs globaux).
     let mut applied: Vec<Applied> = Vec::with_capacity(validated.len());
-    let mut total_gas_used: u64 = 0;    // natif + EVM (pour le receipt)
-    let mut total_gas_used_native: u64 = 0;  // natif uniquement (pour NativeState)
+    let mut total_gas_used: u64 = 0; // natif + EVM (pour le receipt)
+    let mut total_gas_used_native: u64 = 0; // natif uniquement (pour NativeState)
     let mut total_fee: u128 = 0;
     let mut total_validator_fee: u128 = 0;
     let mut total_burned: u128 = 0;
@@ -725,8 +725,9 @@ pub fn apply_block(
                         return Err(ApplyError::EvmExecution(e));
                     }
                 };
-                let total_fee_u256 =
-                    ve.effective_gas_price.saturating_mul(U256::from(outcome.gas_used));
+                let total_fee_u256 = ve
+                    .effective_gas_price
+                    .saturating_mul(U256::from(outcome.gas_used));
                 let total_fee_u128 = u256_to_u128_saturating(total_fee_u256);
 
                 let a = AppliedEvmTx {
@@ -1359,7 +1360,15 @@ mod tests {
             evidences: Vec::new(),
             transactions: Vec::new(),
         };
-        let r = apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[], &exec_ctx(), &[]).unwrap();
+        let r = apply_block(
+            &mut state,
+            &mut sango_evm::EvmState::new(),
+            &block,
+            &[],
+            &exec_ctx(),
+            &[],
+        )
+        .unwrap();
         assert_eq!(r.apply_result.applied.len(), 0);
         assert_eq!(r.receipts.len(), 0);
         assert_eq!(r.gas_used, 0);
@@ -1397,7 +1406,18 @@ mod tests {
             evidences: Vec::new(),
             transactions: vec![Tx::Native(tx1.clone()), Tx::Native(tx2.clone())],
         };
-        let r = apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[ValidatedTransaction::Native(v1), ValidatedTransaction::Native(v2)], &exec_ctx(), &[]).unwrap();
+        let r = apply_block(
+            &mut state,
+            &mut sango_evm::EvmState::new(),
+            &block,
+            &[
+                ValidatedTransaction::Native(v1),
+                ValidatedTransaction::Native(v2),
+            ],
+            &exec_ctx(),
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(r.receipts.len(), 2);
         assert_eq!(r.receipts[0].tx_hash, tx1.hash());
@@ -1435,7 +1455,15 @@ mod tests {
             transactions: vec![Tx::Native(tx)],
         };
         let initial = exec_ctx().initial_supply;
-        let r = apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[ValidatedTransaction::Native(v)], &exec_ctx(), &[]).unwrap();
+        let r = apply_block(
+            &mut state,
+            &mut sango_evm::EvmState::new(),
+            &block,
+            &[ValidatedTransaction::Native(v)],
+            &exec_ctx(),
+            &[],
+        )
+        .unwrap();
 
         let expected_burned = Amount::from_base_units(25_200);
         assert_eq!(r.total_burned_after, expected_burned);
@@ -1477,7 +1505,18 @@ mod tests {
             evidences: Vec::new(),
             transactions: vec![Tx::Native(tx1), Tx::Native(tx2)],
         };
-        let err = apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[ValidatedTransaction::Native(v1), ValidatedTransaction::Native(v2)], &exec_ctx(), &[]).unwrap_err();
+        let err = apply_block(
+            &mut state,
+            &mut sango_evm::EvmState::new(),
+            &block,
+            &[
+                ValidatedTransaction::Native(v1),
+                ValidatedTransaction::Native(v2),
+            ],
+            &exec_ctx(),
+            &[],
+        )
+        .unwrap_err();
         assert!(matches!(err, ApplyError::InsufficientBalance { .. }));
         assert_eq!(state.native_state_root(), root_before);
         assert_eq!(state.total_burned(), Amount::ZERO);
@@ -1503,7 +1542,15 @@ mod tests {
             value: 100,
             bootstrap_public_key: None,
         });
-        let err = apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[v], &exec_ctx(), &[]).unwrap_err();
+        let err = apply_block(
+            &mut state,
+            &mut sango_evm::EvmState::new(),
+            &block,
+            &[v],
+            &exec_ctx(),
+            &[],
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             ApplyError::LengthMismatch {
@@ -1542,7 +1589,15 @@ mod tests {
             evidences: Vec::new(),
             transactions: vec![Tx::Native(tx)],
         };
-        let r = apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[ValidatedTransaction::Native(v)], &exec_ctx(), &[]).unwrap();
+        let r = apply_block(
+            &mut state,
+            &mut sango_evm::EvmState::new(),
+            &block,
+            &[ValidatedTransaction::Native(v)],
+            &exec_ctx(),
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(r.native_state_root, state.native_state_root());
         assert_eq!(r.evm_state_root, empty_evm_state_root());
@@ -1587,7 +1642,15 @@ mod tests {
         };
 
         let ctx = exec_ctx_with_downtime();
-        apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[], &ctx, &[a]).unwrap();
+        apply_block(
+            &mut state,
+            &mut sango_evm::EvmState::new(),
+            &block,
+            &[],
+            &ctx,
+            &[a],
+        )
+        .unwrap();
 
         let info_a = state.get_validator(&a).unwrap();
         let info_b = state.get_validator(&b).unwrap();
@@ -1624,7 +1687,15 @@ mod tests {
             transactions: Vec::new(),
         };
         let ctx = exec_ctx_with_downtime();
-        apply_block(&mut state, &mut sango_evm::EvmState::new(), &block, &[], &ctx, &[]).unwrap();
+        apply_block(
+            &mut state,
+            &mut sango_evm::EvmState::new(),
+            &block,
+            &[],
+            &ctx,
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(state.get_validator(&addr).unwrap().downtime_missed, 1);
     }
@@ -1658,12 +1729,28 @@ mod tests {
         };
 
         // Variante A : participants = [sender].
-        let ra = apply_block(&mut state_a, &mut sango_evm::EvmState::new(), &block, &[ValidatedTransaction::Native(v.clone())], &exec_ctx(), &[sender]).unwrap();
+        let ra = apply_block(
+            &mut state_a,
+            &mut sango_evm::EvmState::new(),
+            &block,
+            &[ValidatedTransaction::Native(v.clone())],
+            &exec_ctx(),
+            &[sender],
+        )
+        .unwrap();
 
         // Variante B : participants = [] (comme si un autre nœud avait vu
         // un `CommitCertificate` différent). Doit donner le **même** root,
         // car le downtime est désactivé.
-        let rb = apply_block(&mut state_b, &mut sango_evm::EvmState::new(), &block, &[ValidatedTransaction::Native(v)], &exec_ctx(), &[]).unwrap();
+        let rb = apply_block(
+            &mut state_b,
+            &mut sango_evm::EvmState::new(),
+            &block,
+            &[ValidatedTransaction::Native(v)],
+            &exec_ctx(),
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(
             ra.native_state_root, rb.native_state_root,
