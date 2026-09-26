@@ -358,7 +358,16 @@ fn eth_get_logs_historical_range_multiple_blocks() {
     let contract = contract_address(&alice, 0);
 
     // 1. Déployer.
-    let deploy = sign_legacy(&alice_sk, EVM_CHAIN_ID, 0, 1, 300_000, None, U256::ZERO, init_code);
+    let deploy = sign_legacy(
+        &alice_sk,
+        EVM_CHAIN_ID,
+        0,
+        1,
+        300_000,
+        None,
+        U256::ZERO,
+        init_code,
+    );
     backend
         .eth_send_raw_transaction(&deploy.encode_ethereum_typed())
         .expect("deploy");
@@ -370,7 +379,14 @@ fn eth_get_logs_historical_range_multiple_blocks() {
     // 2. Appeler 3 fois le contrat → 3 blocs contenant un log chacun.
     for nonce in 1..=3u64 {
         let call = sign_legacy(
-            &alice_sk, EVM_CHAIN_ID, nonce, 1, 100_000, Some(contract), U256::ZERO, Vec::new(),
+            &alice_sk,
+            EVM_CHAIN_ID,
+            nonce,
+            1,
+            100_000,
+            Some(contract),
+            U256::ZERO,
+            Vec::new(),
         );
         backend
             .eth_send_raw_transaction(&call.encode_ethereum_typed())

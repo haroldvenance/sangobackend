@@ -44,11 +44,16 @@
 //!
 //! ## HTTP
 //!
-//! - `POST /rpc`
+//! - `POST /rpc` (et `/`)
 //! - `Content-Type: application/json`
 //! - `Content-Length` obligatoire
 //! - corps max 1 MiB
-//! - pas de keep-alive
+//! - **keep-alive** : plusieurs requêtes sur la même connexion TCP
+//!   (`Connection: keep-alive`, défaut HTTP/1.1)
+//! - `Connection: close` → ferme après la réponse
+//! - Timeout d'inactivité configurable (`RpcServer::with_idle_timeout`)
+//! - Limite de requêtes par connexion (`RpcServer::with_max_requests`)
+//! - Pas de TLS (étape A2 ultérieure), pas de chunked encoding
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

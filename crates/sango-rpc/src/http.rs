@@ -1,12 +1,28 @@
-//! Serveur HTTP/1.1 minimal.
+//! Serveur HTTP/1.1 minimal avec keep-alive.
 //!
-//! Ne gère que :
+//! ## Support
 //!
-//! - la méthode `POST` sur `/rpc` ;
-//! - le header `Content-Length` ;
-//! - une réponse `200 OK` avec `Content-Type: application/json`.
+//! - `POST /rpc` (et `/`)
+//! - `Content-Type: application/json`
+//! - `Content-Length` obligatoire
+//! - Body max 1 MiB
+//! - **Keep-alive** : une même connexion TCP peut servir N requêtes
+//!   successives (`Connection: keep-alive`, défaut HTTP/1.1)
+//! - Détection `Connection: close` → ferme après la réponse
+//! - Timeout d'inactivité configurable côté serveur (voir `server.rs`)
 //!
-//! Pas de keep-alive, pas de chunked encoding, pas de TLS.
+//! ## Non supporté (V1)
+//!
+//! - TLS (étape A2 ultérieure)
+//! - Chunked transfer-encoding
+//! - HTTP/2
+//!
+//! ## Contrat sur `read_request`
+//!
+//! Le `BufReader<TcpStream>` **doit persister** entre les appels sur une
+//! même connexion : il contient le buffer des bytes déjà lus (headers +
+//! début du body suivant). Recréer un `BufReader` à chaque appel casserait
+//! le keep-alive en perdant ces bytes.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -20,6 +36,11 @@ pub struct HttpRequest {
     pub path: String,
     /// Corps brut.
     pub body: Vec<u8>,
+    /// Vrai si le client accepte que la connexion soit réutilisée.
+    ///
+    /// - HTTP/1.1 : `true` par défaut.
+    /// - `Connection: close` : `false`.
+    pub keep_alive: bool,
 }
 
 /// Erreur HTTP (renvoyée au client).
@@ -73,24 +94,55 @@ impl HttpError {
             message: msg.into(),
         }
     }
+
+    /// 408 Request Timeout.
+    ///
+    /// Utilisé quand le serveur a atteint son `idle_timeout` sans avoir lu
+    /// la ligne de requête complète. Le serveur peut alors fermer la
+    /// connexion sans écrire de réponse.
+    #[must_use]
+    pub fn request_timeout() -> Self {
+        Self {
+            status: 408,
+            reason: "Request Timeout",
+            message: "idle timeout exceeded".into(),
+        }
+    }
 }
 
 /// Taille maximale d'un corps HTTP (1 MiB).
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-/// Lit une requête HTTP depuis un stream.
-pub fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, HttpError> {
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|e| HttpError::bad_request(format!("stream clone: {e}")))?,
-    );
+/// Vrai si l'erreur d'I/O est un timeout de lecture.
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
 
+/// Lit une requête HTTP depuis un reader persistant.
+///
+/// ## Retour
+///
+/// - `Ok(None)` : EOF propre (le client a fermé la connexion avant
+///   d'envoyer une requête). Appelant doit fermer proprement.
+/// - `Ok(Some(req))` : requête lue.
+/// - `Err(e)` : erreur de parsing ou timeout. Voir `e.status`.
+///
+/// ## Limites
+///
+/// - Body > `MAX_BODY_BYTES` → `HttpError::payload_too_large` (413).
+/// - Timeout d'idle (dépassé côté serveur) → `HttpError::request_timeout` (408).
+pub fn read_request(reader: &mut BufReader<TcpStream>) -> Result<Option<HttpRequest>, HttpError> {
     // Ligne de requête.
     let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .map_err(|e| HttpError::bad_request(format!("read request line: {e}")))?;
+    match reader.read_line(&mut request_line) {
+        Ok(0) => return Ok(None), // EOF propre avant toute donnée.
+        Ok(_) => {}
+        Err(e) if is_timeout(&e) => return Err(HttpError::request_timeout()),
+        Err(e) => return Err(HttpError::bad_request(format!("read request line: {e}"))),
+    }
     let mut parts = request_line.split_whitespace();
     let method = parts
         .next()
@@ -100,15 +152,19 @@ pub fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, HttpError> {
         .next()
         .ok_or_else(|| HttpError::bad_request("missing path"))?
         .to_string();
-    // Version ignorée.
+    // Version HTTP ignorée (on suppose 1.1).
 
     // Headers.
     let mut content_length: Option<usize> = None;
+    let mut keep_alive = true; // défaut HTTP/1.1
     loop {
         let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| HttpError::bad_request(format!("read header: {e}")))?;
+        match reader.read_line(&mut line) {
+            Ok(0) => return Err(HttpError::bad_request("unexpected EOF in headers")),
+            Ok(_) => {}
+            Err(e) if is_timeout(&e) => return Err(HttpError::request_timeout()),
+            Err(e) => return Err(HttpError::bad_request(format!("read header: {e}"))),
+        }
         if line == "\r\n" || line == "\n" {
             break;
         }
@@ -119,6 +175,10 @@ pub fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, HttpError> {
                     .parse()
                     .map_err(|e| HttpError::bad_request(format!("bad content-length: {e}")))?,
             );
+        } else if let Some(rest) = lower.strip_prefix("connection:") {
+            if rest.trim() == "close" {
+                keep_alive = false;
+            }
         }
     }
 
@@ -131,41 +191,56 @@ pub fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, HttpError> {
 
     let mut body = vec![0u8; len];
     if len > 0 {
-        reader
-            .read_exact(&mut body)
-            .map_err(|e| HttpError::bad_request(format!("read body: {e}")))?;
+        match reader.read_exact(&mut body) {
+            Ok(_) => {}
+            Err(e) if is_timeout(&e) => return Err(HttpError::request_timeout()),
+            Err(e) => return Err(HttpError::bad_request(format!("read body: {e}"))),
+        }
     }
 
-    Ok(HttpRequest { method, path, body })
+    Ok(Some(HttpRequest {
+        method,
+        path,
+        body,
+        keep_alive,
+    }))
 }
 
-/// Envoie une réponse HTTP 200 avec un corps JSON.
-pub fn write_json_ok(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+/// Écrit une réponse HTTP 200 avec un corps JSON.
+pub fn write_json_ok(stream: &mut TcpStream, body: &[u8], keep_alive: bool) -> std::io::Result<()> {
+    let conn = if keep_alive { "keep-alive" } else { "close" };
     let header = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\
+         Connection: {}\r\n\
          \r\n",
-        body.len()
+        body.len(),
+        conn
     );
     stream.write_all(header.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()
 }
 
-/// Envoie une réponse HTTP d'erreur.
-pub fn write_error(stream: &mut TcpStream, err: &HttpError) -> std::io::Result<()> {
+/// Écrit une réponse HTTP d'erreur.
+pub fn write_error(
+    stream: &mut TcpStream,
+    err: &HttpError,
+    keep_alive: bool,
+) -> std::io::Result<()> {
+    let conn = if keep_alive { "keep-alive" } else { "close" };
     let body = format!("{}\n", err.message);
     let header = format!(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: text/plain\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\
+         Connection: {}\r\n\
          \r\n",
         err.status,
         err.reason,
-        body.len()
+        body.len(),
+        conn
     );
     stream.write_all(header.as_bytes())?;
     stream.write_all(body.as_bytes())?;
@@ -183,7 +258,6 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let payload = raw.to_vec();
 
-        // Client.
         let client = std::thread::spawn(move || {
             let mut s = TcpStream::connect(addr).unwrap();
             s.write_all(&payload).unwrap();
@@ -193,11 +267,14 @@ mod tests {
             buf
         });
 
-        // Serveur (une seule requête).
-        let (mut stream, _) = listener.accept().unwrap();
-        let req = read_request(&mut stream).expect("parse");
-        write_json_ok(&mut stream, b"{\"ok\":true}").unwrap();
-        drop(stream);
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let req = read_request(&mut reader)
+            .expect("parse ok")
+            .expect("not EOF");
+        // Réponse unique, fermeture explicite.
+        write_json_ok(reader.get_mut(), b"{\"ok\":true}", false).unwrap();
+        drop(reader);
 
         let _ = req;
         client.join().unwrap()
@@ -211,6 +288,59 @@ mod tests {
         assert!(s.contains("200 OK"));
         assert!(s.contains("Content-Type: application/json"));
         assert!(s.contains("\"ok\":true"));
+        assert!(s.contains("Connection: close"));
+    }
+
+    #[test]
+    fn detects_connection_close_header() {
+        let raw = b"POST /rpc HTTP/1.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = raw.to_vec();
+        let client = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(&payload).unwrap();
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let req = read_request(&mut reader).unwrap().unwrap();
+        assert!(
+            !req.keep_alive,
+            "Connection: close doit désactiver keep-alive"
+        );
+        write_json_ok(reader.get_mut(), b"{}", false).unwrap();
+        drop(reader);
+        let _ = client.join();
+    }
+
+    #[test]
+    fn keep_alive_default_on_http11() {
+        let raw = b"POST /rpc HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = raw.to_vec();
+        let client = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(&payload).unwrap();
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let req = read_request(&mut reader).unwrap().unwrap();
+        assert!(
+            req.keep_alive,
+            "HTTP/1.1 sans Connection: close → keep-alive"
+        );
+        write_json_ok(reader.get_mut(), b"{}", false).unwrap();
+        drop(reader);
+        let _ = client.join();
     }
 
     #[test]
@@ -230,15 +360,35 @@ mod tests {
             buf
         });
 
-        let (mut stream, _) = listener.accept().unwrap();
-        match read_request(&mut stream) {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        match read_request(&mut reader) {
             Err(e) => {
                 assert_eq!(e.status, 413);
-                write_error(&mut stream, &e).unwrap();
+                write_error(reader.get_mut(), &e, false).unwrap();
             }
             Ok(_) => panic!("devrait rejeter"),
         }
-        drop(stream);
+        drop(reader);
+        let _ = client.join();
+    }
+
+    #[test]
+    fn eof_before_request_returns_none() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = std::thread::spawn(move || {
+            let s = TcpStream::connect(addr).unwrap();
+            // Ferme immédiatement sans rien envoyer.
+            s.shutdown(std::net::Shutdown::Both).ok();
+            drop(s);
+        });
+
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let result = read_request(&mut reader).unwrap();
+        assert!(result.is_none(), "EOF propre → None");
         let _ = client.join();
     }
 }
