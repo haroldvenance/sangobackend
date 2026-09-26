@@ -11,12 +11,37 @@ use sango_wallet::commands::{
 };
 use sango_wallet::evm::{EvmTxBuilder, FeeType};
 use sango_wallet::keystore::KeyFile;
-use sango_wallet::rpc_client::RpcClient;
+use sango_wallet::rpc_client::{RpcClient, TlsClientOptions, TrustMode};
 use sango_wallet::WalletError;
 
 const DEFAULT_RPC: &str = "127.0.0.1:8545";
 const DEFAULT_MAX_FEE: u128 = 1_000_000;
 const DEFAULT_PRIORITY_FEE: u128 = 0;
+
+fn build_rpc_client(opts: &sango_wallet::cli::GlobalOpts) -> Result<RpcClient, WalletError> {
+    let endpoint = opts.rpc.as_deref().unwrap_or(DEFAULT_RPC);
+
+    if opts.rpc_tls_insecure {
+        return RpcClient::new_with_tls(
+            endpoint,
+            TlsClientOptions {
+                trust: TrustMode::AcceptAny,
+                server_name: "localhost".to_string(),
+            },
+        );
+    }
+    if let Some(path) = &opts.rpc_tls_ca {
+        let ca_der = std::fs::read(path)?;
+        return RpcClient::new_with_tls(
+            endpoint,
+            TlsClientOptions {
+                trust: TrustMode::CustomCa(ca_der),
+                server_name: "localhost".to_string(),
+            },
+        );
+    }
+    Ok(RpcClient::new(endpoint))
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -34,38 +59,40 @@ fn main() -> ExitCode {
 
 fn run(args: &[String]) -> Result<(), WalletError> {
     let (opts, cmd, rest) = parse_args(args)?;
-    let rpc_endpoint: &str = opts.rpc.as_deref().unwrap_or(DEFAULT_RPC);
-    let keyfile_path = match opts.keyfile {
+    let keyfile_path = match &opts.keyfile {
         Some(p) => std::path::PathBuf::from(p),
         None => KeyFile::default_path()?,
     };
     let kf_path = keyfile_path.as_path();
+
+    // Construire le client RPC une seule fois (HTTP ou HTTPS).
+    let rpc = build_rpc_client(&opts)?;
 
     match cmd.as_str() {
         // --- Natif ---
         "new" => cmd_new(kf_path),
         "address" => cmd_address(kf_path),
         "pubkey" => cmd_pubkey(kf_path),
-        "balance" => cmd_balance(rpc_endpoint, kf_path, &rest),
-        "nonce" => cmd_nonce(rpc_endpoint, kf_path, &rest),
-        "info" => cmd_info(rpc_endpoint),
-        "send" => cmd_send(rpc_endpoint, kf_path, &rest),
-        "stake" => cmd_stake(rpc_endpoint, kf_path, &rest),
-        "unstake" => cmd_unstake(rpc_endpoint, kf_path, &rest),
-        "delegate" => cmd_delegate(rpc_endpoint, kf_path, &rest),
-        "undelegate" => cmd_undelegate(rpc_endpoint, kf_path, &rest),
-        "claim" => cmd_claim(rpc_endpoint, kf_path, &rest),
-        "register-validator" => cmd_register(rpc_endpoint, kf_path, &rest),
-        "update-commission" => cmd_update_commission(rpc_endpoint, kf_path, &rest),
-        "unjail" => cmd_unjail(rpc_endpoint, kf_path, &rest),
+        "balance" => cmd_balance(&rpc, kf_path, &rest),
+        "nonce" => cmd_nonce(&rpc, kf_path, &rest),
+        "info" => cmd_info(&rpc),
+        "send" => cmd_send(&rpc, kf_path, &rest),
+        "stake" => cmd_stake(&rpc, kf_path, &rest),
+        "unstake" => cmd_unstake(&rpc, kf_path, &rest),
+        "delegate" => cmd_delegate(&rpc, kf_path, &rest),
+        "undelegate" => cmd_undelegate(&rpc, kf_path, &rest),
+        "claim" => cmd_claim(&rpc, kf_path, &rest),
+        "register-validator" => cmd_register(&rpc, kf_path, &rest),
+        "update-commission" => cmd_update_commission(&rpc, kf_path, &rest),
+        "unjail" => cmd_unjail(&rpc, kf_path, &rest),
 
         // --- EVM ---
         "evm-new" => cmd_evm_new(kf_path),
         "evm-address" => cmd_evm_address(kf_path),
-        "evm-balance" => cmd_evm_balance(rpc_endpoint, kf_path, &rest),
-        "evm-nonce" => cmd_evm_nonce(rpc_endpoint, kf_path, &rest),
-        "evm-call" => cmd_evm_call(rpc_endpoint, &rest),
-        "evm-sign" => cmd_evm_sign(rpc_endpoint, kf_path, &rest),
+        "evm-balance" => cmd_evm_balance(&rpc, kf_path, &rest),
+        "evm-nonce" => cmd_evm_nonce(&rpc, kf_path, &rest),
+        "evm-call" => cmd_evm_call(&rpc, &rest),
+        "evm-sign" => cmd_evm_sign(&rpc, kf_path, &rest),
 
         // --- Gestion du keyfile ---
         "keyfile-encrypt" => cmd_keyfile_encrypt(kf_path),
@@ -106,13 +133,12 @@ fn cmd_pubkey(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
 }
 
 fn cmd_balance(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
     let addr = resolve_address(keyfile_path, args)?;
-    let rpc = RpcClient::new(rpc_endpoint);
-    let (_, balance, _) = fetch_account(&rpc, &addr)?;
+    let (_, balance, _) = fetch_account(rpc, &addr)?;
     println!(
         "{} base units ({} SANGO)",
         balance,
@@ -122,26 +148,24 @@ fn cmd_balance(
 }
 
 fn cmd_nonce(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
     let addr = resolve_address(keyfile_path, args)?;
-    let rpc = RpcClient::new(rpc_endpoint);
-    let (nonce, _, _) = fetch_account(&rpc, &addr)?;
+    let (nonce, _, _) = fetch_account(rpc, &addr)?;
     println!("{nonce}");
     Ok(())
 }
 
-fn cmd_info(rpc_endpoint: &str) -> Result<(), WalletError> {
-    let rpc = RpcClient::new(rpc_endpoint);
+fn cmd_info(rpc: &RpcClient) -> Result<(), WalletError> {
     let info = rpc.call("sango_chainInfo", serde_json::json!([]))?;
     println!("{}", serde_json::to_string_pretty(&info)?);
     Ok(())
 }
 
 fn cmd_send(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
@@ -149,7 +173,7 @@ fn cmd_send(
     let to = parse_address_arg(&require_flag(&flags, "to")?)?;
     let amount = parse_sango_decimal(&require_flag(&flags, "amount")?)?;
     submit_tx(
-        rpc_endpoint,
+        rpc,
         keyfile_path,
         TxParams {
             chain_id: Default::default(),
@@ -166,14 +190,14 @@ fn cmd_send(
 }
 
 fn cmd_stake(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
     let flags = parse_flags(args)?;
     let amount = parse_sango_decimal(&require_flag(&flags, "amount")?)?;
     submit_tx(
-        rpc_endpoint,
+        rpc,
         keyfile_path,
         TxParams {
             chain_id: Default::default(),
@@ -190,14 +214,14 @@ fn cmd_stake(
 }
 
 fn cmd_unstake(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
     let flags = parse_flags(args)?;
     let amount = parse_sango_decimal(&require_flag(&flags, "amount")?)?;
     submit_tx(
-        rpc_endpoint,
+        rpc,
         keyfile_path,
         TxParams {
             chain_id: Default::default(),
@@ -214,7 +238,7 @@ fn cmd_unstake(
 }
 
 fn cmd_delegate(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
@@ -222,7 +246,7 @@ fn cmd_delegate(
     let validator = parse_address_arg(&require_flag(&flags, "validator")?)?;
     let amount = parse_sango_decimal(&require_flag(&flags, "amount")?)?;
     submit_tx(
-        rpc_endpoint,
+        rpc,
         keyfile_path,
         TxParams {
             chain_id: Default::default(),
@@ -239,7 +263,7 @@ fn cmd_delegate(
 }
 
 fn cmd_undelegate(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
@@ -247,7 +271,7 @@ fn cmd_undelegate(
     let validator = parse_address_arg(&require_flag(&flags, "validator")?)?;
     let amount = parse_sango_decimal(&require_flag(&flags, "amount")?)?;
     submit_tx(
-        rpc_endpoint,
+        rpc,
         keyfile_path,
         TxParams {
             chain_id: Default::default(),
@@ -264,14 +288,14 @@ fn cmd_undelegate(
 }
 
 fn cmd_claim(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
     let flags = parse_flags(args)?;
     let validator = parse_address_arg(&require_flag(&flags, "validator")?)?;
     submit_tx(
-        rpc_endpoint,
+        rpc,
         keyfile_path,
         TxParams {
             chain_id: Default::default(),
@@ -288,7 +312,7 @@ fn cmd_claim(
 }
 
 fn cmd_register(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
@@ -300,7 +324,7 @@ fn cmd_register(
     let mut data = Vec::with_capacity(4);
     data.extend_from_slice(&commission_bps.to_be_bytes());
     submit_tx(
-        rpc_endpoint,
+        rpc,
         keyfile_path,
         TxParams {
             chain_id: Default::default(),
@@ -317,7 +341,7 @@ fn cmd_register(
 }
 
 fn cmd_update_commission(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
@@ -328,7 +352,7 @@ fn cmd_update_commission(
     let mut data = Vec::with_capacity(4);
     data.extend_from_slice(&new_bps.to_be_bytes());
     submit_tx(
-        rpc_endpoint,
+        rpc,
         keyfile_path,
         TxParams {
             chain_id: Default::default(),
@@ -345,13 +369,13 @@ fn cmd_update_commission(
 }
 
 fn cmd_unjail(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
     let _flags = parse_flags(args)?;
     submit_tx(
-        rpc_endpoint,
+        rpc,
         keyfile_path,
         TxParams {
             chain_id: Default::default(),
@@ -432,12 +456,11 @@ fn cmd_evm_address(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
 }
 
 fn cmd_evm_balance(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
     let addr = resolve_evm_address(keyfile_path, args)?;
-    let rpc = RpcClient::new(rpc_endpoint);
     let result = rpc.call(
         "eth_getBalance",
         serde_json::json!([format!("0x{}", addr.to_hex()), "latest"]),
@@ -450,12 +473,11 @@ fn cmd_evm_balance(
 }
 
 fn cmd_evm_nonce(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
     let addr = resolve_evm_address(keyfile_path, args)?;
-    let rpc = RpcClient::new(rpc_endpoint);
     let result = rpc.call(
         "eth_getTransactionCount",
         serde_json::json!([format!("0x{}", addr.to_hex()), "latest"]),
@@ -467,13 +489,11 @@ fn cmd_evm_nonce(
     Ok(())
 }
 
-fn cmd_evm_call(rpc_endpoint: &str, args: &[String]) -> Result<(), WalletError> {
+fn cmd_evm_call(rpc: &RpcClient, args: &[String]) -> Result<(), WalletError> {
     let flags = parse_flags(args)?;
     let to = require_flag(&flags, "to")?;
     let data = optional_flag(&flags, "data").unwrap_or("0x");
     let value = optional_flag(&flags, "value").unwrap_or("0x0");
-
-    let rpc = RpcClient::new(rpc_endpoint);
     let result = rpc.call(
         "eth_call",
         serde_json::json!([
@@ -490,7 +510,7 @@ fn cmd_evm_call(rpc_endpoint: &str, args: &[String]) -> Result<(), WalletError> 
 }
 
 fn cmd_evm_sign(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
@@ -508,8 +528,6 @@ fn cmd_evm_sign(
     let kf = KeyFile::load(keyfile_path)?;
     let kp = kf.evm_keypair()?;
     let addr = kp.address();
-
-    let rpc = RpcClient::new(rpc_endpoint);
 
     // Chain ID EVM.
     let chain_id_hex = rpc
@@ -722,16 +740,15 @@ fn parse_u256_flag(flags: &[(String, String)], name: &str) -> Option<U256> {
 }
 
 fn submit_tx(
-    rpc_endpoint: &str,
+    rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     mut params: TxParams,
 ) -> Result<(), WalletError> {
     let kf = KeyFile::load(keyfile_path)?;
-    let rpc = RpcClient::new(rpc_endpoint);
 
-    params.chain_id = fetch_chain_id(&rpc)?;
+    params.chain_id = fetch_chain_id(rpc)?;
     let addr = kf.address()?;
-    let (nonce, _, onchain_pk) = fetch_account(&rpc, &addr)?;
+    let (nonce, _, onchain_pk) = fetch_account(rpc, &addr)?;
     params.nonce = nonce;
 
     let declare_pk = if onchain_pk.is_none() {
@@ -741,7 +758,7 @@ fn submit_tx(
     };
 
     let tx = params.build_and_sign(&kf, declare_pk)?;
-    let tx_hash = send_transaction(&rpc, &tx)?;
+    let tx_hash = send_transaction(rpc, &tx)?;
     println!("✓ Transaction envoyée");
     println!("  Hash : {tx_hash}");
     Ok(())

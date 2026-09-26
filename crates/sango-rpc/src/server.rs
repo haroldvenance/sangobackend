@@ -152,9 +152,34 @@ fn serve_one_connection<B: RpcBackend>(
 
 /// Boucle keep-alive générique sur un stream (`TcpStream` ou
 /// `StreamOwned<ServerConnection, TcpStream>`).
+/// Trait pour fermer proprement un stream, TLS ou non.
+///
+/// - `TcpStream` : `shutdown(Write)` envoie FIN.
+/// - `StreamOwned<ServerConnection, TcpStream>` : envoie `close_notify` TLS
+///   puis FIN. Sans ce close_notify, certains clients (rustls inclus)
+///   remontent une erreur `peer closed connection without sending TLS
+///   close_notify` quand ils font `read_to_end`.
+trait GracefulShutdown {
+    fn graceful_close(&mut self);
+}
+
+impl GracefulShutdown for TcpStream {
+    fn graceful_close(&mut self) {
+        let _ = self.shutdown(std::net::Shutdown::Write);
+    }
+}
+
+impl GracefulShutdown for StreamOwned<ServerConnection, TcpStream> {
+    fn graceful_close(&mut self) {
+        self.conn.send_close_notify();
+        let _ = self.flush();
+        let _ = self.sock.shutdown(std::net::Shutdown::Write);
+    }
+}
+
 fn handle_connection<S, B>(stream: S, backend: Arc<B>, max_requests: usize) -> std::io::Result<()>
 where
-    S: Read + Write,
+    S: Read + Write + GracefulShutdown,
     B: RpcBackend,
 {
     // Le `BufReader` persiste sur toute la connexion (keep-alive) : il
@@ -164,15 +189,23 @@ where
 
     loop {
         if served >= max_requests {
+            reader.get_mut().graceful_close();
             return Ok(());
         }
 
         let req = match read_request(&mut reader) {
-            Ok(None) => return Ok(()), // EOF propre.
+            Ok(None) => {
+                reader.get_mut().graceful_close();
+                return Ok(()); // EOF propre.
+            }
             Ok(Some(r)) => r,
-            Err(e) if e.status == 408 => return Ok(()), // timeout silencieux
+            Err(e) if e.status == 408 => {
+                reader.get_mut().graceful_close();
+                return Ok(()); // timeout silencieux
+            }
             Err(e) => {
                 let _ = write_error(reader.get_mut(), &e, false);
+                reader.get_mut().graceful_close();
                 return Ok(());
             }
         };
@@ -185,6 +218,7 @@ where
         if req.method != "POST" {
             let err = HttpError::method_not_allowed(format!("method {} not allowed", req.method));
             if write_error(reader.get_mut(), &err, keep_alive).is_err() {
+                reader.get_mut().graceful_close();
                 return Ok(());
             }
             if !keep_alive {
@@ -197,6 +231,7 @@ where
         if req.path != "/rpc" && req.path != "/" {
             let err = HttpError::not_found(format!("path {} not found", req.path));
             if write_error(reader.get_mut(), &err, keep_alive).is_err() {
+                reader.get_mut().graceful_close();
                 return Ok(());
             }
             if !keep_alive {
@@ -219,6 +254,7 @@ where
                 });
                 let body = serde_json::to_vec(&resp).unwrap_or_default();
                 if write_json_ok(reader.get_mut(), &body, keep_alive).is_err() {
+                    reader.get_mut().graceful_close();
                     return Ok(());
                 }
                 if !keep_alive {
@@ -231,6 +267,7 @@ where
         let resp = crate::dispatch::dispatch_value(&*backend, json_value);
         let body = serde_json::to_vec(&resp).unwrap_or_default();
         if write_json_ok(reader.get_mut(), &body, keep_alive).is_err() {
+            reader.get_mut().graceful_close();
             return Ok(());
         }
         if !keep_alive {

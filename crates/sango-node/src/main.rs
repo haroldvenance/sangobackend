@@ -36,7 +36,7 @@ use sango_consensus::{LocalIdentity, Validator, ValidatorSet};
 use sango_node::{Driver, Node, NodeBackend, NodeHandle, OutgoingMessage, RuntimeGenesis};
 use sango_p2p::{P2pConfig, P2pEvent};
 use sango_primitives::Epoch;
-use sango_rpc::RpcServer;
+use sango_rpc::{RpcServer, TlsConfig};
 
 const DEFAULT_DATA_DIR: &str = "./sango-data";
 const DEFAULT_RPC_ADDR: &str = "127.0.0.1:8545";
@@ -120,8 +120,30 @@ fn run(args: &[String]) -> Result<(), String> {
 
     // --- 7. RPC server (thread secondaire) --------------------------------
     let backend = Arc::new(NodeBackend::new(handle.clone()));
-    let server =
-        RpcServer::bind(rpc_addr, backend).map_err(|e| format!("rpc bind {rpc_addr}: {e}"))?;
+
+    // TLS optionnel.
+    let tls_config: Option<TlsConfig> = if opts.rpc_tls_self_signed {
+        Some(TlsConfig::self_signed_localhost().map_err(|e| format!("rpc tls self-signed: {e}"))?)
+    } else {
+        match (&opts.rpc_tls_cert, &opts.rpc_tls_key) {
+            (Some(cert), Some(key)) => Some(
+                TlsConfig::from_pem_files(cert, key).map_err(|e| format!("rpc tls load: {e}"))?,
+            ),
+            (None, None) => None,
+            _ => return Err("--rpc-tls-cert and --rpc-tls-key must be provided together".into()),
+        }
+    };
+
+    let server = match tls_config {
+        Some(cfg) => {
+            println!("✓ RPC TLS activé");
+            RpcServer::bind_tls(rpc_addr, backend, cfg)
+                .map_err(|e| format!("rpc bind_tls {rpc_addr}: {e}"))?
+        }
+        None => {
+            RpcServer::bind(rpc_addr, backend).map_err(|e| format!("rpc bind {rpc_addr}: {e}"))?
+        }
+    };
     let _rpc_shutdown = server.shutdown_handle();
     let _rpc_thread = thread::spawn(move || {
         if let Err(e) = server.serve() {
@@ -338,6 +360,9 @@ struct CliOpts {
     p2p_bootstrap: Vec<String>,
     mdns: bool,
     no_p2p: bool,
+    rpc_tls_cert: Option<PathBuf>,
+    rpc_tls_key: Option<PathBuf>,
+    rpc_tls_self_signed: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<CliOpts, String> {
@@ -378,6 +403,20 @@ fn parse_args(args: &[String]) -> Result<CliOpts, String> {
                 opts.no_p2p = true;
                 i += 1;
             }
+            "--rpc-tls-cert" => {
+                let v = args.get(i + 1).ok_or("--rpc-tls-cert needs a value")?;
+                opts.rpc_tls_cert = Some(PathBuf::from(v));
+                i += 2;
+            }
+            "--rpc-tls-key" => {
+                let v = args.get(i + 1).ok_or("--rpc-tls-key needs a value")?;
+                opts.rpc_tls_key = Some(PathBuf::from(v));
+                i += 2;
+            }
+            "--rpc-tls-self-signed" => {
+                opts.rpc_tls_self_signed = true;
+                i += 1;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -409,6 +448,11 @@ fn print_help() {
          \x20                              Format : /ip4/.../udp/.../quic-v1/p2p/<PeerId>\n\
          \x20   --mdns                     Active la découverte locale mDNS\n\
          \x20   --no-p2p                   Force P2P désactivé\n\
+         \n\
+         RPC TLS (désactivé par défaut) :\n\
+         \x20   --rpc-tls-cert <PATH>      Certificat PEM\n\
+         \x20   --rpc-tls-key  <PATH>      Clé privée PEM\n\
+         \x20   --rpc-tls-self-signed      Cert auto-signé (devnet uniquement)\n\
          \n\
          \x20   --help, -h                 Affiche cette aide\n"
     );

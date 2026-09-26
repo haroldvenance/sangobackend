@@ -9,6 +9,10 @@ pub struct GlobalOpts {
     pub rpc: Option<String>,
     /// Chemin du keyfile. Défaut : `~/.sango/wallet.json`.
     pub keyfile: Option<String>,
+    /// Chemin vers une CA TLS custom (PEM ou DER). Active HTTPS.
+    pub rpc_tls_ca: Option<String>,
+    /// Accepte tout certificat TLS (devnet uniquement). Active HTTPS.
+    pub rpc_tls_insecure: bool,
 }
 
 /// Parse `argv` (sans le nom du binaire) en `(GlobalOpts, commande, args)`.
@@ -29,6 +33,15 @@ pub fn parse_args(args: &[String]) -> Result<(GlobalOpts, String, Vec<String>), 
                 .ok_or_else(|| WalletError::Usage("--keyfile needs a value".into()))?;
             opts.keyfile = Some(v.clone());
             i += 2;
+        } else if a == "--rpc-tls-ca" {
+            let v = args
+                .get(i + 1)
+                .ok_or_else(|| WalletError::Usage("--rpc-tls-ca needs a value".into()))?;
+            opts.rpc_tls_ca = Some(v.clone());
+            i += 2;
+        } else if a == "--rpc-tls-insecure" {
+            opts.rpc_tls_insecure = true;
+            i += 1;
         } else if a == "--help" || a == "-h" {
             return Err(WalletError::Usage(HELP.to_string()));
         } else if a.starts_with("--") {
@@ -121,9 +134,11 @@ SÉCURITÉ:
     (recommandé : utiliser le prompt interactif).
 
 OPTIONS GLOBALES:
-    --rpc URL          Endpoint RPC (défaut : 127.0.0.1:8545)
-    --keyfile PATH     Chemin du keyfile (défaut : ~/.sango/wallet.json)
-    --help, -h         Affiche cette aide
+    --rpc URL                 Endpoint RPC (défaut : 127.0.0.1:8545)
+    --keyfile PATH            Chemin du keyfile (défaut : ~/.sango/wallet.json)
+    --rpc-tls-ca PATH         CA custom TLS (DER). Active HTTPS.
+    --rpc-tls-insecure        Accepte tout cert TLS (devnet uniquement)
+    --help, -h                Affiche cette aide
 ";
 
 #[cfg(test)]
