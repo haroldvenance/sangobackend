@@ -314,6 +314,75 @@ mod tests {
         assert_eq!(tx.hash(), tx.hash());
     }
 
+    /// **Golden vector** pour le codec TS.
+    ///
+    /// Valeurs figées. Toute divergence TS ↔ Rust casse ce test.
+    #[test]
+    fn golden_vector_fixed_transaction() {
+        use sango_primitives::Signature;
+
+        let tx = Transaction {
+            version: 1,
+            chain_id: ChainId32::from_bytes([0x11; 32]),
+            nonce: 42,
+            sender: NativeAddress::from_bytes([0xaa; 20]),
+            public_key: None,
+            gas_limit: 21_000,
+            max_fee: 20,
+            priority_fee: 2,
+            value: Amount::from_base_units(100),
+            tx_kind: TxKind::Transfer,
+            recipient: Some(NativeAddress::from_bytes([0xbb; 20])),
+            data: Vec::new(),
+            signature: Signature::ZERO,
+        };
+
+        let unsigned = tx.encode_unsigned_to_vec();
+        let full = tx.encode_to_vec();
+        let hash = tx.hash();
+
+        assert_eq!(unsigned.len(), 147, "taille unsigned");
+        assert_eq!(full.len(), 211, "taille complète");
+
+        // --- Hash figé (golden vector partagé avec le codec TS) ---
+        assert_eq!(
+            hash.to_hex(),
+            "59e52128cf567408e038a076e15f575b0a505657f8e0bb885d5e12359b09aaf0"
+        );
+
+        // --- Encodage unsigned figé (147 bytes) ---
+        assert_eq!(
+            hex::encode(&unsigned),
+            "010000001111111111111111111111111111111111111111111111111111111111111111\
+             2a00000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000852000000000000\
+             140000000000000000000000000000000200000000000000000000000000000064000000\
+             0000000000000000000000000101bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000000"
+        );
+
+        // --- Encodage complet figé (211 bytes = unsigned + 64 × 0x00) ---
+        let expected_full = format!(
+            "{}{}",
+            hex::encode(&unsigned),
+            "0".repeat(128) // 64 bytes de signature ZERO
+        );
+        assert_eq!(hex::encode(&full), expected_full);
+
+        // --- Vérifications structurelles par offset ---
+        assert_eq!(&unsigned[0..4], &1u32.to_le_bytes());
+        assert_eq!(&unsigned[4..36], &[0x11; 32]);
+        assert_eq!(&unsigned[36..44], &42u64.to_le_bytes());
+        assert_eq!(&unsigned[44..64], &[0xaa; 20]);
+        assert_eq!(unsigned[64], 0x00); // Option None
+        assert_eq!(&unsigned[65..73], &21_000u64.to_le_bytes());
+        assert_eq!(&unsigned[73..89], &20u128.to_le_bytes());
+        assert_eq!(&unsigned[89..105], &2u128.to_le_bytes());
+        assert_eq!(&unsigned[105..121], &100u128.to_le_bytes());
+        assert_eq!(unsigned[121], 0x01); // TxKind::Transfer
+        assert_eq!(unsigned[122], 0x01); // Option Some
+        assert_eq!(&unsigned[123..143], &[0xbb; 20]);
+        assert_eq!(&unsigned[143..147], &0u32.to_le_bytes()); // data vide
+    }
+
     #[test]
     fn sign_verify_roundtrip() {
         let kp = NativeKeypair::from_seed([0x42; 32]);

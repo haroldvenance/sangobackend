@@ -66,3 +66,6 @@ argon2 = "0.5"
 chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 rpassword = "7"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"

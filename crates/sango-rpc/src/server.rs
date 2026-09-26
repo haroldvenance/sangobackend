@@ -1,14 +1,17 @@
 //! Serveur RPC : accepte des connexions TCP, parse HTTP, dispatch JSON-RPC.
 
-use std::io::BufReader;
+use std::io::{BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use rustls::{ServerConnection, StreamOwned};
+
 use crate::backend::RpcBackend;
 use crate::http::{read_request, write_error, write_json_ok, HttpError};
+use crate::tls::TlsConfig;
 
 /// Serveur RPC.
 pub struct RpcServer<B: RpcBackend> {
@@ -20,6 +23,8 @@ pub struct RpcServer<B: RpcBackend> {
     /// Nombre maximal de requêtes servies sur une même connexion
     /// (protection anti-DoS).
     max_requests_per_connection: usize,
+    /// Configuration TLS. `None` → HTTP en clair.
+    tls: Option<TlsConfig>,
 }
 
 impl<B: RpcBackend> RpcServer<B> {
@@ -33,7 +38,18 @@ impl<B: RpcBackend> RpcServer<B> {
             shutdown: Arc::new(AtomicBool::new(false)),
             idle_timeout: Duration::from_secs(30),
             max_requests_per_connection: 100,
+            tls: None,
         })
+    }
+
+    /// Bind sur `addr` avec **TLS** activé.
+    ///
+    /// - Le serveur s'authentifie auprès du client (TLS one-way).
+    /// - Le client n'est pas authentifié par cert.
+    pub fn bind_tls(addr: SocketAddr, backend: Arc<B>, tls: TlsConfig) -> std::io::Result<Self> {
+        let mut server = Self::bind(addr, backend)?;
+        server.tls = Some(tls);
+        Ok(server)
     }
 
     /// Configure le timeout d'inactivité (keep-alive).
@@ -73,6 +89,7 @@ impl<B: RpcBackend> RpcServer<B> {
     pub fn serve(self) -> std::io::Result<()> {
         let idle_timeout = self.idle_timeout;
         let max_requests = self.max_requests_per_connection;
+        let tls = self.tls;
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
                 return Ok(());
@@ -80,8 +97,10 @@ impl<B: RpcBackend> RpcServer<B> {
             match self.listener.accept() {
                 Ok((stream, _peer)) => {
                     let backend = Arc::clone(&self.backend);
+                    let tls = tls.clone();
                     thread::spawn(move || {
-                        let _ = handle_connection(stream, backend, idle_timeout, max_requests);
+                        let _ =
+                            serve_one_connection(stream, backend, idle_timeout, max_requests, tls);
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -106,17 +125,38 @@ impl ShutdownHandle {
     }
 }
 
-fn handle_connection<B: RpcBackend>(
-    stream: TcpStream,
+/// Sert une connexion TCP : applique TLS si configuré, puis délègue
+/// à la boucle keep-alive.
+fn serve_one_connection<B: RpcBackend>(
+    tcp: TcpStream,
     backend: Arc<B>,
     idle_timeout: Duration,
     max_requests: usize,
+    tls: Option<TlsConfig>,
 ) -> std::io::Result<()> {
-    // Timeouts sur lecture/écriture. Le `WouldBlock`/`TimedOut` est
-    // traduit en `HttpError::request_timeout` dans `read_request`.
-    stream.set_read_timeout(Some(idle_timeout)).ok();
-    stream.set_write_timeout(Some(idle_timeout)).ok();
+    // Timeouts TCP : à poser **avant** le wrap TLS pour qu'ils s'appliquent
+    // au socket sous-jacent.
+    tcp.set_read_timeout(Some(idle_timeout)).ok();
+    tcp.set_write_timeout(Some(idle_timeout)).ok();
 
+    match tls {
+        Some(cfg) => {
+            let conn = ServerConnection::new(cfg.server_config())
+                .map_err(|e| std::io::Error::other(format!("tls: {e}")))?;
+            let stream = StreamOwned::new(conn, tcp);
+            handle_connection(stream, backend, max_requests)
+        }
+        None => handle_connection(tcp, backend, max_requests),
+    }
+}
+
+/// Boucle keep-alive générique sur un stream (`TcpStream` ou
+/// `StreamOwned<ServerConnection, TcpStream>`).
+fn handle_connection<S, B>(stream: S, backend: Arc<B>, max_requests: usize) -> std::io::Result<()>
+where
+    S: Read + Write,
+    B: RpcBackend,
+{
     // Le `BufReader` persiste sur toute la connexion (keep-alive) : il
     // contient les bytes déjà lus qui appartiennent à la requête suivante.
     let mut reader = BufReader::new(stream);
@@ -124,7 +164,6 @@ fn handle_connection<B: RpcBackend>(
 
     loop {
         if served >= max_requests {
-            // Limite atteinte : fermer proprement.
             return Ok(());
         }
 

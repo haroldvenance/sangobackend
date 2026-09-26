@@ -53,7 +53,8 @@
 //! - `Connection: close` → ferme après la réponse
 //! - Timeout d'inactivité configurable (`RpcServer::with_idle_timeout`)
 //! - Limite de requêtes par connexion (`RpcServer::with_max_requests`)
-//! - Pas de TLS (étape A2 ultérieure), pas de chunked encoding
+//! - **TLS** optionnel (`RpcServer::bind_tls`), rustls 0.23, one-way
+//! - Pas de chunked encoding, pas de HTTP/2
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -64,6 +65,7 @@ pub mod error;
 mod http;
 pub mod json;
 mod server;
+pub mod tls;
 
 pub use backend::{
     BlockTag, EthCallRequest, EthCallResult, EthLog, EthLogFilter, EthProof, EthStorageProof,
@@ -72,3 +74,4 @@ pub use backend::{
 pub use error::RpcError;
 pub use json::{ErrorObject, Request, Response};
 pub use server::{RpcServer, ShutdownHandle};
+pub use tls::{init_tls_crypto, TlsConfig, TlsError};

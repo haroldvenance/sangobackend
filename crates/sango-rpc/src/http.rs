@@ -25,7 +25,6 @@
 //! le keep-alive en perdant ces bytes.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
 
 /// Requête HTTP parsée.
 #[derive(Debug)]
@@ -134,7 +133,7 @@ fn is_timeout(e: &std::io::Error) -> bool {
 ///
 /// - Body > `MAX_BODY_BYTES` → `HttpError::payload_too_large` (413).
 /// - Timeout d'idle (dépassé côté serveur) → `HttpError::request_timeout` (408).
-pub fn read_request(reader: &mut BufReader<TcpStream>) -> Result<Option<HttpRequest>, HttpError> {
+pub fn read_request<S: Read>(reader: &mut BufReader<S>) -> Result<Option<HttpRequest>, HttpError> {
     // Ligne de requête.
     let mut request_line = String::new();
     match reader.read_line(&mut request_line) {
@@ -207,7 +206,11 @@ pub fn read_request(reader: &mut BufReader<TcpStream>) -> Result<Option<HttpRequ
 }
 
 /// Écrit une réponse HTTP 200 avec un corps JSON.
-pub fn write_json_ok(stream: &mut TcpStream, body: &[u8], keep_alive: bool) -> std::io::Result<()> {
+pub fn write_json_ok<W: Write>(
+    stream: &mut W,
+    body: &[u8],
+    keep_alive: bool,
+) -> std::io::Result<()> {
     let conn = if keep_alive { "keep-alive" } else { "close" };
     let header = format!(
         "HTTP/1.1 200 OK\r\n\
@@ -224,8 +227,8 @@ pub fn write_json_ok(stream: &mut TcpStream, body: &[u8], keep_alive: bool) -> s
 }
 
 /// Écrit une réponse HTTP d'erreur.
-pub fn write_error(
-    stream: &mut TcpStream,
+pub fn write_error<W: Write>(
+    stream: &mut W,
     err: &HttpError,
     keep_alive: bool,
 ) -> std::io::Result<()> {
@@ -250,7 +253,7 @@ pub fn write_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
 
     /// Crée un serveur jetable, envoie `raw`, retourne la réponse brute.
     fn round_trip(raw: &[u8]) -> Vec<u8> {

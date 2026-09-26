@@ -14,3 +14,11 @@ serde_json.workspace = true
 sango-primitives.workspace = true
 sango-codec.workspace = true
 sango-types.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+rcgen = "0.13"
+
+[dev-dependencies]
+
+tempfile = "3"
