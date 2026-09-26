@@ -343,3 +343,104 @@ fn eth_get_proof_missing_account_returns_absence_proof() {
     assert_eq!(proof.storage_proof.len(), 1);
     assert_eq!(proof.storage_proof[0].value, U256::ZERO);
 }
+
+#[test]
+fn eth_get_logs_historical_range_multiple_blocks() {
+    let (_dir, handle, backend) = setup();
+    let alice_sk = signing_key(ALICE_SEED);
+    let alice = evm_address(&alice_sk);
+    let vs = setup_validator();
+    let vkp = sango_crypto::NativeKeypair::from_seed(VALIDATOR_SEED);
+
+    // Runtime : émet un log vide (PUSH1 0, PUSH1 0, LOG0, STOP).
+    let runtime = vec![0x60, 0x00, 0x60, 0x00, 0xa0, 0x00];
+    let init_code = init_code_for_runtime(&runtime);
+    let contract = contract_address(&alice, 0);
+
+    // 1. Déployer.
+    let deploy = sign_legacy(&alice_sk, EVM_CHAIN_ID, 0, 1, 300_000, None, U256::ZERO, init_code);
+    backend
+        .eth_send_raw_transaction(&deploy.encode_ethereum_typed())
+        .expect("deploy");
+
+    let local = LocalIdentity::new(vkp.clone());
+    let mut driver = Driver::new(handle.clone(), vs, Some(local), Epoch::new(0)).unwrap();
+    run_until_height(&mut driver, 1);
+
+    // 2. Appeler 3 fois le contrat → 3 blocs contenant un log chacun.
+    for nonce in 1..=3u64 {
+        let call = sign_legacy(
+            &alice_sk, EVM_CHAIN_ID, nonce, 1, 100_000, Some(contract), U256::ZERO, Vec::new(),
+        );
+        backend
+            .eth_send_raw_transaction(&call.encode_ethereum_typed())
+            .expect("call");
+        run_until_height(&mut driver, nonce + 1);
+    }
+
+    // 3. eth_getLogs([0, 4]) → 3 logs (un par call, pas de log sur le deploy).
+    let all = backend
+        .eth_get_logs(&EthLogFilter {
+            from_block: Some(BlockTag::Number(0)),
+            to_block: Some(BlockTag::Number(4)),
+            block_hash: None,
+            addresses: vec![contract],
+            topics: vec![],
+        })
+        .unwrap();
+    assert_eq!(all.len(), 3, "3 calls → 3 logs");
+
+    // Ordre chronologique : blockNumber croissant.
+    let heights: Vec<u64> = all.iter().map(|l| l.block_number).collect();
+    let mut sorted = heights.clone();
+    sorted.sort();
+    assert_eq!(heights, sorted, "logs triés par blockNumber");
+
+    // 4. Sous-plage [2, 3] → 2 logs.
+    let sub = backend
+        .eth_get_logs(&EthLogFilter {
+            from_block: Some(BlockTag::Number(2)),
+            to_block: Some(BlockTag::Number(3)),
+            block_hash: None,
+            addresses: vec![contract],
+            topics: vec![],
+        })
+        .unwrap();
+    assert_eq!(sub.len(), 2, "sous-plage [2,3] → 2 logs");
+
+    // 5. Plage future [100, 200] → 0.
+    let empty = backend
+        .eth_get_logs(&EthLogFilter {
+            from_block: Some(BlockTag::Number(100)),
+            to_block: Some(BlockTag::Number(200)),
+            block_hash: None,
+            addresses: vec![contract],
+            topics: vec![],
+        })
+        .unwrap();
+    assert!(empty.is_empty(), "plage future → 0 logs");
+
+    // 6. `from > to` → 0 logs (pas d'erreur).
+    let inverted = backend
+        .eth_get_logs(&EthLogFilter {
+            from_block: Some(BlockTag::Number(5)),
+            to_block: Some(BlockTag::Number(2)),
+            block_hash: None,
+            addresses: vec![contract],
+            topics: vec![],
+        })
+        .unwrap();
+    assert!(inverted.is_empty(), "from > to → 0 logs");
+
+    // 7. `latest` → jusqu'au tip.
+    let latest = backend
+        .eth_get_logs(&EthLogFilter {
+            from_block: Some(BlockTag::Number(0)),
+            to_block: Some(BlockTag::Latest),
+            block_hash: None,
+            addresses: vec![contract],
+            topics: vec![],
+        })
+        .unwrap();
+    assert_eq!(latest.len(), 3, "latest inclut tout l'historique");
+}
