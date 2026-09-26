@@ -141,6 +141,28 @@ impl RpcBackend for NodeBackend {
                 .map_err(|e| RpcError::TransactionRejected(e.to_string()))
         })
     }
+
+    fn eth_get_logs(
+        &self,
+        filter: &sango_rpc::EthLogFilter,
+    ) -> Result<Vec<sango_rpc::EthLog>, RpcError> {
+        self.handle.with_node(|n| {
+            n.eth_get_logs(filter)
+                .map_err(|e| RpcError::Internal(format!("eth_getLogs: {e}")))
+        })
+    }
+
+    fn eth_get_proof(
+        &self,
+        address: &EvmAddress,
+        storage_keys: &[U256],
+        block: Option<u64>,
+    ) -> Result<sango_rpc::EthProof, RpcError> {
+        self.handle.with_node(|n| {
+            n.eth_get_proof(address, storage_keys, block)
+                .map_err(|e| RpcError::Internal(format!("eth_getProof: {e}")))
+        })
+    }
 }
 
 impl std::fmt::Debug for NodeBackend {

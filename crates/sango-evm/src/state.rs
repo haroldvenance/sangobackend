@@ -226,6 +226,46 @@ impl EvmState {
         sango_mpt::mpt_root(&entries)
     }
 
+    // --- Proofs (EIP-1186) -------------------------------------------------
+
+    /// Calcule un **MPT proof** (EIP-1186) pour le compte `addr`.
+    ///
+    /// Retourne la liste des nœuds RLP-encodés traversés depuis la racine
+    /// jusqu'à la feuille (ou jusqu'au point de divergence si le compte
+    /// n'existe pas — c'est alors une preuve d'absence).
+    ///
+    /// Le vérificateur doit utiliser `sango_mpt::verify_proof(root, key, proof)`
+    /// avec `root = state.state_root()` et `key = keccak256(addr)`.
+    #[must_use]
+    pub fn account_proof(&self, addr: &EvmAddress) -> Vec<Vec<u8>> {
+        let key = keccak256(addr.as_bytes());
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+            .accounts
+            .iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v.clone()))
+            .collect();
+        sango_mpt::mpt_proof(&entries, key.as_bytes())
+    }
+
+    /// Calcule un **MPT proof** (EIP-1186) pour le slot `slot` du compte
+    /// `addr`.
+    ///
+    /// Le vérificateur doit utiliser `sango_mpt::verify_proof(root, key, proof)`
+    /// avec `root = state.storage_root(addr)` et
+    /// `key = keccak256(slot.to_be_bytes::<32>())` (`crate::storage::slot_mpt_key`).
+    #[must_use]
+    pub fn storage_proof(&self, addr: &EvmAddress, slot: U256) -> Vec<Vec<u8>> {
+        let slot_hash = crate::storage::slot_mpt_key(slot);
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = match self.storages.get(addr) {
+            Some(t) => t
+                .iter_entries()
+                .map(|(k, v)| (k.as_bytes().to_vec(), v.clone()))
+                .collect(),
+            None => Vec::new(),
+        };
+        sango_mpt::mpt_proof(&entries, slot_hash.as_bytes())
+    }
+
     // --- Itération ---------------------------------------------------------
 
     /// Itère sur les entrées `(keccak_addr, RLP account)`.
@@ -535,6 +575,77 @@ mod tests {
     fn empty_account_is_eoa_empty() {
         let acc = EvmAccount::empty();
         assert!(is_eoa_empty(&acc));
+    }
+
+    // --- MPT proofs (EIP-1186) --------------------------------------------
+
+    #[test]
+    fn account_proof_for_existing_account_is_verifiable() {
+        let mut s = EvmState::new();
+        let a = addr(0xaa);
+        s.set_account(a, make_account(1, 100));
+
+        let root = s.state_root();
+        let key = keccak256(a.as_bytes());
+        let proof = s.account_proof(&a);
+        assert!(!proof.is_empty(), "proof should not be empty");
+
+        let decoded = sango_mpt::verify_proof(root, key.as_bytes(), &proof).unwrap();
+        assert!(decoded.is_some(), "existing account → presence proof");
+    }
+
+    #[test]
+    fn account_proof_for_missing_account_is_verifiable_absence() {
+        let mut s = EvmState::new();
+        s.set_account(addr(0xaa), make_account(1, 100));
+
+        let root = s.state_root();
+        let missing = addr(0xbb);
+        let key = keccak256(missing.as_bytes());
+        let proof = s.account_proof(&missing);
+        assert!(!proof.is_empty(), "proof-of-absence still has nodes");
+
+        let decoded = sango_mpt::verify_proof(root, key.as_bytes(), &proof).unwrap();
+        assert!(decoded.is_none(), "missing account → absence proof");
+    }
+
+    #[test]
+    fn storage_proof_for_existing_slot_is_verifiable() {
+        let mut s = EvmState::new();
+        let a = addr(0xaa);
+        let slot = U256::from(7u64);
+        s.set_storage(a, slot, U256::from(0xdead_u64));
+
+        let root = s.storage_root(&a);
+        let key = crate::storage::slot_mpt_key(slot);
+        let proof = s.storage_proof(&a, slot);
+        assert!(!proof.is_empty());
+
+        let decoded = sango_mpt::verify_proof(root, key.as_bytes(), &proof).unwrap();
+        assert!(decoded.is_some());
+    }
+
+    #[test]
+    fn storage_proof_for_missing_slot_is_verifiable_absence() {
+        let mut s = EvmState::new();
+        let a = addr(0xaa);
+        s.set_storage(a, U256::from(1u64), U256::from(100u64));
+
+        let root = s.storage_root(&a);
+        let missing_slot = U256::from(999u64);
+        let key = crate::storage::slot_mpt_key(missing_slot);
+        let proof = s.storage_proof(&a, missing_slot);
+        assert!(!proof.is_empty());
+
+        let decoded = sango_mpt::verify_proof(root, key.as_bytes(), &proof).unwrap();
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn account_proof_on_empty_state_returns_empty_vec() {
+        let s = EvmState::new();
+        let proof = s.account_proof(&addr(0xaa));
+        assert!(proof.is_empty(), "empty trie → empty proof");
     }
 
     #[test]

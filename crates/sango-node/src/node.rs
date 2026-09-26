@@ -14,7 +14,7 @@ use sango_primitives::{
 use sango_state::{MetadataKey, NativeState};
 use sango_storage::{metadata_key, Batch, Column, Storage};
 use sango_tx::{validate_transaction, SenderInfo, ValidationContext};
-use sango_types::{Block, BlockHeader, ChainTip, Tx};
+use sango_types::{Block, BlockHeader, ChainTip, EvmLog, Receipt, Tx};
 
 use crate::base_fee::{next_base_fee, INITIAL_BASE_FEE};
 use crate::diff::{diff_evm, diff_state, EvmDiff};
@@ -454,6 +454,131 @@ impl Node {
         Block::decode_exact(&block_bytes)
             .map(Some)
             .map_err(|e| NodeError::Storage(sango_storage::StorageError::Codec(e)))
+    }
+
+    /// Lit un bloc par hash.
+    ///
+    /// Retourne `None` si aucun bloc n'est enregistré sous ce hash.
+    pub fn get_block_by_hash(&self, hash: &Hash32) -> Result<Option<Block>, NodeError> {
+        let Some(bytes) = self.storage.get(Column::Blocks, hash.as_bytes())? else {
+            return Ok(None);
+        };
+        Block::decode_exact(&bytes)
+            .map(Some)
+            .map_err(|e| NodeError::Storage(sango_storage::StorageError::Codec(e)))
+    }
+
+    /// Récupère les logs EVM filtrés (`eth_getLogs`).
+    ///
+    /// ## Implémentation V1
+    ///
+    /// 1. Résout `from_block` / `to_block` (`latest` → tip, `earliest` → 0).
+    /// 2. Pour chaque hauteur, charge le bloc.
+    /// 3. Pour chaque transaction, charge le receipt et extrait les logs.
+    /// 4. Filtre par adresse et topics.
+    pub fn eth_get_logs(
+        &self,
+        filter: &sango_rpc::EthLogFilter,
+    ) -> Result<Vec<sango_rpc::EthLog>, NodeError> {
+        // Résoudre la plage de hauteurs.
+        let (from, to) = if let Some(h) = filter.block_hash {
+            let Some(b) = self.get_block_by_hash(&h)? else {
+                return Ok(Vec::new());
+            };
+            let n = b.header.height.get();
+            (n, n)
+        } else {
+            let tip = self.tip.map(|t| t.height.get()).unwrap_or(0);
+            let from = resolve_block_tag(filter.from_block.as_ref(), tip);
+            let to = resolve_block_tag(filter.to_block.as_ref(), tip);
+            if from > to {
+                return Ok(Vec::new());
+            }
+            (from, to)
+        };
+
+        let mut out = Vec::new();
+        for h in from..=to {
+            let Some(block) = self.get_block_by_height(h)? else {
+                continue;
+            };
+            let block_hash = block.hash();
+            let block_number = block.header.height.get();
+            let mut log_index: u64 = 0;
+
+            for (tx_index, tx) in block.transactions.iter().enumerate() {
+                let tx_hash = tx.hash();
+                let Some(receipt_bytes) = self.storage.get(Column::Receipts, tx_hash.as_bytes())?
+                else {
+                    // Receipt absent (corruption ou race) : on skip.
+                    continue;
+                };
+                let receipt = Receipt::decode_exact(&receipt_bytes)
+                    .map_err(|e| NodeError::Storage(sango_storage::StorageError::Codec(e)))?;
+                for log in &receipt.logs {
+                    let matched = log_matches_filter(log, filter);
+                    if matched {
+                        out.push(sango_rpc::EthLog {
+                            address: log.address,
+                            topics: log.topics.clone(),
+                            data: log.data.clone(),
+                            block_number,
+                            block_hash,
+                            transaction_hash: tx_hash,
+                            transaction_index: tx_index as u64,
+                            log_index,
+                            removed: false,
+                        });
+                    }
+                    log_index = log_index.saturating_add(1);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Génère une preuve MPT EIP-1186 (`eth_getProof`).
+    ///
+    /// ## Implémentation V1
+    ///
+    /// - Le `block` demandé est **ignoré** : seul l'état au tip est
+    ///   disponible (pas de snapshots historiques). Les clients doivent
+    ///   passer `latest` (ou `None`).
+    /// - `account_proof` : preuve MPT du compte contre `state_root()`.
+    /// - `storage_proof[i]` : preuve MPT du slot i contre
+    ///   `storage_root(addr)`.
+    pub fn eth_get_proof(
+        &self,
+        address: &EvmAddress,
+        storage_keys: &[U256],
+        _block: Option<u64>,
+    ) -> Result<sango_rpc::EthProof, NodeError> {
+        let account_proof = self.evm.account_proof(address);
+        let acc = self
+            .evm
+            .get_account(address)
+            .unwrap_or_else(sango_types::EvmAccount::empty);
+
+        let mut storage_proof = Vec::with_capacity(storage_keys.len());
+        for slot in storage_keys {
+            let proof = self.evm.storage_proof(address, *slot);
+            let value = self.evm.get_storage(address, *slot);
+            storage_proof.push(sango_rpc::EthStorageProof {
+                key: *slot,
+                value,
+                proof,
+            });
+        }
+
+        Ok(sango_rpc::EthProof {
+            address: *address,
+            account_proof,
+            balance: acc.balance,
+            code_hash: acc.code_hash,
+            nonce: acc.nonce,
+            storage_hash: acc.storage_root,
+            storage_proof,
+        })
     }
 
     /// Liste tous les validateurs enregistrés.
@@ -985,6 +1110,35 @@ impl Node {
         let mut trial = self.evm.clone();
         evm_transact(&mut trial, &tx, &block_env, extras).map_err(NodeError::Evm)
     }
+}
+
+/// Résout un tag de bloc en hauteur concrète.
+fn resolve_block_tag(tag: Option<&sango_rpc::BlockTag>, tip: u64) -> u64 {
+    match tag {
+        None => tip,
+        Some(sango_rpc::BlockTag::Latest) | Some(sango_rpc::BlockTag::Pending) => tip,
+        Some(sango_rpc::BlockTag::Earliest) => 0,
+        Some(sango_rpc::BlockTag::Number(n)) => *n,
+    }
+}
+
+/// Vrai si le log passe les filtres adresse + topics.
+fn log_matches_filter(log: &EvmLog, filter: &sango_rpc::EthLogFilter) -> bool {
+    if !filter.addresses.is_empty() && !filter.addresses.contains(&log.address) {
+        return false;
+    }
+    for (i, topic_filter) in filter.topics.iter().enumerate() {
+        let Some(allowed) = topic_filter else {
+            continue;
+        };
+        let Some(log_topic) = log.topics.get(i) else {
+            return false;
+        };
+        if !allowed.contains(log_topic) {
+            return false;
+        }
+    }
+    true
 }
 
 impl std::fmt::Debug for Node {

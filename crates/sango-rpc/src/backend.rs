@@ -45,6 +45,94 @@ pub struct EthCallResult {
     pub gas_used: u64,
 }
 
+// --- Types eth_getLogs ----------------------------------------------------
+
+/// Tag de bloc pour les filtres (`eth_getLogs`, `eth_getProof`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlockTag {
+    /// Dernier bloc connu (`latest`).
+    Latest,
+    /// Bloc genesis (`earliest`).
+    Earliest,
+    /// Bloc en cours (`pending`). En V1, traité comme `latest`.
+    Pending,
+    /// Numéro de bloc explicite.
+    Number(u64),
+}
+
+/// Filtre `eth_getLogs`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EthLogFilter {
+    /// Bloc de début. `None` = `latest`.
+    pub from_block: Option<BlockTag>,
+    /// Bloc de fin. `None` = `latest`.
+    pub to_block: Option<BlockTag>,
+    /// Filtre sur un bloc précis par hash (override `from`/`to`).
+    pub block_hash: Option<Hash32>,
+    /// Adresses à garder. Vide = toutes.
+    pub addresses: Vec<EvmAddress>,
+    /// Filtres positionnels de topics. Vide = aucune contrainte.
+    ///
+    /// `topics[i] = Some(v)` = la i-ème topic doit appartenir à `v`.
+    /// `topics[i] = None` = wildcard à la position i.
+    pub topics: Vec<Option<Vec<Hash32>>>,
+}
+
+/// Log EVM au format RPC Ethereum.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EthLog {
+    /// Adresse du contrat émetteur.
+    pub address: EvmAddress,
+    /// Topics indexés.
+    pub topics: Vec<Hash32>,
+    /// Données non indexées.
+    pub data: Vec<u8>,
+    /// Hauteur du bloc.
+    pub block_number: u64,
+    /// Hash du bloc.
+    pub block_hash: Hash32,
+    /// Hash de la transaction.
+    pub transaction_hash: Hash32,
+    /// Index de la transaction dans le bloc.
+    pub transaction_index: u64,
+    /// Index du log dans le bloc (position absolue, tous txs confondus).
+    pub log_index: u64,
+    /// Toujours `false` en V1 (pas de réorganisation).
+    pub removed: bool,
+}
+
+// --- Types eth_getProof (EIP-1186) ----------------------------------------
+
+/// Preuve MPT pour un slot de storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EthStorageProof {
+    /// Clé de storage (U256).
+    pub key: U256,
+    /// Valeur du slot (`0` si absent).
+    pub value: U256,
+    /// Nœuds RLP-encodés traversés (preuve MPT).
+    pub proof: Vec<Vec<u8>>,
+}
+
+/// Preuve MPT pour un compte EVM (EIP-1186).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EthProof {
+    /// Adresse EVM concernée.
+    pub address: EvmAddress,
+    /// Nœuds RLP-encodés vers la feuille du compte.
+    pub account_proof: Vec<Vec<u8>>,
+    /// Solde du compte.
+    pub balance: U256,
+    /// `Keccak256(code)` — `empty_code_hash()` si pas de code.
+    pub code_hash: Hash32,
+    /// Nonce du compte.
+    pub nonce: u64,
+    /// Racine du storage trie du compte.
+    pub storage_hash: Hash32,
+    /// Preuves individuelles pour chaque slot demandé.
+    pub storage_proof: Vec<EthStorageProof>,
+}
+
 /// Vue en lecture + en écriture minimale d'un nœud Sango.
 ///
 /// ## Compatibilité
@@ -132,6 +220,27 @@ pub trait RpcBackend: Send + Sync + 'static {
     fn eth_send_raw_transaction(&self, _raw: &[u8]) -> Result<Hash32, RpcError> {
         Err(RpcError::Internal(
             "eth_sendRawTransaction not supported by this backend".into(),
+        ))
+    }
+
+    /// Récupère les logs EVM filtrés (`eth_getLogs`). Défaut : non supporté.
+    fn eth_get_logs(&self, _filter: &EthLogFilter) -> Result<Vec<EthLog>, RpcError> {
+        Err(RpcError::Internal(
+            "eth_getLogs not supported by this backend".into(),
+        ))
+    }
+
+    /// Génère une preuve MPT EIP-1186 (`eth_getProof`). Défaut : non supporté.
+    ///
+    /// Le paramètre `block` est ignoré en V1 : seul le tip est disponible.
+    fn eth_get_proof(
+        &self,
+        _address: &EvmAddress,
+        _storage_keys: &[U256],
+        _block: Option<u64>,
+    ) -> Result<EthProof, RpcError> {
+        Err(RpcError::Internal(
+            "eth_getProof not supported by this backend".into(),
         ))
     }
 }

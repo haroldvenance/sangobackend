@@ -60,7 +60,10 @@ mod http;
 pub mod json;
 mod server;
 
-pub use backend::{EthCallRequest, EthCallResult, RpcBackend};
+pub use backend::{
+    BlockTag, EthCallRequest, EthCallResult, EthLog, EthLogFilter, EthProof, EthStorageProof,
+    RpcBackend,
+};
 pub use error::RpcError;
 pub use json::{ErrorObject, Request, Response};
 pub use server::{RpcServer, ShutdownHandle};

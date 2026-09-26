@@ -1,6 +1,5 @@
 //! Serveur RPC : accepte des connexions TCP, parse HTTP, dispatch JSON-RPC.
 
-use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -8,9 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::backend::RpcBackend;
-use crate::dispatch::dispatch;
 use crate::http::{read_request, write_error, write_json_ok, HttpError};
-use crate::json::{Request, Response};
 
 /// Serveur RPC.
 pub struct RpcServer<B: RpcBackend> {
@@ -107,21 +104,24 @@ fn handle_connection<B: RpcBackend>(mut stream: TcpStream, backend: Arc<B>) -> s
         return Ok(());
     }
 
-    // Parser le JSON.
-    let json_req: Request = match serde_json::from_slice(&req.body) {
-        Ok(r) => r,
+    // Parser le JSON brut en `Value` (objet unique OU tableau batch).
+    let json_value: serde_json::Value = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
         Err(e) => {
-            let resp = Response::failure(
-                serde_json::Value::Null,
-                crate::error::RpcError::InvalidRequest(format!("parse json: {e}")),
-            );
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32600,
+                    "message": format!("parse json: {e}")
+                },
+                "id": serde_json::Value::Null,
+            });
             let body = serde_json::to_vec(&resp).unwrap_or_default();
             return write_json_ok(&mut stream, &body);
         }
     };
 
-    let resp = dispatch(&*backend, json_req);
+    let resp = crate::dispatch::dispatch_value(&*backend, json_value);
     let body = serde_json::to_vec(&resp).unwrap_or_default();
-    let _ = stream.write_all(b"");
     write_json_ok(&mut stream, &body)
 }

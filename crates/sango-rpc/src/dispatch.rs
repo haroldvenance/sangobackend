@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 
 use sango_codec::Decode as _;
-use sango_primitives::{EvmAddress, NativeAddress, U256};
+use sango_primitives::{EvmAddress, Hash32, NativeAddress, U256};
 use sango_types::Transaction;
 
 use crate::backend::{EthCallRequest, RpcBackend};
@@ -51,6 +51,8 @@ fn handle<B: RpcBackend>(backend: &B, method: &str, params: &Value) -> Result<Va
         "eth_call" => eth_call(backend, params),
         "eth_estimateGas" => eth_estimate_gas(backend, params),
         "eth_sendRawTransaction" => eth_send_raw_transaction(backend, params),
+        "eth_getLogs" => eth_get_logs(backend, params),
+        "eth_getProof" => eth_get_proof(backend, params),
 
         other => Err(RpcError::MethodNotFound(other.to_string())),
     }
@@ -223,6 +225,271 @@ fn eth_send_raw_transaction<B: RpcBackend>(backend: &B, params: &Value) -> Resul
     let raw = decode_hex(raw_hex)?;
     let hash = backend.eth_send_raw_transaction(&raw)?;
     Ok(json!(format!("0x{}", hash.to_hex())))
+}
+
+// --- eth_getLogs / eth_getProof -------------------------------------------
+
+fn eth_get_logs<B: RpcBackend>(backend: &B, params: &Value) -> Result<Value, RpcError> {
+    let filter = parse_log_filter(params)?;
+    let logs = backend.eth_get_logs(&filter)?;
+    Ok(serialize_logs(&logs))
+}
+
+fn eth_get_proof<B: RpcBackend>(backend: &B, params: &Value) -> Result<Value, RpcError> {
+    let (addr, slots, block) = parse_get_proof_params(params)?;
+    let proof = backend.eth_get_proof(&addr, &slots, block)?;
+    Ok(serialize_proof(&proof))
+}
+
+fn parse_log_filter(params: &Value) -> Result<crate::backend::EthLogFilter, RpcError> {
+    use crate::backend::EthLogFilter;
+
+    let obj = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| RpcError::InvalidParams("expected [filter_object]".into()))?;
+
+    let from_block = parse_block_tag(obj.get("fromBlock"))?;
+    let to_block = parse_block_tag(obj.get("toBlock"))?;
+
+    let block_hash = match obj.get("blockHash").and_then(|v| v.as_str()) {
+        Some(s) => Some(
+            Hash32::from_hex(s)
+                .map_err(|e| RpcError::InvalidParams(format!("bad blockHash: {e}")))?,
+        ),
+        None => None,
+    };
+
+    // `address` : string OU array de strings.
+    let mut addresses = Vec::new();
+    if let Some(addr_val) = obj.get("address") {
+        if let Some(s) = addr_val.as_str() {
+            addresses.push(
+                EvmAddress::from_hex(s)
+                    .map_err(|e| RpcError::InvalidParams(format!("bad address: {e}")))?,
+            );
+        } else if let Some(arr) = addr_val.as_array() {
+            for (i, v) in arr.iter().enumerate() {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| RpcError::InvalidParams(format!("address[{i}] not a string")))?;
+                addresses.push(
+                    EvmAddress::from_hex(s)
+                        .map_err(|e| RpcError::InvalidParams(format!("bad address[{i}]: {e}")))?,
+                );
+            }
+        } else {
+            return Err(RpcError::InvalidParams(
+                "address must be a string or array".into(),
+            ));
+        }
+    }
+
+    // `topics` : array de (null | hash | array de hashes).
+    let mut topics = Vec::new();
+    if let Some(topic_val) = obj.get("topics") {
+        let arr = topic_val
+            .as_array()
+            .ok_or_else(|| RpcError::InvalidParams("topics must be an array".into()))?;
+        for (i, v) in arr.iter().enumerate() {
+            if v.is_null() {
+                topics.push(None);
+            } else if let Some(s) = v.as_str() {
+                let h = Hash32::from_hex(s)
+                    .map_err(|e| RpcError::InvalidParams(format!("bad topic[{i}]: {e}")))?;
+                topics.push(Some(vec![h]));
+            } else if let Some(sub) = v.as_array() {
+                let mut hashes = Vec::with_capacity(sub.len());
+                for (j, h) in sub.iter().enumerate() {
+                    let s = h.as_str().ok_or_else(|| {
+                        RpcError::InvalidParams(format!("topic[{i}][{j}] not a string"))
+                    })?;
+                    hashes.push(Hash32::from_hex(s).map_err(|e| {
+                        RpcError::InvalidParams(format!("bad topic[{i}][{j}]: {e}"))
+                    })?);
+                }
+                topics.push(Some(hashes));
+            } else {
+                return Err(RpcError::InvalidParams(format!(
+                    "topic[{i}] must be null, string, or array of strings"
+                )));
+            }
+        }
+    }
+
+    Ok(EthLogFilter {
+        from_block,
+        to_block,
+        block_hash,
+        addresses,
+        topics,
+    })
+}
+
+fn parse_block_tag(v: Option<&Value>) -> Result<Option<crate::backend::BlockTag>, RpcError> {
+    use crate::backend::BlockTag;
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let s = v
+        .as_str()
+        .ok_or_else(|| RpcError::InvalidParams("block tag must be a string".into()))?;
+    Ok(Some(match s {
+        "latest" => BlockTag::Latest,
+        "earliest" => BlockTag::Earliest,
+        "pending" => BlockTag::Pending,
+        // Alias pour clients modernes : on retombe sur latest.
+        "safe" | "finalized" => BlockTag::Latest,
+        _ => {
+            let n = parse_u64_hex(s)
+                .map_err(|e| RpcError::InvalidParams(format!("bad block tag `{s}`: {e}")))?;
+            BlockTag::Number(n)
+        }
+    }))
+}
+
+fn parse_get_proof_params(
+    params: &Value,
+) -> Result<(EvmAddress, Vec<U256>, Option<u64>), RpcError> {
+    let arr = params.as_array().ok_or_else(|| {
+        RpcError::InvalidParams("expected [address, storage_keys, block?]".into())
+    })?;
+
+    let addr_str = arr
+        .first()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::InvalidParams("missing or bad address".into()))?;
+    let addr = EvmAddress::from_hex(addr_str)
+        .map_err(|e| RpcError::InvalidParams(format!("bad address: {e}")))?;
+
+    let keys_arr = arr
+        .get(1)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| RpcError::InvalidParams("missing or bad storage_keys array".into()))?;
+    let mut slots = Vec::with_capacity(keys_arr.len());
+    for (i, v) in keys_arr.iter().enumerate() {
+        let s = v
+            .as_str()
+            .ok_or_else(|| RpcError::InvalidParams(format!("storage_keys[{i}] not a string")))?;
+        let u = parse_u256_hex(s)
+            .map_err(|e| RpcError::InvalidParams(format!("bad storage_keys[{i}]: {e}")))?;
+        slots.push(u);
+    }
+
+    // 3ᵉ paramètre optionnel : blockNumber. On l'accepte mais l'implémenteur
+    // décidera s'il peut le traiter (V1 : tip uniquement).
+    let block = arr
+        .get(2)
+        .and_then(|v| v.as_str().and_then(|s| parse_u64_hex(s).ok()));
+
+    Ok((addr, slots, block))
+}
+
+fn serialize_logs(logs: &[crate::backend::EthLog]) -> Value {
+    let arr: Vec<Value> = logs
+        .iter()
+        .map(|l| {
+            json!({
+                "address": format!("0x{}", l.address.to_hex()),
+                "topics": l
+                    .topics
+                    .iter()
+                    .map(|t| format!("0x{}", t.to_hex()))
+                    .collect::<Vec<_>>(),
+                "data": format!("0x{}", hex::encode(&l.data)),
+                "blockNumber": format!("0x{:x}", l.block_number),
+                "blockHash": format!("0x{}", l.block_hash.to_hex()),
+                "transactionHash": format!("0x{}", l.transaction_hash.to_hex()),
+                "transactionIndex": format!("0x{:x}", l.transaction_index),
+                "logIndex": format!("0x{:x}", l.log_index),
+                "removed": l.removed,
+            })
+        })
+        .collect();
+    Value::Array(arr)
+}
+
+fn serialize_proof(p: &crate::backend::EthProof) -> Value {
+    json!({
+        "address": format!("0x{}", p.address.to_hex()),
+        "accountProof": p
+            .account_proof
+            .iter()
+            .map(|n| format!("0x{}", hex::encode(n)))
+            .collect::<Vec<_>>(),
+        "balance": format!("0x{:x}", p.balance),
+        "codeHash": format!("0x{}", p.code_hash.to_hex()),
+        "nonce": format!("0x{:x}", p.nonce),
+        "storageHash": format!("0x{}", p.storage_hash.to_hex()),
+        "storageProof": p
+            .storage_proof
+            .iter()
+            .map(|sp| {
+                json!({
+                    "key": format!("0x{:x}", sp.key),
+                    "value": format!("0x{:x}", sp.value),
+                    "proof": sp
+                        .proof
+                        .iter()
+                        .map(|n| format!("0x{}", hex::encode(n)))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+// --- Batch dispatch --------------------------------------------------------
+
+/// Dispatch un corps JSON arbitraire : objet unique ou tableau batch.
+///
+/// ## Règles JSON-RPC 2.0
+///
+/// - Objet → une réponse unique.
+/// - Tableau non vide → tableau de réponses (une par item, dans l'ordre).
+/// - Tableau vide → erreur unique `-32600` (`id: null`).
+/// - Autre (nombre, string, …) → erreur unique `-32600`.
+pub fn dispatch_value<B: RpcBackend>(backend: &B, value: Value) -> Value {
+    match value {
+        Value::Array(items) => {
+            if items.is_empty() {
+                return json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32600, "message": "empty batch request" },
+                    "id": Value::Null,
+                });
+            }
+            let responses: Vec<Value> = items
+                .into_iter()
+                .map(|item| dispatch_single_value(backend, item))
+                .collect();
+            Value::Array(responses)
+        }
+        other => dispatch_single_value(backend, other),
+    }
+}
+
+fn dispatch_single_value<B: RpcBackend>(backend: &B, value: Value) -> Value {
+    let req: Request = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return json!({
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32600,
+                    "message": format!("invalid request: {e}")
+                },
+                "id": Value::Null,
+            });
+        }
+    };
+    let resp = dispatch(backend, req);
+    // `Response` n'a pas de `Deserialize` mais dérive `Serialize`.
+    serde_json::to_value(&resp).unwrap_or(Value::Null)
 }
 
 // --- Helpers ---------------------------------------------------------------
@@ -461,6 +728,47 @@ mod tests {
             // Mock : retourne un hash constant.
             Ok(Hash32::from_bytes([0xab; 32]))
         }
+        fn eth_get_logs(
+            &self,
+            _filter: &crate::backend::EthLogFilter,
+        ) -> Result<Vec<crate::backend::EthLog>, RpcError> {
+            // Mock : 1 log constant.
+            Ok(vec![crate::backend::EthLog {
+                address: EvmAddress::from_bytes([0xaa; 20]),
+                topics: vec![Hash32::from_bytes([0x11; 32])],
+                data: vec![0xde, 0xad],
+                block_number: 5,
+                block_hash: Hash32::from_bytes([0x55; 32]),
+                transaction_hash: Hash32::from_bytes([0x66; 32]),
+                transaction_index: 0,
+                log_index: 0,
+                removed: false,
+            }])
+        }
+        fn eth_get_proof(
+            &self,
+            address: &EvmAddress,
+            storage_keys: &[U256],
+            _block: Option<u64>,
+        ) -> Result<crate::backend::EthProof, RpcError> {
+            let storage_proof = storage_keys
+                .iter()
+                .map(|k| crate::backend::EthStorageProof {
+                    key: *k,
+                    value: U256::from(0xbeef_u64),
+                    proof: vec![vec![0x01, 0x02]],
+                })
+                .collect();
+            Ok(crate::backend::EthProof {
+                address: *address,
+                account_proof: vec![vec![0x0a, 0x0b]],
+                balance: U256::from(1000u64),
+                code_hash: Hash32::from_bytes([0xcc; 32]),
+                nonce: 42,
+                storage_hash: Hash32::from_bytes([0xdd; 32]),
+                storage_proof,
+            })
+        }
     }
 
     fn call<B: RpcBackend>(backend: &B, method: &str, params: Value) -> Value {
@@ -614,6 +922,170 @@ mod tests {
         let b = MockBackend::default();
         let v = call(&b, "eth_sendRawTransaction", json!(["0xdeadbeef"]));
         assert_eq!(v, json!(format!("0x{}", "ab".repeat(32))));
+    }
+
+    #[test]
+    fn eth_get_logs_routes_and_returns_logs() {
+        let b = MockBackend::default();
+        let v = call(
+            &b,
+            "eth_getLogs",
+            json!([{
+                "fromBlock": "0x0",
+                "toBlock": "0x5",
+                "address": "0x000000000000000000000000000000000000aaaa"
+            }]),
+        );
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0].get("address").and_then(|x| x.as_str()),
+            Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            arr[0].get("blockNumber").and_then(|x| x.as_str()),
+            Some("0x5")
+        );
+        assert_eq!(arr[0].get("logIndex").and_then(|x| x.as_str()), Some("0x0"));
+        assert_eq!(arr[0].get("removed").and_then(|x| x.as_bool()), Some(false));
+    }
+
+    #[test]
+    fn eth_get_logs_accepts_latest_tag() {
+        let b = MockBackend::default();
+        let v = call(&b, "eth_getLogs", json!([{ "fromBlock": "latest" }]));
+        assert!(v.is_array());
+    }
+
+    #[test]
+    fn eth_get_logs_rejects_bad_address() {
+        let b = MockBackend::default();
+        let req = Request {
+            jsonrpc: "2.0".into(),
+            method: "eth_getLogs".into(),
+            params: json!([{ "address": "0xnot-hex" }]),
+            id: json!(1),
+        };
+        let resp = dispatch(&b, req);
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    #[test]
+    fn eth_get_logs_accepts_array_of_addresses_and_topics() {
+        let b = MockBackend::default();
+        let v = call(
+            &b,
+            "eth_getLogs",
+            json!([{
+                "address": [
+                    "0x0000000000000000000000000000000000000001",
+                    "0x0000000000000000000000000000000000000002"
+                ],
+                "topics": [
+                    "0x0000000000000000000000000000000000000000000000000000000000000011",
+                    null,
+                    ["0x0000000000000000000000000000000000000000000000000000000000000022"]
+                ]
+            }]),
+        );
+        assert!(v.is_array());
+    }
+
+    #[test]
+    fn eth_get_proof_routes_and_returns_proof() {
+        let b = MockBackend::default();
+        let v = call(
+            &b,
+            "eth_getProof",
+            json!([
+                "0x0000000000000000000000000000000000000001",
+                ["0x0000000000000000000000000000000000000000000000000000000000000007"],
+                "latest"
+            ]),
+        );
+        assert_eq!(v.get("address").and_then(|x| x.as_str()).unwrap().len(), 42);
+        assert_eq!(v.get("balance").and_then(|x| x.as_str()), Some("0x3e8"));
+        assert_eq!(v.get("nonce").and_then(|x| x.as_str()), Some("0x2a"));
+        let sp = v.get("storageProof").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(sp.len(), 1);
+        assert_eq!(sp[0].get("value").and_then(|x| x.as_str()), Some("0xbeef"));
+    }
+
+    #[test]
+    fn eth_get_proof_rejects_bad_params() {
+        let b = MockBackend::default();
+        let req = Request {
+            jsonrpc: "2.0".into(),
+            method: "eth_getProof".into(),
+            params: json!(["0xnot-hex", []]),
+            id: json!(1),
+        };
+        let resp = dispatch(&b, req);
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    // --- Batch dispatch ---------------------------------------------------
+
+    #[test]
+    fn batch_with_two_valid_requests() {
+        let b = MockBackend::default();
+        let body = json!([
+            {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1},
+            {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 2},
+        ]);
+        let resp = super::dispatch_value(&b, body);
+        let arr = resp.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(
+            arr[0].get("result").and_then(|x| x.as_str()),
+            Some("0x1e61")
+        );
+        assert_eq!(arr[0].get("id").and_then(|x| x.as_u64()), Some(1));
+        assert_eq!(arr[1].get("result").and_then(|x| x.as_str()), Some("0x0"));
+        assert_eq!(arr[1].get("id").and_then(|x| x.as_u64()), Some(2));
+    }
+
+    #[test]
+    fn batch_with_one_invalid_item_returns_ordered_errors() {
+        let b = MockBackend::default();
+        let body = json!([
+            {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1},
+            {"jsonrpc": "2.0", "method": "eth_doesNotExist", "params": [], "id": 2},
+            {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 3},
+        ]);
+        let resp = super::dispatch_value(&b, body);
+        let arr = resp.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert!(arr[0].get("result").is_some());
+        assert!(arr[1].get("error").is_some());
+        assert!(arr[2].get("result").is_some());
+    }
+
+    #[test]
+    fn empty_batch_returns_single_error() {
+        let b = MockBackend::default();
+        let resp = super::dispatch_value(&b, json!([]));
+        assert!(resp.is_object());
+        assert!(resp.get("error").is_some());
+    }
+
+    #[test]
+    fn batch_with_non_object_item_returns_error_for_that_item() {
+        let b = MockBackend::default();
+        let resp = super::dispatch_value(&b, json!(["not an object"]));
+        let arr = resp.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert!(arr[0].get("error").is_some());
+    }
+
+    #[test]
+    fn non_object_non_array_body_returns_error() {
+        let b = MockBackend::default();
+        let resp = super::dispatch_value(&b, json!("hello"));
+        assert!(resp.is_object());
+        assert!(resp.get("error").is_some());
     }
 
     #[test]
