@@ -17,6 +17,7 @@ members = [
     "crates/sango-node",
     "crates/sango-wallet",
     "crates/sango-p2p",
+    "crates/sango-faucet",
 ]
 
 [workspace.package]

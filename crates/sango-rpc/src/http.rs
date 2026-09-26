@@ -112,6 +112,33 @@ impl HttpError {
 /// Taille maximale d'un corps HTTP (1 MiB).
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
+/// Headers CORS envoyés sur **toutes** les réponses.
+///
+/// ## Pourquoi `*`
+///
+/// Pour V1, on accepte n'importe quelle origine. C'est acceptable pour
+/// un RPC public sans état d'authentification : les clients signent
+/// localement, le nœud ne valide que des signatures. Ne pas exposer
+/// d'endpoint stateful (wallet custodial) avec `Access-Control-Allow-Origin: *`.
+///
+/// Pour une allow-list en P4+, remplacer par une origine explicite.
+pub const CORS_ALLOW_ORIGIN: &str = "*";
+
+/// Méthodes autorisées en CORS (`Access-Control-Allow-Methods`).
+///
+/// Seul `POST` est réellement utilisé par le RPC ; `OPTIONS` sert au
+/// preflight navigateur.
+pub const CORS_ALLOW_METHODS: &str = "POST, OPTIONS";
+
+/// En-têtes autorisés en CORS (`Access-Control-Allow-Headers`).
+pub const CORS_ALLOW_HEADERS: &str = "Content-Type, Accept, Authorization";
+
+/// Durée de cache du preflight CORS en secondes (`Access-Control-Max-Age`).
+///
+/// `86400` = 24 heures : les navigateurs ne rejouent pas le preflight
+/// avant une journée, ce qui évite un aller-retour par requête.
+pub const CORS_MAX_AGE: &str = "86400"; // 24h
+
 /// Vrai si l'erreur d'I/O est un timeout de lecture.
 fn is_timeout(e: &std::io::Error) -> bool {
     matches!(
@@ -217,7 +244,57 @@ pub fn write_json_ok<W: Write>(
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          Connection: {}\r\n\
+         Access-Control-Allow-Origin: {}\r\n\
          \r\n",
+        body.len(),
+        conn,
+        CORS_ALLOW_ORIGIN
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
+/// Réponse CORS preflight (`OPTIONS`).
+///
+/// Retourne `204 No Content` avec les headers `Access-Control-Allow-*`.
+pub fn write_preflight_ok<W: Write>(stream: &mut W, keep_alive: bool) -> std::io::Result<()> {
+    let conn = if keep_alive { "keep-alive" } else { "close" };
+    let header = format!(
+        "HTTP/1.1 204 No Content\r\n\
+         Content-Length: 0\r\n\
+         Connection: {}\r\n\
+         Access-Control-Allow-Origin: {}\r\n\
+         Access-Control-Allow-Methods: {}\r\n\
+         Access-Control-Allow-Headers: {}\r\n\
+         Access-Control-Max-Age: {}\r\n\
+         \r\n",
+        conn, CORS_ALLOW_ORIGIN, CORS_ALLOW_METHODS, CORS_ALLOW_HEADERS, CORS_MAX_AGE
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.flush()
+}
+
+/// Écrit une réponse HTTP avec un statut arbitraire et un corps JSON.
+///
+/// Utilisé par les services (faucet, explorer) qui veulent un code HTTP
+/// précis (400, 404, 429, 500, …) et un corps JSON.
+pub fn write_json_status<W: Write>(
+    stream: &mut W,
+    status: u16,
+    reason: &str,
+    body: &[u8],
+    keep_alive: bool,
+) -> std::io::Result<()> {
+    let conn = if keep_alive { "keep-alive" } else { "close" };
+    let header = format!(
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: {}\r\n\
+         \r\n",
+        status,
+        reason,
         body.len(),
         conn
     );
@@ -239,11 +316,13 @@ pub fn write_error<W: Write>(
          Content-Type: text/plain\r\n\
          Content-Length: {}\r\n\
          Connection: {}\r\n\
+         Access-Control-Allow-Origin: {}\r\n\
          \r\n",
         err.status,
         err.reason,
         body.len(),
-        conn
+        conn,
+        CORS_ALLOW_ORIGIN
     );
     stream.write_all(header.as_bytes())?;
     stream.write_all(body.as_bytes())?;

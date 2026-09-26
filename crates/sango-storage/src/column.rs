@@ -20,6 +20,24 @@ pub enum Column {
     Transactions,
     /// Receipts indexés par `tx_hash`.
     Receipts,
+    /// Localisation des transactions (index secondaire).
+    ///
+    /// Clé = `tx_hash` (32 bytes).
+    /// Valeur = `height(8 LE) || block_hash(32) || tx_index(4 LE) || tag(1)`.
+    ///
+    /// `tag` = `0x01` (native) ou `0x02` (EVM). Permet de retrouver
+    /// `block_height`, `block_hash` et la position dans le bloc à
+    /// partir du hash de la tx.
+    TxLocations,
+    /// Index `sender → [tx_hash]` pour les txs natives.
+    ///
+    /// Clé = `sender(20) || height_be(8) || tx_index_be(4)` (32 bytes).
+    /// Valeur = `tx_hash` (32 bytes).
+    ///
+    /// Trié byte-lex = trié par `(sender, height, tx_index)`. Pour
+    /// paginer « plus récent d'abord », itérer à l'envers sur le
+    /// préfixe `sender`.
+    TxBySender,
     /// Entrées du SMT d'état natif indexées par `key_hash`.
     StateNative,
     /// État validateurs.
@@ -68,6 +86,8 @@ impl Column {
         Column::BlockHeights,
         Column::Transactions,
         Column::Receipts,
+        Column::TxLocations,
+        Column::TxBySender,
         Column::StateNative,
         Column::Validators,
         Column::Staking,
@@ -88,6 +108,8 @@ impl Column {
             Column::BlockHeights => "block_heights",
             Column::Transactions => "transactions",
             Column::Receipts => "receipts",
+            Column::TxLocations => "tx_locations",
+            Column::TxBySender => "tx_by_sender",
             Column::StateNative => "state_native",
             Column::Validators => "validators",
             Column::Staking => "staking",
@@ -121,6 +143,8 @@ mod tests {
         assert_eq!(Column::BlockHeights.name(), "block_heights");
         assert_eq!(Column::Transactions.name(), "transactions");
         assert_eq!(Column::Receipts.name(), "receipts");
+        assert_eq!(Column::TxLocations.name(), "tx_locations");
+        assert_eq!(Column::TxBySender.name(), "tx_by_sender");
         assert_eq!(Column::StateNative.name(), "state_native");
         assert_eq!(Column::Validators.name(), "validators");
         assert_eq!(Column::Staking.name(), "staking");
@@ -134,6 +158,6 @@ mod tests {
 
     #[test]
     fn all_contains_every_variant() {
-        assert_eq!(Column::ALL.len(), 14);
+        assert_eq!(Column::ALL.len(), 16);
     }
 }

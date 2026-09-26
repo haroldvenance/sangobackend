@@ -11,6 +11,7 @@ mod error;
 mod node;
 mod node_handle;
 mod rpc_backend;
+pub mod tx_index;
 
 pub use base_fee::{
     next_base_fee, BASE_FEE_MAX_CHANGE_DENOMINATOR, INITIAL_BASE_FEE, MIN_BASE_FEE,
@@ -22,3 +23,4 @@ pub use error::NodeError;
 pub use node::Node;
 pub use node_handle::NodeHandle;
 pub use rpc_backend::NodeBackend;
+pub use tx_index::{TxIndexError, TxLocation, TX_TAG_EVM, TX_TAG_NATIVE};

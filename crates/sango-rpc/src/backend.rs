@@ -230,6 +230,30 @@ pub trait RpcBackend: Send + Sync + 'static {
         ))
     }
 
+    /// Récupère une transaction native par hash (`sango_getTransactionByHash`).
+    ///
+    /// Retourne `None` si la tx est inconnue.
+    ///
+    /// ## Note V1
+    ///
+    /// Ne retourne pas `blockHeight` / `blockHash` / `txIndex` (nécessite
+    /// un index secondaire qu'on ajoutera plus tard). Le client peut
+    /// reconstituer ces infos via `sango_getBlock`.
+    fn get_transaction_by_hash(&self, _hash: &Hash32) -> Option<Transaction> {
+        None
+    }
+
+    /// Base fee courante (`sango_baseFee`), en base units par gas.
+    ///
+    /// Utilisée par les wallets pour signer avec un `max_fee` correct.
+    /// Recommandation : `max_fee = base_fee * 2`, `priority_fee = 0` (ou un
+    /// petit pourboire si besoin de priorité).
+    ///
+    /// Défaut : 1 (INITIAL_BASE_FEE).
+    fn sango_base_fee(&self) -> u128 {
+        1
+    }
+
     /// Génère une preuve MPT EIP-1186 (`eth_getProof`). Défaut : non supporté.
     ///
     /// Le paramètre `block` est ignoré en V1 : seul le tip est disponible.

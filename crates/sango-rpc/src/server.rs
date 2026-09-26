@@ -10,7 +10,7 @@ use std::time::Duration;
 use rustls::{ServerConnection, StreamOwned};
 
 use crate::backend::RpcBackend;
-use crate::http::{read_request, write_error, write_json_ok, HttpError};
+use crate::http::{read_request, write_error, write_json_ok, write_preflight_ok, HttpError};
 use crate::tls::TlsConfig;
 
 /// Serveur RPC.
@@ -213,6 +213,20 @@ where
 
         // Dernière requête autorisée ou client demande close → fermer.
         let keep_alive = req.keep_alive && served < max_requests;
+
+        // CORS preflight : répondre 204 avec les headers Allow-*,
+        // sans exécuter le RPC. Doit être AVANT le check `method != POST`,
+        // sinon OPTIONS tombe dans le 405.
+        if req.method == "OPTIONS" {
+            if write_preflight_ok(reader.get_mut(), keep_alive).is_err() {
+                reader.get_mut().graceful_close();
+                return Ok(());
+            }
+            if !keep_alive {
+                return Ok(());
+            }
+            continue;
+        }
 
         // Méthode.
         if req.method != "POST" {

@@ -58,6 +58,16 @@ impl RpcBackend for NodeBackend {
         self.handle.with_node(|n| n.all_validators())
     }
 
+    fn sango_base_fee(&self) -> u128 {
+        self.handle
+            .with_node(|n| n.expected_base_fee().unwrap_or(INITIAL_BASE_FEE))
+    }
+
+    fn get_transaction_by_hash(&self, hash: &Hash32) -> Option<Transaction> {
+        self.handle
+            .with_node(|n| n.get_transaction_by_hash(hash).ok().flatten())
+    }
+
     fn send_transaction(&self, tx: &Transaction) -> Result<Hash32, RpcError> {
         let (base_fee, sender_nonce) = self.handle.with_node(|n| {
             let bf = n.expected_base_fee().unwrap_or(INITIAL_BASE_FEE);

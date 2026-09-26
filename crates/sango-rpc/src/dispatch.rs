@@ -39,6 +39,8 @@ fn handle<B: RpcBackend>(backend: &B, method: &str, params: &Value) -> Result<Va
         "sango_getValidators" => sango_get_validators(backend),
         "sango_sendTransaction" => sango_send_transaction(backend, params),
         "sango_chainInfo" => sango_chain_info(backend),
+        "sango_baseFee" => sango_base_fee(backend),
+        "sango_getTransactionByHash" => sango_get_transaction_by_hash(backend, params),
 
         // --- Ethereum-compatible ---
         "eth_chainId" => eth_chain_id(backend),
@@ -144,6 +146,34 @@ fn sango_send_transaction<B: RpcBackend>(backend: &B, params: &Value) -> Result<
         .map_err(|e| RpcError::InvalidParams(format!("decode tx: {e}")))?;
     let hash = backend.send_transaction(&tx)?;
     Ok(json!(format!("0x{}", hash.to_hex())))
+}
+
+fn sango_get_transaction_by_hash<B: RpcBackend>(
+    backend: &B,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let hash_hex = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::InvalidParams("expected [tx_hash_hex]".into()))?;
+    let hash = Hash32::from_hex(hash_hex)
+        .map_err(|e| RpcError::InvalidParams(format!("bad hash: {e}")))?;
+    match backend.get_transaction_by_hash(&hash) {
+        None => Ok(Value::Null),
+        Some(tx) => {
+            let bytes = sango_codec::Encode::encode_to_vec(&tx);
+            Ok(json!({
+                "hash": format!("0x{}", tx.hash().to_hex()),
+                "tx": format!("0x{}", hex::encode(&bytes)),
+            }))
+        }
+    }
+}
+
+fn sango_base_fee<B: RpcBackend>(backend: &B) -> Result<Value, RpcError> {
+    // Décimale (string) en base units, cohérent avec `sango_getBalance`.
+    Ok(json!(backend.sango_base_fee().to_string()))
 }
 
 fn sango_chain_info<B: RpcBackend>(backend: &B) -> Result<Value, RpcError> {

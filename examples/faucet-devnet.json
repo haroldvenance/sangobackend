@@ -1,0 +1,9 @@
+{
+  "rpc_url": "http://127.0.0.1:8545",
+  "listen_addr": "127.0.0.1:3000",
+  "faucet_seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "amount_sango": "100",
+  "cooldown_secs": 3600,
+  "max_requests_per_ip": 5,
+  "max_fee_base_units": 1000
+}

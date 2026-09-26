@@ -14,7 +14,7 @@ use sango_primitives::{
 use sango_state::{MetadataKey, NativeState};
 use sango_storage::{metadata_key, Batch, Column, Storage};
 use sango_tx::{validate_transaction, SenderInfo, ValidationContext};
-use sango_types::{Block, BlockHeader, ChainTip, EvmLog, Receipt, Tx};
+use sango_types::{Block, BlockHeader, ChainTip, EvmLog, Receipt, Transaction, Tx};
 
 use crate::base_fee::{next_base_fee, INITIAL_BASE_FEE};
 use crate::diff::{diff_evm, diff_state, EvmDiff};
@@ -581,6 +581,129 @@ impl Node {
         })
     }
 
+    /// Lit une transaction native par hash.
+    ///
+    /// Retourne `None` si inconnue (ni dans RocksDB ni dans le mempool —
+    /// le mempool n'est pas consulté par cette méthode, à la charge de
+    /// l'appelant).
+    pub fn get_transaction_by_hash(&self, hash: &Hash32) -> Result<Option<Transaction>, NodeError> {
+        let Some(bytes) = self.storage.get(Column::Transactions, hash.as_bytes())? else {
+            return Ok(None);
+        };
+        Transaction::decode_exact(&bytes)
+            .map(Some)
+            .map_err(|e| NodeError::Storage(sango_storage::StorageError::Codec(e)))
+    }
+
+    /// Lit une transaction (native ou EVM) par hash, avec sa
+    /// localisation dans la chaîne.
+    ///
+    /// ## Différences avec [`Self::get_transaction_by_hash`]
+    ///
+    /// - Gère les deux variants de [`Tx`] (native et EVM).
+    /// - Retourne la [`crate::tx_index::TxLocation`] (height,
+    ///   block_hash, tx_index, tag).
+    ///
+    /// ## Note V1
+    ///
+    /// Les blocs appliqués **avant** l'introduction de l'index
+    /// secondaire ne sont pas indexés. Un `data-dir` qui contient des
+    /// blocs non indexés doit être wipé en devnet (acceptable).
+    pub fn get_transaction_with_location(
+        &self,
+        hash: &Hash32,
+    ) -> Result<Option<(Tx, crate::tx_index::TxLocation)>, NodeError> {
+        let Some(loc_bytes) = self.storage.get(Column::TxLocations, hash.as_bytes())? else {
+            return Ok(None);
+        };
+        let location = crate::tx_index::TxLocation::decode(&loc_bytes).map_err(|_| {
+            NodeError::Storage(sango_storage::StorageError::Codec(
+                sango_codec::CodecError::MalformedPayload {
+                    reason: "invalid TxLocation",
+                },
+            ))
+        })?;
+        let Some(tx_bytes) = self.storage.get(Column::Transactions, hash.as_bytes())? else {
+            // Incohérence : `TxLocations` pointe vers une tx absente.
+            // On tolère (retourne `None`) plutôt que de paniquer.
+            return Ok(None);
+        };
+        let tx = Tx::decode_exact(&tx_bytes)
+            .map_err(|e| NodeError::Storage(sango_storage::StorageError::Codec(e)))?;
+        Ok(Some((tx, location)))
+    }
+
+    /// Liste les transactions **natives** envoyées par `addr`, paginées.
+    ///
+    /// ## Ordre
+    ///
+    /// Plus récentes d'abord (décroissant par `height`, puis par
+    /// `tx_index` dans le bloc).
+    ///
+    /// ## Retour
+    ///
+    /// `(items, total)`. `items` contient au plus `limit` éléments à
+    /// partir de `offset` (dans l'ordre décroissant). `total` est le
+    /// nombre total de txs natives envoyées par `addr`.
+    ///
+    /// ## Implémentation V1
+    ///
+    /// Charge toute la colonne `TxBySender` et filtre par préfixe
+    /// `sender`. Acceptable pour un devnet ; un itérateur prefix-aware
+    /// RocksDB remplacera cette implémentation si le volume le
+    /// justifie.
+    pub fn get_transactions_by_address(
+        &self,
+        addr: &NativeAddress,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<(Tx, crate::tx_index::TxLocation)>, u64), NodeError> {
+        let prefix = addr.as_bytes();
+
+        let all = self.storage.iter_column(Column::TxBySender)?;
+        let mut keys: Vec<Vec<u8>> = all
+            .into_iter()
+            .filter_map(|(k, _)| {
+                if k.len() == crate::tx_index::TX_BY_SENDER_KEY_LEN && &k[..20] == prefix.as_slice()
+                {
+                    Some(k)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // `iter_column` retourne déjà trié byte-lex croissant, mais on
+        // re-trie par sécurité (idempotent).
+        keys.sort();
+
+        let total = keys.len() as u64;
+
+        // Fenêtre : on part de la fin, on saute `offset` txs, puis on
+        // garde `limit` éléments, dans l'ordre décroissant.
+        let n = keys.len();
+        let end = n.saturating_sub(offset as usize);
+        let start = end.saturating_sub(limit as usize);
+        let selected: Vec<&Vec<u8>> = keys[start..end].iter().rev().collect();
+
+        let mut out = Vec::with_capacity(selected.len());
+        for k in selected {
+            let Some(hash_bytes) = self.storage.get(Column::TxBySender, k)? else {
+                continue;
+            };
+            if hash_bytes.len() != 32 {
+                continue;
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&hash_bytes);
+            let tx_hash = Hash32::from_bytes(arr);
+            if let Some((tx, location)) = self.get_transaction_with_location(&tx_hash)? {
+                out.push((tx, location));
+            }
+        }
+
+        Ok((out, total))
+    }
+
     /// Liste tous les validateurs enregistrés.
     #[must_use]
     pub fn all_validators(&self) -> Vec<sango_types::ValidatorInfo> {
@@ -866,9 +989,16 @@ impl Node {
             block.header.height.get().to_le_bytes(),
             block_hash.as_bytes(),
         );
-        for tx in &block.transactions {
+        for (index, tx) in block.transactions.iter().enumerate() {
             let tx_hash = tx.hash();
             batch.put(Column::Transactions, tx_hash.as_bytes(), tx.encode_to_vec());
+            crate::tx_index::write_tx_index(
+                &mut batch,
+                tx,
+                block.header.height.get(),
+                block_hash,
+                index as u32,
+            );
         }
         for receipt in &result.receipts {
             batch.put(

@@ -62,7 +62,7 @@
 pub mod backend;
 mod dispatch;
 pub mod error;
-mod http;
+pub mod http;
 pub mod json;
 mod server;
 pub mod tls;

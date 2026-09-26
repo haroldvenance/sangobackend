@@ -4494,6 +4494,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sango-faucet"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sango-crypto",
+ "sango-primitives",
+ "sango-rpc",
+ "sango-types",
+ "sango-wallet",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "sango-mempool"
 version = "0.1.0"
 dependencies = [
