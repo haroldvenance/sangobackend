@@ -106,6 +106,9 @@ COMMANDES NATIVES:
     balance [ADDR]                      Solde natif
     nonce [ADDR]                        Nonce natif
     info                                Informations chaîne
+    history [ADDR] [--limit N] [--offset M]
+                                        Transactions natives d'une adresse
+                                        (défaut : limit=20, offset=0)
     send --to ADDR --amount SANGO       Transfert natif
     stake|unstake --amount SANGO
     delegate|undelegate --validator ADDR --amount SANGO

@@ -76,6 +76,7 @@ fn run(args: &[String]) -> Result<(), WalletError> {
         "balance" => cmd_balance(&rpc, kf_path, &rest),
         "nonce" => cmd_nonce(&rpc, kf_path, &rest),
         "info" => cmd_info(&rpc),
+        "history" => cmd_history(&rpc, kf_path, &rest),
         "send" => cmd_send(&rpc, kf_path, &rest),
         "stake" => cmd_stake(&rpc, kf_path, &rest),
         "unstake" => cmd_unstake(&rpc, kf_path, &rest),
@@ -161,6 +162,100 @@ fn cmd_nonce(
 fn cmd_info(rpc: &RpcClient) -> Result<(), WalletError> {
     let info = rpc.call("sango_chainInfo", serde_json::json!([]))?;
     println!("{}", serde_json::to_string_pretty(&info)?);
+    Ok(())
+}
+
+/// `history [ADDR] [--limit N] [--offset M]`
+///
+/// Liste les transactions **natives** émises par `ADDR` (défaut : adresse
+/// du keyfile). Ordre décroissant par hauteur.
+fn cmd_history(
+    rpc: &RpcClient,
+    keyfile_path: &std::path::Path,
+    args: &[String],
+) -> Result<(), WalletError> {
+    let addr = resolve_address(keyfile_path, args)?;
+
+    let mut limit: u32 = 20;
+    let mut offset: u32 = 0;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--limit" => {
+                limit = args
+                    .get(i + 1)
+                    .ok_or_else(|| WalletError::Usage("--limit needs a value".into()))?
+                    .parse()
+                    .map_err(|e| WalletError::Usage(format!("--limit: {e}")))?;
+                i += 2;
+            }
+            "--offset" => {
+                offset = args
+                    .get(i + 1)
+                    .ok_or_else(|| WalletError::Usage("--offset needs a value".into()))?
+                    .parse()
+                    .map_err(|e| WalletError::Usage(format!("--offset: {e}")))?;
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let result = rpc.call(
+        "sango_getTransactionsByAddress",
+        serde_json::json!([format!("0x{}", addr.to_hex()), limit, offset]),
+    )?;
+
+    let total = result.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+    let items = result
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    println!(
+        "Transactions de 0x{} — {} au total, {} affichée(s)",
+        addr.to_hex(),
+        total,
+        items.len()
+    );
+    println!();
+
+    if items.is_empty() {
+        println!("  (aucune transaction)");
+        return Ok(());
+    }
+
+    for (i, item) in items.iter().enumerate() {
+        let hash = item.get("hash").and_then(|v| v.as_str()).unwrap_or("0x?");
+        let height = item
+            .get("blockHeight")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let tx_index = item.get("txIndex").and_then(|v| v.as_u64()).unwrap_or(0);
+        let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+        let tx_kind = item
+            .get("txKind")
+            .and_then(|v| v.as_u64())
+            .map(|v| format!("{v}"))
+            .unwrap_or_else(|| "-".into());
+
+        let short_hash = if hash.len() >= 12 {
+            format!("{}…{}", &hash[..8], &hash[hash.len() - 4..])
+        } else {
+            hash.to_string()
+        };
+
+        println!(
+            "  #{:<3} {}  bloc {:<6} idx {}  {}  txKind={}",
+            offset + i as u32 + 1,
+            short_hash,
+            height,
+            tx_index,
+            kind,
+            tx_kind,
+        );
+    }
     Ok(())
 }
 
