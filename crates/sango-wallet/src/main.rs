@@ -122,13 +122,13 @@ fn cmd_new(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
 }
 
 fn cmd_address(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
-    let kf = KeyFile::load(keyfile_path)?;
+    let kf = KeyFile::load_silent(keyfile_path)?;
     println!("0x{}", kf.address_hex);
     Ok(())
 }
 
 fn cmd_pubkey(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
-    let kf = KeyFile::load(keyfile_path)?;
+    let kf = KeyFile::load_silent(keyfile_path)?;
     println!("0x{}", kf.public_key_hex()?);
     Ok(())
 }
@@ -544,7 +544,7 @@ fn cmd_evm_new(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
 }
 
 fn cmd_evm_address(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
-    let kf = KeyFile::load(keyfile_path)?;
+    let kf = KeyFile::load_silent(keyfile_path)?;
     let addr = kf.evm_address()?;
     println!("0x{}", addr.to_hex());
     Ok(())
@@ -795,7 +795,7 @@ fn resolve_address(
             return parse_address_arg(arg);
         }
     }
-    let kf = KeyFile::load(keyfile_path)?;
+    let kf = KeyFile::load_silent(keyfile_path)?;
     kf.address()
 }
 
@@ -809,7 +809,7 @@ fn resolve_evm_address(
                 .map_err(|e| WalletError::InvalidAddress(format!("{arg}: {e}")));
         }
     }
-    let kf = KeyFile::load(keyfile_path)?;
+    let kf = KeyFile::load_silent(keyfile_path)?;
     kf.evm_address()
 }
 

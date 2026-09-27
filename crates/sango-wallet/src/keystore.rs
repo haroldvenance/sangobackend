@@ -162,13 +162,30 @@ impl KeyFile {
         Ok(PathBuf::from(home).join(".sango").join("wallet.json"))
     }
 
-    /// Charge un keyfile **v1 en clair**.
+    /// Charge un keyfile **v1 en clair**, avec avertissement de sécurité.
+    ///
+    /// Réservé aux commandes qui **signent** ou **modifient** le keyfile.
+    /// Pour les lectures publiques (adresse, solde, historique), utiliser
+    /// [`Self::load_silent`] — le warning y serait du bruit.
     ///
     /// # Erreurs
     ///
     /// [`WalletError::AlreadyEncrypted`] si le fichier est en v2 — il
     /// faut alors utiliser [`Self::load_encrypted`].
     pub fn load(path: impl AsRef<Path>) -> Result<Self, WalletError> {
+        let kf = Self::load_silent(path)?;
+        if kf.version == 1 {
+            eprintln!("⚠️  Keyfile en clair (v1). Migrez avec `sango-wallet keyfile encrypt`.");
+        }
+        Ok(kf)
+    }
+
+    /// Charge un keyfile **v1 en clair**, sans warning.
+    ///
+    /// À utiliser pour les commandes qui ne manipulent que des données
+    /// publiques (adresse, solde, historique). Pour les commandes
+    /// sensibles, préférer [`Self::load`].
+    pub fn load_silent(path: impl AsRef<Path>) -> Result<Self, WalletError> {
         let path = path.as_ref();
         let bytes = fs::read(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -186,7 +203,6 @@ impl KeyFile {
                         v1.version
                     )));
                 }
-                eprintln!("⚠️  Keyfile en clair (v1). Migrez avec `sango-wallet keyfile encrypt`.");
                 Ok(Self {
                     version: 1,
                     seed_hex: v1.seed_hex,
