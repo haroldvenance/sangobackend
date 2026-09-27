@@ -271,16 +271,64 @@ pub fn block(rpc: &Rpc, network: &str, height: u64) -> String {
              </tr></thead><tbody>",
         );
         for (i, tx) in block.transactions.iter().enumerate() {
-            body.push_str(&tx_row(tx, i as u32));
+            body.push_str(&tx_row(rpc, tx, i as u32));
         }
         body.push_str("</tbody></table>");
     }
     body.push_str("</div>");
 
+    // Vue Ethereum (eth_getBlockByNumber) — debug : permet de comparer
+    // les deux représentations du même bloc.
+    if let Ok(Some(eth_block)) = rpc.eth_get_block_by_number(h, false) {
+        body.push_str(&eth_view_section(&eth_block));
+    }
+
     layout(&format!("Bloc #{h}"), network, &body)
 }
 
-fn tx_row(tx: &Tx, index: u32) -> String {
+/// Rendu HTML de la vue Ethereum d'un bloc (`eth_getBlockByNumber`).
+///
+/// Dump compact des champs Ethereum-only : `logsBloom`, `receiptsRoot`
+/// (format hex Ethereum), `sha3Uncles`, `size`, `baseFeePerGas`.
+fn eth_view_section(eth_block: &serde_json::Value) -> String {
+    let field = |k: &str| -> String {
+        eth_block
+            .get(k)
+            .and_then(|x| x.as_str())
+            .map(|s| {
+                if s.len() > 30 {
+                    format!("<span class=\"mono\">{}</span>", escape(&shorten(s, 14, 8)))
+                } else {
+                    format!("<span class=\"mono\">{}</span>", escape(s))
+                }
+            })
+            .unwrap_or_else(|| "<span class=\"muted\">—</span>".into())
+    };
+
+    let mut out = String::from(
+        "<div class=\"card\"><h2>Vue Ethereum <span class=\"muted\">(eth_getBlockByNumber)</span></h2><dl class=\"kv\">",
+    );
+    out.push_str(&kv("Number", &field("number")));
+    out.push_str(&kv("Hash", &field("hash")));
+    out.push_str(&kv("Parent hash", &field("parentHash")));
+    out.push_str(&kv("State root", &field("stateRoot")));
+    out.push_str(&kv("Transactions root", &field("transactionsRoot")));
+    out.push_str(&kv("Receipts root", &field("receiptsRoot")));
+    out.push_str(&kv("Logs bloom", &field("logsBloom")));
+    out.push_str(&kv("Gas used", &field("gasUsed")));
+    out.push_str(&kv("Gas limit", &field("gasLimit")));
+    out.push_str(&kv("Base fee", &field("baseFeePerGas")));
+    out.push_str(&kv("Size", &field("size")));
+    out.push_str(&kv("Timestamp", &field("timestamp")));
+    out.push_str(&kv(
+        "Miner",
+        "<span class=\"muted\">adresse nulle (proposeur Sango natif)</span>",
+    ));
+    out.push_str("</dl></div>");
+    out
+}
+
+fn tx_row(rpc: &Rpc, tx: &Tx, index: u32) -> String {
     let hash = tx.hash();
     let (kind_class, kind_label, from, to, value) = match tx {
         Tx::Native(t) => (
@@ -292,15 +340,23 @@ fn tx_row(tx: &Tx, index: u32) -> String {
                 .unwrap_or_else(|| "—".into()),
             format_amount(t.value.base_units()),
         ),
-        Tx::Evm(t) => (
-            "evm",
-            "evm",
-            "<span class=\"muted\">(récupéré)</span>".into(),
-            t.to()
-                .map(|r| format!("0x{}", r.to_hex()))
-                .unwrap_or_else(|| "(création)".into()),
-            format!("{:#x}", t.value()),
-        ),
+        Tx::Evm(t) => {
+            let from = rpc
+                .eth_get_transaction(&hash)
+                .ok()
+                .flatten()
+                .and_then(|v| v.get("from").and_then(|x| x.as_str()).map(str::to_string))
+                .unwrap_or_else(|| "(récupéré)".into());
+            (
+                "evm",
+                "evm",
+                from,
+                t.to()
+                    .map(|r| format!("0x{}", r.to_hex()))
+                    .unwrap_or_else(|| "(création)".into()),
+                format!("{:#x}", t.value()),
+            )
+        }
     };
     format!(
         "<tr>\
@@ -359,7 +415,175 @@ pub fn tx(rpc: &Rpc, network: &str, hash_hex: &str) -> String {
     }
     body.push_str("</dl></div>");
 
+    // Section receipt.
+    let tx_hash = tx.tx.hash();
+    match &tx.tx {
+        Tx::Evm(_) => match rpc.eth_get_receipt(&tx_hash) {
+            Ok(Some(receipt)) => body.push_str(&receipt_section(&receipt)),
+            Ok(None) => body.push_str(
+                "<div class=\"card\"><h2>Receipt</h2><div class=\"empty\">Receipt non disponible (tx non incluse ou pas encore indexée)</div></div>",
+            ),
+            Err(e) => body.push_str(&format!(
+                "<div class=\"card\"><h2>Receipt</h2><div class=\"empty\">Erreur : {}</div></div>",
+                escape(&e.to_string())
+            )),
+        },
+        Tx::Native(_) => body.push_str(
+            "<div class=\"card\"><h2>Receipt</h2><div class=\"empty\">Pas de receipt exposé pour les transactions natives en V1</div></div>",
+        ),
+    }
+
     layout("Transaction", network, &body)
+}
+
+/// Rendu HTML de la section receipt EVM.
+fn receipt_section(receipt: &serde_json::Value) -> String {
+    let status = receipt
+        .get("status")
+        .and_then(|x| x.as_str())
+        .unwrap_or("0x?");
+    let status_label = if status == "0x1" {
+        "<span class=\"green\">Succès</span>"
+    } else {
+        "<span class=\"red\">Échec</span>"
+    };
+    let gas_used = receipt
+        .get("gasUsed")
+        .and_then(|x| x.as_str())
+        .unwrap_or("0x0");
+    let cum_gas = receipt
+        .get("cumulativeGasUsed")
+        .and_then(|x| x.as_str())
+        .unwrap_or("0x0");
+    let contract = receipt.get("contractAddress").and_then(|x| x.as_str());
+
+    let mut out = String::from("<div class=\"card\"><h2>Receipt</h2><dl class=\"kv\">");
+    out.push_str(&kv("Statut", status_label));
+    out.push_str(&kv("Gas utilisé", &escape(gas_used)));
+    out.push_str(&kv("Gas cumulé (bloc)", &escape(cum_gas)));
+    if let Some(c) = contract {
+        out.push_str(&kv("Contrat créé", &addr_link(c)));
+    }
+    out.push_str("</dl>");
+
+    if let Some(logs) = receipt.get("logs").and_then(|x| x.as_array()) {
+        out.push_str(&format!(
+            "<h2 style=\"margin-top:1rem\">Logs <span class=\"muted\">{}</span></h2>",
+            logs.len()
+        ));
+        if logs.is_empty() {
+            out.push_str("<div class=\"empty\">Aucun log</div>");
+        } else {
+            out.push_str(
+                "<table><thead><tr>\
+                 <th>Index</th><th>Adresse</th><th>Topics</th><th>Data</th>\
+                 </tr></thead><tbody>",
+            );
+            for log in logs {
+                let idx = log.get("logIndex").and_then(|x| x.as_str()).unwrap_or("?");
+                let addr = log.get("address").and_then(|x| x.as_str()).unwrap_or("");
+                let data = log.get("data").and_then(|x| x.as_str()).unwrap_or("0x");
+                let topics_str = log
+                    .get("topics")
+                    .and_then(|x| x.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|t| t.as_str())
+                            .map(|t| {
+                                format!("<div class=\"mono\">{}</div>", escape(&shorten(t, 14, 8)))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "<tr>\
+                     <td class=\"mono\">{}</td>\
+                     <td class=\"mono\">{}</td>\
+                     <td>{}</td>\
+                     <td class=\"mono\">{}</td>\
+                     </tr>",
+                    escape(idx),
+                    addr_link(addr),
+                    topics_str,
+                    escape(&shorten(data, 20, 10)),
+                ));
+            }
+            out.push_str("</tbody></table>");
+        }
+    }
+    out.push_str("</div>");
+    out
+}
+
+// --- Recherche -------------------------------------------------------------
+
+/// Page `/search?q=X`.
+///
+/// Heuristique :
+/// - `123` → `/block/123`
+/// - `0x` + 64 hex → tx hash (via `sango_getTransactionByHash`)
+/// - `0x` + 40 hex → adresse
+/// - autre → page d'erreur
+#[must_use]
+pub fn search(rpc: &Rpc, network: &str, query: &str) -> String {
+    let q = query.trim();
+    if q.is_empty() {
+        return error_page(network, "Recherche vide");
+    }
+
+    // Nombre pur → bloc.
+    if q.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(h) = q.parse::<u64>() {
+            return block(rpc, network, h);
+        }
+    }
+
+    // 0x + hex.
+    if let Some(hex) = q.strip_prefix("0x").or_else(|| q.strip_prefix("0X")) {
+        match hex.len() {
+            64 => {
+                if let Ok(h) = Hash32::from_hex(q) {
+                    // 1. Tx ?
+                    if let Ok(Some(_)) = rpc.get_transaction(&h) {
+                        return tx(rpc, network, &format!("0x{}", h.to_hex()));
+                    }
+                    // 2. Bloc ? On utilise eth_getBlockByHash (retourne
+                    // le numéro de bloc, qu'on peut router vers /block/N).
+                    if let Ok(Some(blk)) = rpc.eth_get_block_by_hash(&h, false) {
+                        if let Some(num_hex) = blk.get("number").and_then(|x| x.as_str()) {
+                            if let Ok(num) =
+                                u64::from_str_radix(num_hex.trim_start_matches("0x"), 16)
+                            {
+                                return block(rpc, network, num);
+                            }
+                        }
+                    }
+                }
+                return error_page(
+                    network,
+                    &format!("Hash introuvable (ni tx ni bloc) : {}", escape(q)),
+                );
+            }
+            40 => {
+                return address(rpc, network, q, 1);
+            }
+            _ => {
+                return error_page(
+                    network,
+                    &format!(
+                        "Longueur de hash invalide : {} (attendu 40 ou 64)",
+                        hex.len()
+                    ),
+                );
+            }
+        }
+    }
+
+    error_page(
+        network,
+        "Format non reconnu. Utilise : nombre (bloc), 0x…40 (adresse), 0x…64 (tx)",
+    )
 }
 
 fn native_tx_fields(body: &mut String, t: &Transaction) {

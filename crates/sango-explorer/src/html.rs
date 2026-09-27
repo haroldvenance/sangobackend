@@ -130,6 +130,16 @@ tbody tr:hover { background: rgba(88,166,255,0.04); }
 .error-page h1 { font-size: 3rem; margin: 0; color: var(--muted); }
 .error-page p { color: var(--muted); }
 footer { text-align: center; padding: 1.5rem; color: var(--muted); font-size: 0.8rem; }
+header .search { flex: 1; max-width: 420px; margin: 0 1.5rem; }
+header .search input {
+  width: 100%; padding: 0.4rem 0.75rem;
+  background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 4px;
+  font-family: ui-monospace, Menlo, monospace; font-size: 0.85rem;
+}
+header .search input:focus {
+  outline: none; border-color: var(--accent);
+}
 "#;
 
 /// Layout HTML commun.
@@ -149,6 +159,9 @@ pub fn layout(title: &str, network: &str, body: &str) -> String {
 <body>
 <header>
   <h1><a href="/">Sango Explorer</a><span class="network">{network_e}</span></h1>
+  <form class="search" action="/search" method="get">
+    <input type="text" name="q" placeholder="Bloc, hash ou adresse…" autocomplete="off" />
+  </form>
   <nav>
     <a href="/">Accueil</a>
     <a href="/blocks">Blocs</a>

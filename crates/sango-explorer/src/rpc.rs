@@ -238,6 +238,56 @@ impl Rpc {
             .cloned()
             .ok_or_else(|| ExplorerError::Parse("getPendingUnbondings: expected array".into()))
     }
+
+    // --- Ethereum-style (EVM uniquement) -----------------------------------
+
+    /// `eth_getTransactionByHash` (format EIP-1474).
+    ///
+    /// Retourne `None` si la tx est native ou inconnue.
+    pub fn eth_get_transaction(&self, hash: &Hash32) -> Result<Option<Value>, ExplorerError> {
+        let v = self.raw(
+            "eth_getTransactionByHash",
+            json!([format!("0x{}", hash.to_hex())]),
+        )?;
+        Ok(if v.is_null() { None } else { Some(v) })
+    }
+
+    /// `eth_getTransactionReceipt`.
+    ///
+    /// Retourne `None` si la tx est native ou inconnue.
+    pub fn eth_get_receipt(&self, hash: &Hash32) -> Result<Option<Value>, ExplorerError> {
+        let v = self.raw(
+            "eth_getTransactionReceipt",
+            json!([format!("0x{}", hash.to_hex())]),
+        )?;
+        Ok(if v.is_null() { None } else { Some(v) })
+    }
+
+    /// `eth_getBlockByNumber` (format Ethereum).
+    pub fn eth_get_block_by_number(
+        &self,
+        height: u64,
+        full_tx: bool,
+    ) -> Result<Option<Value>, ExplorerError> {
+        let v = self.raw(
+            "eth_getBlockByNumber",
+            json!([format!("0x{:x}", height), full_tx]),
+        )?;
+        Ok(if v.is_null() { None } else { Some(v) })
+    }
+
+    /// `eth_getBlockByHash` (format Ethereum).
+    pub fn eth_get_block_by_hash(
+        &self,
+        hash: &Hash32,
+        full_tx: bool,
+    ) -> Result<Option<Value>, ExplorerError> {
+        let v = self.raw(
+            "eth_getBlockByHash",
+            json!([format!("0x{}", hash.to_hex()), full_tx]),
+        )?;
+        Ok(if v.is_null() { None } else { Some(v) })
+    }
 }
 
 /// Transaction décodée + localisation (vue explorer).

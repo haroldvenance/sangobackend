@@ -202,6 +202,14 @@ fn route(explorer: &Explorer, req: &HttpRequest) -> (u16, &'static str, String) 
                 .unwrap_or(1u64);
             (200, "OK", pages::blocks(&explorer.rpc, network, page))
         }
+        "/search" => {
+            let q = query
+                .iter()
+                .find(|(k, _)| k == "q")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("");
+            (200, "OK", pages::search(&explorer.rpc, network, q))
+        }
         _ => {
             if let Some(rest) = path.strip_prefix("/block/") {
                 return match rest.parse::<u64>() {
