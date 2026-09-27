@@ -309,7 +309,14 @@ impl Node {
                     };
                     let vn = match validate_transaction(&native, &vctx) {
                         Ok(v) => v,
-                        Err(_) => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                tx = %format!("0x{}", native.hash().to_hex()),
+                                reason = ?e,
+                                "native tx rejected at validation"
+                            );
+                            break;
+                        }
                     };
                     let gas_used = gas_for(native.tx_kind).unwrap_or(NATIVE_TRANSFER_GAS);
                     let exec_ctx = ExecutionContext {
@@ -323,9 +330,14 @@ impl Node {
                         downtime_enabled: false,
                         evm_chain_id: self.evm_chain_id,
                     };
-                    if apply_tx_no_rollback(&mut trial_filter, &native, &vn, gas_used, &exec_ctx)
-                        .is_err()
+                    if let Err(e) =
+                        apply_tx_no_rollback(&mut trial_filter, &native, &vn, gas_used, &exec_ctx)
                     {
+                        tracing::warn!(
+                            tx = %format!("0x{}", native.hash().to_hex()),
+                            reason = ?e,
+                            "native tx rejected at apply"
+                        );
                         break;
                     }
                     accepted.push(Tx::Native(native));
@@ -334,7 +346,13 @@ impl Node {
                 Tx::Evm(evm) => {
                     let ve = match self.validate_evm_tx(&evm, base_fee) {
                         Ok(v) => v,
-                        Err(_) => break,
+                        Err(reason) => {
+                            tracing::warn!(
+                                reason = %reason,
+                                "evm tx rejected at validation"
+                            );
+                            break;
+                        }
                     };
                     let extras = TxEnvExtras {
                         caller: ve.sender,
@@ -343,7 +361,11 @@ impl Node {
                     // Un REVERT/HALT renvoie `Ok(outcome)` — on accepte la
                     // tx (elle consomme du gas et laisse une trace). Un
                     // `Err` (nonce invalide, fonds insuffisants…) rejette.
-                    if evm_transact(&mut trial_evm, &evm, &evm_block_env, extras).is_err() {
+                    if let Err(e) = evm_transact(&mut trial_evm, &evm, &evm_block_env, extras) {
+                        tracing::warn!(
+                            reason = ?e,
+                            "evm tx rejected at apply"
+                        );
                         break;
                     }
                     accepted.push(Tx::Evm(evm));

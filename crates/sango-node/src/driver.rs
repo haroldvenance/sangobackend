@@ -450,6 +450,14 @@ impl Driver {
             .handle
             .with_mempool(|pool| pool.select_for_block(MAX_TXS_PER_BLOCK, &nonces));
 
+        let selected = entries.len();
+        tracing::debug!(
+            senders = senders.len(),
+            selected,
+            max_txs = MAX_TXS_PER_BLOCK,
+            "collect_native_candidates"
+        );
+
         entries.into_iter().map(|e| e.tx).collect()
     }
 
@@ -507,6 +515,7 @@ impl Driver {
     }
 
     fn prune_native_mempool(&self) {
+        tracing::debug!("prune_native_mempool");
         let senders: Vec<NativeAddress> = self.handle.with_mempool(|pool| {
             let mut s = HashSet::new();
             for h in pool.hashes() {

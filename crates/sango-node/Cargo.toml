@@ -34,6 +34,8 @@ sango-p2p.workspace = true
 tokio.workspace = true
 sango-rpc.workspace = true
 sango-wallet.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

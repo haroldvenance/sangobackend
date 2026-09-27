@@ -43,7 +43,27 @@ const DEFAULT_RPC_ADDR: &str = "127.0.0.1:8545";
 const BLOCK_INTERVAL_MS: u64 = 500;
 const P2P_DRAIN_PER_TICK: usize = 100;
 
+/// Initialise le subscriber `tracing` (idempotent).
+///
+/// Priorité : `RUST_LOG` > `RUST_LOG_STYLE` > défaut `info`.
+/// Exemples :
+/// - `RUST_LOG=info` (défaut)
+/// - `RUST_LOG=sango_node=debug`
+/// - `RUST_LOG=sango_node=debug,sango_consensus=warn`
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // `try_init` ne panique pas si un subscriber est déjà installé
+    // (utile en tests qui appellent `run` plusieurs fois).
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_level(true)
+        .try_init();
+}
+
 fn main() -> ExitCode {
+    init_tracing();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
