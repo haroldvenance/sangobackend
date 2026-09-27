@@ -2,11 +2,14 @@
 
 use serde_json::{json, Value};
 
-use sango_codec::Decode as _;
+use sango_codec::{Decode as _, Encode as _};
 use sango_primitives::{EvmAddress, Hash32, NativeAddress, U256};
-use sango_types::Transaction;
+use sango_types::{
+    Block, Delegation, EvmAccessListItem, EvmAuthorization, EvmTx, PendingUnbonding, Receipt,
+    ReceiptStatus, Transaction, Tx, ValidatorInfo,
+};
 
-use crate::backend::{EthCallRequest, RpcBackend};
+use crate::backend::{EthCallRequest, RpcBackend, TxLocation};
 use crate::error::RpcError;
 use crate::json::{Request, Response};
 
@@ -41,6 +44,10 @@ fn handle<B: RpcBackend>(backend: &B, method: &str, params: &Value) -> Result<Va
         "sango_chainInfo" => sango_chain_info(backend),
         "sango_baseFee" => sango_base_fee(backend),
         "sango_getTransactionByHash" => sango_get_transaction_by_hash(backend, params),
+        "sango_getTransactionsByAddress" => sango_get_transactions_by_address(backend, params),
+        "sango_getValidatorInfo" => sango_get_validator_info(backend, params),
+        "sango_getDelegations" => sango_get_delegations(backend, params),
+        "sango_getPendingUnbondings" => sango_get_pending_unbondings(backend, params),
 
         // --- Ethereum-compatible ---
         "eth_chainId" => eth_chain_id(backend),
@@ -55,6 +62,10 @@ fn handle<B: RpcBackend>(backend: &B, method: &str, params: &Value) -> Result<Va
         "eth_sendRawTransaction" => eth_send_raw_transaction(backend, params),
         "eth_getLogs" => eth_get_logs(backend, params),
         "eth_getProof" => eth_get_proof(backend, params),
+        "eth_getTransactionByHash" => eth_get_transaction_by_hash(backend, params),
+        "eth_getTransactionReceipt" => eth_get_transaction_receipt(backend, params),
+        "eth_getBlockByNumber" => eth_get_block_by_number(backend, params),
+        "eth_getBlockByHash" => eth_get_block_by_hash(backend, params),
 
         other => Err(RpcError::MethodNotFound(other.to_string())),
     }
@@ -118,21 +129,25 @@ fn sango_get_balance<B: RpcBackend>(backend: &B, params: &Value) -> Result<Value
 
 fn sango_get_validators<B: RpcBackend>(backend: &B) -> Result<Value, RpcError> {
     let validators = backend.get_validators();
-    let array: Vec<Value> = validators
-        .into_iter()
-        .map(|v| {
-            json!({
-                "address": format!("0x{}", v.address.to_hex()),
-                "publicKey": format!("0x{}", v.public_key.to_hex()),
-                "selfStake": v.self_stake.base_units().to_string(),
-                "totalDelegated": v.total_delegated.base_units().to_string(),
-                "votingPower": v.voting_power().base_units().to_string(),
-                "commissionBps": v.commission_bps,
-                "jailed": v.jailed,
-            })
-        })
-        .collect();
+    let array: Vec<Value> = validators.iter().map(validator_info_to_json).collect();
     Ok(Value::Array(array))
+}
+
+fn validator_info_to_json(v: &ValidatorInfo) -> Value {
+    json!({
+        "address": format!("0x{}", v.address.to_hex()),
+        "publicKey": format!("0x{}", v.public_key.to_hex()),
+        "selfStake": v.self_stake.base_units().to_string(),
+        "totalDelegated": v.total_delegated.base_units().to_string(),
+        "votingPower": v.voting_power().base_units().to_string(),
+        "commissionBps": v.commission_bps,
+        "jailed": v.jailed,
+        "pendingCommissionBps": v.pending_commission_bps,
+        "pendingCommissionAt": v.pending_commission_at,
+        "jailedUntil": v.jailed_until,
+        "downtimeWindowStart": v.downtime_window_start,
+        "downtimeMissed": v.downtime_missed,
+    })
 }
 
 fn sango_send_transaction<B: RpcBackend>(backend: &B, params: &Value) -> Result<Value, RpcError> {
@@ -148,6 +163,44 @@ fn sango_send_transaction<B: RpcBackend>(backend: &B, params: &Value) -> Result<
     Ok(json!(format!("0x{}", hash.to_hex())))
 }
 
+/// Sérialise une tx (native ou EVM) + sa localisation en JSON.
+fn tx_to_json(tx: &Tx, loc: &TxLocation) -> Value {
+    let (kind, native_tx_kind) = match tx {
+        Tx::Native(n) => ("native", Some(n.tx_kind.tag())),
+        Tx::Evm(_) => ("evm", None),
+    };
+    json!({
+        "hash": format!("0x{}", tx.hash().to_hex()),
+        "blockHeight": loc.height,
+        "blockHash": format!("0x{}", loc.block_hash.to_hex()),
+        "txIndex": loc.tx_index,
+        "kind": kind,
+        "txKind": native_tx_kind,
+        "tx": format!("0x{}", hex::encode(tx.canonical_bytes())),
+    })
+}
+
+fn delegation_to_json(d: &Delegation) -> Value {
+    json!({
+        "delegator": format!("0x{}", d.delegator.to_hex()),
+        "validator": format!("0x{}", d.validator.to_hex()),
+        "bonded": d.bonded.base_units().to_string(),
+        "unbonding": d.unbonding.base_units().to_string(),
+        "unbondingUntil": d.unbonding_until,
+        "pendingRewards": d.pending_rewards.base_units().to_string(),
+    })
+}
+
+fn pending_unbonding_to_json(p: &PendingUnbonding) -> Value {
+    json!({
+        "id": p.id,
+        "delegator": format!("0x{}", p.delegator.to_hex()),
+        "validator": format!("0x{}", p.validator.to_hex()),
+        "amount": p.amount.base_units().to_string(),
+        "matureAt": p.mature_at,
+    })
+}
+
 fn sango_get_transaction_by_hash<B: RpcBackend>(
     backend: &B,
     params: &Value,
@@ -159,16 +212,52 @@ fn sango_get_transaction_by_hash<B: RpcBackend>(
         .ok_or_else(|| RpcError::InvalidParams("expected [tx_hash_hex]".into()))?;
     let hash = Hash32::from_hex(hash_hex)
         .map_err(|e| RpcError::InvalidParams(format!("bad hash: {e}")))?;
-    match backend.get_transaction_by_hash(&hash) {
+    match backend.get_transaction_with_location(&hash) {
         None => Ok(Value::Null),
-        Some(tx) => {
-            let bytes = sango_codec::Encode::encode_to_vec(&tx);
-            Ok(json!({
-                "hash": format!("0x{}", tx.hash().to_hex()),
-                "tx": format!("0x{}", hex::encode(&bytes)),
-            }))
-        }
+        Some((tx, loc)) => Ok(tx_to_json(&tx, &loc)),
     }
+}
+
+fn sango_get_transactions_by_address<B: RpcBackend>(
+    backend: &B,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let address = parse_address_param(params, 0, "address")?;
+    let limit = parse_optional_u32_param(params, 1, 20).min(100);
+    let offset = parse_optional_u32_param(params, 2, 0);
+    let (items, total) = backend.get_transactions_by_address(&address, limit, offset);
+    let items_json: Vec<Value> = items.iter().map(|(tx, loc)| tx_to_json(tx, loc)).collect();
+    Ok(json!({
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "items": items_json,
+    }))
+}
+
+fn sango_get_validator_info<B: RpcBackend>(backend: &B, params: &Value) -> Result<Value, RpcError> {
+    let address = parse_address_param(params, 0, "address")?;
+    match backend.get_validator_info(&address) {
+        None => Ok(Value::Null),
+        Some(v) => Ok(validator_info_to_json(&v)),
+    }
+}
+
+fn sango_get_delegations<B: RpcBackend>(backend: &B, params: &Value) -> Result<Value, RpcError> {
+    let address = parse_address_param(params, 0, "address")?;
+    let delegations = backend.get_delegations_of(&address);
+    let array: Vec<Value> = delegations.iter().map(delegation_to_json).collect();
+    Ok(Value::Array(array))
+}
+
+fn sango_get_pending_unbondings<B: RpcBackend>(
+    backend: &B,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let address = parse_address_param(params, 0, "address")?;
+    let pending = backend.get_pending_unbondings_for(&address);
+    let array: Vec<Value> = pending.iter().map(pending_unbonding_to_json).collect();
+    Ok(Value::Array(array))
 }
 
 fn sango_base_fee<B: RpcBackend>(backend: &B) -> Result<Value, RpcError> {
@@ -269,6 +358,355 @@ fn eth_get_proof<B: RpcBackend>(backend: &B, params: &Value) -> Result<Value, Rp
     let (addr, slots, block) = parse_get_proof_params(params)?;
     let proof = backend.eth_get_proof(&addr, &slots, block)?;
     Ok(serialize_proof(&proof))
+}
+
+// --- eth_getTransactionByHash / eth_getTransactionReceipt / blocks --------
+
+/// Constante Ethereum : `Keccak256(RLP([]))` — hash des ommers vides.
+const OMMERS_HASH: &str = "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347";
+
+fn access_list_to_json(list: &[EvmAccessListItem]) -> Value {
+    list.iter()
+        .map(|item| {
+            json!({
+                "address": format!("0x{}", item.address.to_hex()),
+                "storageKeys": item
+                    .storage_keys
+                    .iter()
+                    .map(|k| format!("0x{}", k.to_hex()))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+fn authorization_list_to_json(list: &[EvmAuthorization]) -> Value {
+    list.iter()
+        .map(|a| {
+            json!({
+                "chainId": format!("0x{:x}", a.chain_id),
+                "address": format!("0x{}", a.address.to_hex()),
+                "nonce": format!("0x{:x}", a.nonce),
+                "yParity": format!("0x{:x}", a.y_parity),
+                "r": format!("0x{:x}", a.r),
+                "s": format!("0x{:x}", a.s),
+            })
+        })
+        .collect()
+}
+
+/// Sérialise une tx EVM en format Ethereum (EIP-1474).
+///
+/// ## Champs communs
+///
+/// `hash`, `blockHash`, `blockNumber`, `transactionIndex`, `from`, `to`,
+/// `value`, `gas`, `input`, `nonce`, `type`.
+///
+/// ## Champs spécifiques par type
+///
+/// - **Legacy (0x0)** : `chainId`, `gasPrice`, `v`, `r`, `s`.
+/// - **EIP-2930 (0x1)** : `chainId`, `gasPrice`, `accessList`, `v`, `r`, `s`.
+/// - **EIP-1559 (0x2)** : `chainId`, `maxPriorityFeePerGas`,
+///   `maxFeePerGas`, `accessList`, `v`, `r`, `s`.
+/// - **EIP-7702 (0x4)** : idem EIP-1559 + `authorizationList`.
+///
+/// ## `from`
+///
+/// Récupéré **cryptographiquement** de la signature. Retourne une erreur
+/// interne si la récupération échoue (ne devrait pas arriver : la tx a
+/// été validée à l'entrée dans le bloc).
+fn serialize_evm_tx_eth(tx: &EvmTx, loc: &TxLocation) -> Result<Value, RpcError> {
+    let tx_hash = sango_crypto::keccak256(&tx.encode_ethereum_typed());
+    let sender = sango_evm::recover_sender(tx)
+        .map_err(|e| RpcError::Internal(format!("recover_sender: {e}")))?;
+
+    let type_hex = format!("0x{:x}", tx.kind().tag());
+    let common = |extra: Value| -> Value {
+        let mut obj = json!({
+            "hash": format!("0x{}", tx_hash.to_hex()),
+            "blockHash": format!("0x{}", loc.block_hash.to_hex()),
+            "blockNumber": format!("0x{:x}", loc.height),
+            "transactionIndex": format!("0x{:x}", loc.tx_index),
+            "from": format!("0x{}", sender.to_hex()),
+            "to": tx.to().map(|a| format!("0x{}", a.to_hex())),
+            "value": format!("0x{:x}", tx.value()),
+            "gas": format!("0x{:x}", tx.gas_limit()),
+            "input": format!("0x{}", hex::encode(tx.data())),
+            "nonce": format!("0x{:x}", tx.nonce()),
+            "type": type_hex,
+        });
+        if let (Some(base), Some(extra_map)) = (obj.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra_map {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        obj
+    };
+
+    Ok(match tx {
+        EvmTx::Legacy {
+            chain_id,
+            gas_price,
+            y_parity,
+            r,
+            s,
+            ..
+        } => {
+            let v = chain_id
+                .saturating_mul(2)
+                .saturating_add(35)
+                .saturating_add(*y_parity as u64);
+            common(json!({
+                "chainId": format!("0x{:x}", chain_id),
+                "gasPrice": format!("0x{:x}", gas_price),
+                "v": format!("0x{:x}", v),
+                "r": format!("0x{:x}", r),
+                "s": format!("0x{:x}", s),
+            }))
+        }
+        EvmTx::Eip2930 {
+            chain_id,
+            gas_price,
+            access_list,
+            y_parity,
+            r,
+            s,
+            ..
+        } => common(json!({
+            "chainId": format!("0x{:x}", chain_id),
+            "gasPrice": format!("0x{:x}", gas_price),
+            "accessList": access_list_to_json(access_list),
+            "v": format!("0x{:x}", y_parity),
+            "r": format!("0x{:x}", r),
+            "s": format!("0x{:x}", s),
+        })),
+        EvmTx::Eip1559 {
+            chain_id,
+            max_priority_fee_per_gas,
+            max_fee_per_gas,
+            access_list,
+            y_parity,
+            r,
+            s,
+            ..
+        } => common(json!({
+            "chainId": format!("0x{:x}", chain_id),
+            "maxPriorityFeePerGas": format!("0x{:x}", max_priority_fee_per_gas),
+            "maxFeePerGas": format!("0x{:x}", max_fee_per_gas),
+            "accessList": access_list_to_json(access_list),
+            "v": format!("0x{:x}", y_parity),
+            "r": format!("0x{:x}", r),
+            "s": format!("0x{:x}", s),
+        })),
+        EvmTx::Eip7702 {
+            chain_id,
+            max_priority_fee_per_gas,
+            max_fee_per_gas,
+            access_list,
+            authorization_list,
+            y_parity,
+            r,
+            s,
+            ..
+        } => common(json!({
+            "chainId": format!("0x{:x}", chain_id),
+            "maxPriorityFeePerGas": format!("0x{:x}", max_priority_fee_per_gas),
+            "maxFeePerGas": format!("0x{:x}", max_fee_per_gas),
+            "accessList": access_list_to_json(access_list),
+            "authorizationList": authorization_list_to_json(authorization_list),
+            "v": format!("0x{:x}", y_parity),
+            "r": format!("0x{:x}", r),
+            "s": format!("0x{:x}", s),
+        })),
+    })
+}
+
+fn eth_get_transaction_by_hash<B: RpcBackend>(
+    backend: &B,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let hash_hex = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::InvalidParams("expected [tx_hash_hex]".into()))?;
+    let hash = Hash32::from_hex(hash_hex)
+        .map_err(|e| RpcError::InvalidParams(format!("bad hash: {e}")))?;
+    match backend.eth_get_transaction_with_location(&hash) {
+        None => Ok(Value::Null),
+        Some((tx, loc)) => serialize_evm_tx_eth(&tx, &loc),
+    }
+}
+
+fn logs_to_json(
+    logs: &[sango_types::EvmLog],
+    tx_hash: &Hash32,
+    loc: &TxLocation,
+    log_index_base: u64,
+) -> Value {
+    logs.iter()
+        .enumerate()
+        .map(|(i, log)| {
+            json!({
+                "address": format!("0x{}", log.address.to_hex()),
+                "topics": log.topics.iter().map(|t| format!("0x{}", t.to_hex())).collect::<Vec<_>>(),
+                "data": format!("0x{}", hex::encode(&log.data)),
+                "blockNumber": format!("0x{:x}", loc.height),
+                "transactionHash": format!("0x{}", tx_hash.to_hex()),
+                "transactionIndex": format!("0x{:x}", loc.tx_index),
+                "blockHash": format!("0x{}", loc.block_hash.to_hex()),
+                "logIndex": format!("0x{:x}", log_index_base.saturating_add(i as u64)),
+                "removed": false,
+            })
+        })
+        .collect()
+}
+
+fn eth_get_transaction_receipt<B: RpcBackend>(
+    backend: &B,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let hash_hex = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::InvalidParams("expected [tx_hash_hex]".into()))?;
+    let hash = Hash32::from_hex(hash_hex)
+        .map_err(|e| RpcError::InvalidParams(format!("bad hash: {e}")))?;
+
+    let Some((evm_tx, _)) = backend.eth_get_transaction_with_location(&hash) else {
+        return Ok(Value::Null);
+    };
+    let Some((receipt, loc, log_index_base)) = backend.eth_get_receipt_bundle(&hash) else {
+        return Ok(Value::Null);
+    };
+    let sender = sango_evm::recover_sender(&evm_tx)
+        .map_err(|e| RpcError::Internal(format!("recover_sender: {e}")))?;
+
+    let status_hex = match receipt.status {
+        ReceiptStatus::Success => "0x1",
+        ReceiptStatus::Failure => "0x0",
+    };
+
+    Ok(json!({
+        "transactionHash": format!("0x{}", receipt.tx_hash.to_hex()),
+        "transactionIndex": format!("0x{:x}", loc.tx_index),
+        "blockHash": format!("0x{}", loc.block_hash.to_hex()),
+        "blockNumber": format!("0x{:x}", loc.height),
+        "from": format!("0x{}", sender.to_hex()),
+        "to": evm_tx.to().map(|a| format!("0x{}", a.to_hex())),
+        "cumulativeGasUsed": format!("0x{:x}", receipt.cumulative_gas_used),
+        "gasUsed": format!("0x{:x}", receipt.gas_used),
+        "contractAddress": receipt.contract_address.map(|a| format!("0x{}", a.to_hex())),
+        "logs": logs_to_json(&receipt.logs, &receipt.tx_hash, &loc, log_index_base),
+        "logsBloom": format!("0x{}", hex::encode(receipt.logs_bloom.as_bytes())),
+        "status": status_hex,
+        "type": format!("0x{:x}", evm_tx.kind().tag()),
+    }))
+}
+
+fn combine_blooms(receipts: &[Receipt]) -> sango_types::LogsBloom {
+    let mut out = [0u8; sango_types::LOGS_BLOOM_BYTES];
+    for r in receipts {
+        for (i, b) in r.logs_bloom.as_bytes().iter().enumerate() {
+            out[i] |= b;
+        }
+    }
+    sango_types::LogsBloom::from_bytes(out)
+}
+
+/// Sérialise un bloc + receipts en format Ethereum.
+fn serialize_block_eth(
+    block: &Block,
+    receipts: &[Receipt],
+    full_tx: bool,
+) -> Result<Value, RpcError> {
+    let combined_bloom = combine_blooms(receipts);
+
+    // Liste des hashs ou objets tx (EVM uniquement).
+    let mut txs_json: Vec<Value> = Vec::new();
+    for (i, tx) in block.transactions.iter().enumerate() {
+        let Tx::Evm(evm) = tx else { continue };
+        // Localisation pour cette tx.
+        let loc = TxLocation {
+            height: block.header.height.get(),
+            block_hash: block.hash(),
+            tx_index: i as u32,
+            tag: crate::backend::TX_TAG_EVM,
+        };
+        if full_tx {
+            txs_json.push(serialize_evm_tx_eth(evm, &loc)?);
+        } else {
+            txs_json.push(json!(format!("0x{}", tx.hash().to_hex())));
+        }
+    }
+
+    let size = block.encode_to_vec().len();
+
+    Ok(json!({
+        "number": format!("0x{:x}", block.header.height.get()),
+        "hash": format!("0x{}", block.hash().to_hex()),
+        "parentHash": format!("0x{}", block.header.previous_block_hash.to_hex()),
+        "nonce": "0x0000000000000000",
+        "sha3Uncles": OMMERS_HASH,
+        "logsBloom": format!("0x{}", hex::encode(combined_bloom.as_bytes())),
+        "transactionsRoot": format!("0x{}", block.header.transaction_root.to_hex()),
+        "stateRoot": format!("0x{}", block.header.state_root.to_hex()),
+        "receiptsRoot": format!("0x{}", block.header.receipt_root.to_hex()),
+        "miner": "0x0000000000000000000000000000000000000000",
+        "difficulty": "0x0",
+        "totalDifficulty": "0x0",
+        "extraData": "0x",
+        "size": format!("0x{:x}", size),
+        "gasLimit": format!("0x{:x}", block.header.gas_limit),
+        "gasUsed": format!("0x{:x}", block.header.gas_used),
+        "timestamp": format!("0x{:x}", block.header.timestamp),
+        "transactions": txs_json,
+        "uncles": [],
+        "baseFeePerGas": format!("0x{:x}", block.header.base_fee),
+    }))
+}
+
+fn parse_full_tx_flag(params: &Value) -> bool {
+    params
+        .as_array()
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn eth_get_block_by_number<B: RpcBackend>(backend: &B, params: &Value) -> Result<Value, RpcError> {
+    let tag = parse_block_tag(params.as_array().and_then(|a| a.first()))?;
+    let height = match tag {
+        None | Some(crate::backend::BlockTag::Latest) | Some(crate::backend::BlockTag::Pending) => {
+            match backend.block_number() {
+                Some(h) => h,
+                None => return Ok(Value::Null),
+            }
+        }
+        Some(crate::backend::BlockTag::Earliest) => 0,
+        Some(crate::backend::BlockTag::Number(n)) => n,
+    };
+    let full_tx = parse_full_tx_flag(params);
+    match backend.eth_get_block_with_receipts_by_number(height) {
+        None => Ok(Value::Null),
+        Some((block, receipts)) => serialize_block_eth(&block, &receipts, full_tx),
+    }
+}
+
+fn eth_get_block_by_hash<B: RpcBackend>(backend: &B, params: &Value) -> Result<Value, RpcError> {
+    let hash_hex = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::InvalidParams("expected [block_hash_hex]".into()))?;
+    let hash = Hash32::from_hex(hash_hex)
+        .map_err(|e| RpcError::InvalidParams(format!("bad hash: {e}")))?;
+    let full_tx = parse_full_tx_flag(params);
+    match backend.eth_get_block_with_receipts_by_hash(&hash) {
+        None => Ok(Value::Null),
+        Some((block, receipts)) => serialize_block_eth(&block, &receipts, full_tx),
+    }
 }
 
 fn parse_log_filter(params: &Value) -> Result<crate::backend::EthLogFilter, RpcError> {
@@ -655,6 +1093,15 @@ fn parse_eth_call_request(params: &Value) -> Result<EthCallRequest, RpcError> {
         value,
         data,
     })
+}
+
+fn parse_optional_u32_param(params: &Value, index: usize, default: u32) -> u32 {
+    params
+        .as_array()
+        .and_then(|a| a.get(index))
+        .and_then(|v| v.as_u64())
+        .map(|n| n.min(u32::MAX as u64) as u32)
+        .unwrap_or(default)
 }
 
 fn parse_u64_hex(s: &str) -> Result<u64, String> {

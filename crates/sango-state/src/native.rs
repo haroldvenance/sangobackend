@@ -548,6 +548,28 @@ impl NativeState {
         out
     }
 
+    /// Liste toutes les délégations émises par un délégateur donné.
+    ///
+    /// Même filtrage cryptographique que [`Self::delegations_for`], mais
+    /// par délégateur au lieu du validateur.
+    #[must_use]
+    pub fn delegations_of(&self, delegator: &NativeAddress) -> Vec<sango_types::Delegation> {
+        let mut out = Vec::new();
+        for (key_hash, value) in self.smt.iter() {
+            if let Ok(d) = sango_types::Delegation::decode_exact(value) {
+                if d.delegator != *delegator {
+                    continue;
+                }
+                let key = Self::delegation_identifier(&d.delegator, &d.validator);
+                let expected = state_key_hash(Namespace::Delegation, &key);
+                if expected == *key_hash {
+                    out.push(d);
+                }
+            }
+        }
+        out
+    }
+
     /// Liste toutes les délégations vers un validateur donné.
     #[must_use]
     pub fn delegations_for(&self, validator: &NativeAddress) -> Vec<sango_types::Delegation> {

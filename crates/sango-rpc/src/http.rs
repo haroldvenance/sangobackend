@@ -258,7 +258,14 @@ pub fn write_json_ok<W: Write>(
 /// Réponse CORS preflight (`OPTIONS`).
 ///
 /// Retourne `204 No Content` avec les headers `Access-Control-Allow-*`.
-pub fn write_preflight_ok<W: Write>(stream: &mut W, keep_alive: bool) -> std::io::Result<()> {
+///
+/// `allow_methods` permet aux services qui exposent d'autres verbes
+/// (GET pour le faucet, par ex.) de l'annoncer correctement.
+pub fn write_preflight_ok<W: Write>(
+    stream: &mut W,
+    keep_alive: bool,
+    allow_methods: &str,
+) -> std::io::Result<()> {
     let conn = if keep_alive { "keep-alive" } else { "close" };
     let header = format!(
         "HTTP/1.1 204 No Content\r\n\
@@ -269,7 +276,7 @@ pub fn write_preflight_ok<W: Write>(stream: &mut W, keep_alive: bool) -> std::io
          Access-Control-Allow-Headers: {}\r\n\
          Access-Control-Max-Age: {}\r\n\
          \r\n",
-        conn, CORS_ALLOW_ORIGIN, CORS_ALLOW_METHODS, CORS_ALLOW_HEADERS, CORS_MAX_AGE
+        conn, CORS_ALLOW_ORIGIN, allow_methods, CORS_ALLOW_HEADERS, CORS_MAX_AGE
     );
     stream.write_all(header.as_bytes())?;
     stream.flush()
@@ -292,11 +299,13 @@ pub fn write_json_status<W: Write>(
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          Connection: {}\r\n\
+         Access-Control-Allow-Origin: {}\r\n\
          \r\n",
         status,
         reason,
         body.len(),
-        conn
+        conn,
+        CORS_ALLOW_ORIGIN
     );
     stream.write_all(header.as_bytes())?;
     stream.write_all(body)?;

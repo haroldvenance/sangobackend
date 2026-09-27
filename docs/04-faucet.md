@@ -20,15 +20,30 @@ Le faucet a besoin d'un nœud RPC joignable (celui du devnet). Lance le
 nœud avant le faucet.
 Config — examples/faucet-devnet.json
 
-    ⚠️ Vérifier les champs exacts dans examples/faucet-devnet.json.
+Exemple réel :
+json
 
-Champs principaux :
+{
+  "rpc_url": "http://127.0.0.1:8545",
+  "listen_addr": "127.0.0.1:3001",
+  "faucet_seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "amount_sango": "100",
+  "cooldown_secs": 3600,
+  "max_requests_per_ip": 5,
+  "max_fee_base_units": 1000
+}
+
 Champ	Rôle
-listen_addr	Adresse d'écoute HTTP (défaut 127.0.0.1:3001)
 rpc_url	Endpoint RPC du nœud Sango
-keyfile	Keyfile du compte faucet
-amount_base_units	Montant distribué (défaut 1000000000 = 100 SANGO)
-rate_limit	Quotas par adresse / par IP
+listen_addr	Adresse d'écoute HTTP (défaut 127.0.0.1:3001)
+faucet_seed_hex	Seed Ed25519 du compte faucet (32 bytes hex)
+amount_sango	Montant distribué, en SANGO décimal (ex. "100")
+cooldown_secs	Délai minimum entre deux requêtes par adresse
+max_requests_per_ip	Quota par IP (fenêtre glissante)
+max_fee_base_units	max_fee appliqué à la tx faucet
+
+⚠️ Ne mets jamais la vraie seed du faucet d'un réseau public ici.
+faucet_seed_hex est un secret — quiconque la lit peut vider le compte.
 Endpoint HTTP
 POST /faucet
 
@@ -52,17 +67,17 @@ json
 Le compte est crédité au bloc suivant (~500 ms sur devnet).
 Rate limiting
 
-Le faucet applique un double quota :
+Deux garde-fous indépendants :
 
-    par adresse : N requêtes / heure ;
+    par adresse : cooldown_secs (3600 s = 1 h par défaut) ;
 
-    par IP : M requêtes / heure.
+    par IP : max_requests_per_ip (5 par défaut).
 
-Au-delà, le faucet retourne HTTP 429 avec un JSON d'erreur.
+Au-delà, le faucet retourne HTTP 429.
 Erreurs courantes
 Symptôme	Cause	Fix
 connection refused	Nœud RPC non lancé	Démarre le node d'abord
-HTTP 429	Quota dépassé	Attends, ou change d'adresse
+HTTP 429	Cooldown ou quota IP dépassé	Attends, ou change d'adresse
 HTTP 400	Adresse mal formée	Vérifie 0x + 40 hex
 HTTP 500	Compte faucet vide	Réapprovisionne via Genesis
 Voir aussi
@@ -72,4 +87,3 @@ Voir aussi
     RPC — méthodes exposées par le nœud
 
     Devnet — config Genesis du compte faucet
-    

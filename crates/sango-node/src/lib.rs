@@ -23,4 +23,4 @@ pub use error::NodeError;
 pub use node::Node;
 pub use node_handle::NodeHandle;
 pub use rpc_backend::NodeBackend;
-pub use tx_index::{TxIndexError, TxLocation, TX_TAG_EVM, TX_TAG_NATIVE};
+pub use tx_index::{decode_tx_by_sender_key, tx_by_sender_key, TX_BY_SENDER_KEY_LEN};

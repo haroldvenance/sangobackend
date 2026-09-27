@@ -3,31 +3,41 @@ Architecture — vue d'ensemble des crates
 Sango est organisé en crates Rust, chacun avec une responsabilité
 claire. Cette page donne la carte du dépôt.
 Workspace
-
-    ⚠️ Vérifier avec ls crates/ — certains crates peuvent exister
-    sous d'autres noms, ou être ajoutés plus tard.
-
 Crate	Rôle
-sango-node	Binaire principal : assemble consensus, storage, RPC, P2P
-sango-rpc	Serveur JSON-RPC (dispatch, HTTP, trait Backend)
+sango-types	Types de base : adresses, hashes, montants
+sango-primitives	Primitives consensus partagées
+sango-crypto	Ed25519, secp256k1, KDF, AEAD
+sango-codec	Encodage canonique Sango (tx, blocs)
+sango-tx	Structures de transactions natives et EVM
 sango-state	État (comptes, soldes, nonces, storage natif)
-sango-faucet	Service HTTP de distribution de SANGO de test
+sango-storage	Persistance RocksDB (colonnes, index)
+sango-mpt	Merkle Patricia Trie (état, racines)
+sango-mempool	Pool de transactions en attente
+sango-exec	Exécution des txs contre l'état
+sango-evm	EVM embarquée (txs typées, receipts, logs)
+sango-staking	Bond/unbond, délégations, validateurs, jail
+sango-consensus	Proposeur, commit, timers
+sango-p2p	Réseau pair-à-pair, seeds, gossip
+sango-rpc	Serveur JSON-RPC (dispatch, HTTP, trait Backend)
+sango-node	Binaire principal — assemble tout
 sango-wallet	CLI client (signature, keyfile, appels RPC)
+sango-faucet	Service HTTP de distribution de SANGO de test
 Flux d'une transaction native
 
     Wallet signe une tx Ed25519 avec la clé native.
 
-    Wallet encode la tx au format canonique Sango et l'envoie via
-    sango_sendTransaction.
+    Wallet encode la tx au format canonique Sango (sango-codec)
+    et l'envoie via sango_sendTransaction.
 
-    sango-rpc désérialise, valide, et passe au mempool.
+    sango-rpc désérialise, valide, et pousse au sango-mempool.
 
-    sango-node (proposeur) sélectionne la tx, l'exécute contre
-    sango-state, produit un bloc.
+    sango-node (proposeur) sélectionne la tx, l'exécute via
+    sango-exec contre sango-state, produit un bloc.
 
-    Le bloc est commité (RocksDB flush) et diffusé aux pairs P2P.
+    Le bloc est commité dans sango-storage (flush RocksDB) et
+    diffusé via sango-p2p.
 
-    L'index secondaire (tx_index) met à jour le mapping
+    L'index secondaire met à jour le mapping
     hash → (height, txIndex).
 
 Flux d'une transaction EVM
@@ -37,9 +47,9 @@ Flux d'une transaction EVM
     Envoi via eth_sendRawTransaction.
 
     sango-rpc récupère le sender depuis la signature, valide nonce
-    et balance, pousse au mempool.
+    et balance, pousse au sango-mempool.
 
-    Exécution dans l'EVM embarquée contre l'état Sango.
+    Exécution dans sango-evm contre l'état Sango.
 
     Logs (eth_getLogs) indexés par bloc, avec logIndex global.
 
@@ -56,11 +66,13 @@ entre le serveur RPC et le nœud. sango-node/src/rpc_backend.rs en
 fournit l'implémentation.
 Stockage
 
-    RocksDB comme moteur clé-valeur.
+    RocksDB comme moteur clé-valeur (sango-storage).
 
     Colonnes : blocs, état, index txs, validateurs, etc.
 
     Flush après chaque bloc — pas de perte sur Ctrl+C.
+
+    sango-mpt fournit les racines Merkle (état, tx, receipts).
 
 L'index secondaire des transactions (sango-node/src/tx_index.rs)
 permet sango_getTransactionsByAddress avec pagination.
@@ -80,11 +92,21 @@ P2P
 
     --p2p-addr pour fixer l'adresse d'écoute.
 
+Staking
+
+sango-staking gère :
+
+    le cycle de vie d'un validateur (register, unjail, commission) ;
+
+    les délégations (delegate / undelegate / claim) ;
+
+    les unbondings avec maturation différée.
+
 TLS
 
 Le serveur RPC et le wallet supportent HTTPS optionnel :
 
-    Côté serveur : --tls-cert / --tls-key (à confirmer).
+    Côté serveur : --tls-cert / --tls-key.
 
     Côté wallet : --rpc-tls-ca (CA DER custom) ou --rpc-tls-insecure
     (devnet uniquement).

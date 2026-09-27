@@ -8,7 +8,10 @@
 //!   serveur.
 
 use sango_primitives::{Amount, ChainId32, EvmAddress, Hash32, NativeAddress, U256};
-use sango_types::{Block, NativeAccount, Transaction, ValidatorInfo};
+use sango_types::{
+    Block, Delegation, EvmTx, NativeAccount, PendingUnbonding, Receipt, Transaction, Tx,
+    ValidatorInfo,
+};
 
 use crate::error::RpcError;
 
@@ -133,6 +136,70 @@ pub struct EthProof {
     pub storage_proof: Vec<EthStorageProof>,
 }
 
+// --- TxLocation (P3.2) ----------------------------------------------------
+
+/// Tag : transaction native.
+pub const TX_TAG_NATIVE: u8 = 0x01;
+
+/// Tag : transaction EVM.
+pub const TX_TAG_EVM: u8 = 0x02;
+
+/// Taille d'une valeur `TxLocation` encodée.
+pub const TX_LOCATION_ENCODED_LEN: usize = 45;
+
+/// Localisation d'une transaction dans la chaîne.
+///
+/// Encodage binaire (utilisé par `sango-node` pour RocksDB, colonne
+/// `tx_locations`) :
+///
+/// ```text
+/// height(8 LE) || block_hash(32) || tx_index(4 LE) || tag(1)
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TxLocation {
+    /// Hauteur du bloc contenant la tx.
+    pub height: u64,
+    /// Hash du bloc contenant la tx.
+    pub block_hash: Hash32,
+    /// Index de la tx dans `Block::transactions`.
+    pub tx_index: u32,
+    /// Tag de type : [`TX_TAG_NATIVE`] ou [`TX_TAG_EVM`].
+    pub tag: u8,
+}
+
+impl TxLocation {
+    /// Encode en 45 bytes fixes.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(TX_LOCATION_ENCODED_LEN);
+        out.extend_from_slice(&self.height.to_le_bytes());
+        out.extend_from_slice(self.block_hash.as_bytes());
+        out.extend_from_slice(&self.tx_index.to_le_bytes());
+        out.push(self.tag);
+        out
+    }
+
+    /// Décode 45 bytes. Retourne `None` si la longueur est incorrecte.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != TX_LOCATION_ENCODED_LEN {
+            return None;
+        }
+        let mut h = [0u8; 8];
+        h.copy_from_slice(&bytes[..8]);
+        let mut bh = [0u8; 32];
+        bh.copy_from_slice(&bytes[8..40]);
+        let mut ti = [0u8; 4];
+        ti.copy_from_slice(&bytes[40..44]);
+        Some(Self {
+            height: u64::from_le_bytes(h),
+            block_hash: Hash32::from_bytes(bh),
+            tx_index: u32::from_le_bytes(ti),
+            tag: bytes[44],
+        })
+    }
+}
+
 /// Vue en lecture + en écriture minimale d'un nœud Sango.
 ///
 /// ## Compatibilité
@@ -230,19 +297,6 @@ pub trait RpcBackend: Send + Sync + 'static {
         ))
     }
 
-    /// Récupère une transaction native par hash (`sango_getTransactionByHash`).
-    ///
-    /// Retourne `None` si la tx est inconnue.
-    ///
-    /// ## Note V1
-    ///
-    /// Ne retourne pas `blockHeight` / `blockHash` / `txIndex` (nécessite
-    /// un index secondaire qu'on ajoutera plus tard). Le client peut
-    /// reconstituer ces infos via `sango_getBlock`.
-    fn get_transaction_by_hash(&self, _hash: &Hash32) -> Option<Transaction> {
-        None
-    }
-
     /// Base fee courante (`sango_baseFee`), en base units par gas.
     ///
     /// Utilisée par les wallets pour signer avec un `max_fee` correct.
@@ -252,6 +306,90 @@ pub trait RpcBackend: Send + Sync + 'static {
     /// Défaut : 1 (INITIAL_BASE_FEE).
     fn sango_base_fee(&self) -> u128 {
         1
+    }
+
+    /// Validateur par adresse (`sango_getValidatorInfo`).
+    ///
+    /// Retourne `None` si aucun validateur n'est enregistré à cette
+    /// adresse. Défaut : `None`.
+    fn get_validator_info(&self, _address: &NativeAddress) -> Option<ValidatorInfo> {
+        None
+    }
+
+    /// Délégations émises par une adresse (`sango_getDelegations`).
+    ///
+    /// Liste toutes les `Delegation(delegator, *)` où `delegator` est
+    /// l'adresse fournie. Défaut : vide.
+    fn get_delegations_of(&self, _delegator: &NativeAddress) -> Vec<Delegation> {
+        Vec::new()
+    }
+
+    /// Unbondings en attente de maturation (`sango_getPendingUnbondings`).
+    ///
+    /// Liste tous les `PendingUnbonding` dont le `delegator` correspond.
+    /// Défaut : vide.
+    fn get_pending_unbondings_for(&self, _delegator: &NativeAddress) -> Vec<PendingUnbonding> {
+        Vec::new()
+    }
+
+    /// Transaction (native ou EVM) + localisation dans la chaîne.
+    ///
+    /// Retourne `None` si le hash est inconnu (index absent ou tx
+    /// absente). Défaut : `None`.
+    fn get_transaction_with_location(&self, _hash: &Hash32) -> Option<(Tx, TxLocation)> {
+        None
+    }
+
+    /// Transactions natives émises par une adresse, paginées.
+    ///
+    /// ## Ordre
+    ///
+    /// Plus récentes d'abord (décroissant par `height`, puis par
+    /// `tx_index` dans le bloc).
+    ///
+    /// ## Retour
+    ///
+    /// `(items, total)` : au plus `limit` éléments à partir de
+    /// `offset`, et le nombre total de txs natives émises par
+    /// l'adresse. Défaut : `(Vec::new(), 0)`.
+    fn get_transactions_by_address(
+        &self,
+        _address: &NativeAddress,
+        _limit: u32,
+        _offset: u32,
+    ) -> (Vec<(Tx, TxLocation)>, u64) {
+        (Vec::new(), 0)
+    }
+
+    /// Tx EVM par hash, avec localisation (`eth_getTransactionByHash`).
+    ///
+    /// Retourne `None` si inconnue ou si c'est une tx **native**
+    /// (les natifs n'ont pas de représentation Ethereum). Défaut : `None`.
+    fn eth_get_transaction_with_location(&self, _hash: &Hash32) -> Option<(EvmTx, TxLocation)> {
+        None
+    }
+
+    /// Receipt + localisation + `log_index_base` (`eth_getTransactionReceipt`).
+    ///
+    /// Le `log_index_base` est le nombre de logs émis par les
+    /// transactions **précédentes** dans le même bloc. Utilisé pour
+    /// calculer `logIndex` global (Ethereum-style). Défaut : `None`.
+    fn eth_get_receipt_bundle(&self, _hash: &Hash32) -> Option<(Receipt, TxLocation, u64)> {
+        None
+    }
+
+    /// Bloc + ses receipts par hauteur (`eth_getBlockByNumber`).
+    ///
+    /// Retourne `None` si la hauteur est inconnue. Défaut : `None`.
+    fn eth_get_block_with_receipts_by_number(&self, _height: u64) -> Option<(Block, Vec<Receipt>)> {
+        None
+    }
+
+    /// Bloc + ses receipts par hash (`eth_getBlockByHash`).
+    ///
+    /// Retourne `None` si le hash est inconnu. Défaut : `None`.
+    fn eth_get_block_with_receipts_by_hash(&self, _hash: &Hash32) -> Option<(Block, Vec<Receipt>)> {
+        None
     }
 
     /// Génère une preuve MPT EIP-1186 (`eth_getProof`). Défaut : non supporté.

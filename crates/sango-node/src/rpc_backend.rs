@@ -6,7 +6,10 @@
 
 use sango_primitives::{Amount, ChainId32, EvmAddress, Hash32, NativeAddress, U256};
 use sango_rpc::{EthCallRequest, EthCallResult, RpcBackend, RpcError};
-use sango_types::{Block, EvmTx, NativeAccount, Transaction, ValidatorInfo};
+use sango_types::{
+    Block, Delegation, EvmTx, NativeAccount, PendingUnbonding, Receipt, Transaction, Tx,
+    ValidatorInfo,
+};
 
 use crate::base_fee::INITIAL_BASE_FEE;
 use crate::node_handle::NodeHandle;
@@ -63,9 +66,34 @@ impl RpcBackend for NodeBackend {
             .with_node(|n| n.expected_base_fee().unwrap_or(INITIAL_BASE_FEE))
     }
 
-    fn get_transaction_by_hash(&self, hash: &Hash32) -> Option<Transaction> {
+    fn get_validator_info(&self, address: &NativeAddress) -> Option<ValidatorInfo> {
+        self.handle.with_node(|n| n.state().get_validator(address))
+    }
+
+    fn get_delegations_of(&self, delegator: &NativeAddress) -> Vec<Delegation> {
+        self.handle.with_node(|n| n.get_delegations_of(delegator))
+    }
+
+    fn get_pending_unbondings_for(&self, delegator: &NativeAddress) -> Vec<PendingUnbonding> {
         self.handle
-            .with_node(|n| n.get_transaction_by_hash(hash).ok().flatten())
+            .with_node(|n| n.get_pending_unbondings_for(delegator))
+    }
+
+    fn get_transaction_with_location(&self, hash: &Hash32) -> Option<(Tx, sango_rpc::TxLocation)> {
+        self.handle
+            .with_node(|n| n.get_transaction_with_location(hash).ok().flatten())
+    }
+
+    fn get_transactions_by_address(
+        &self,
+        address: &NativeAddress,
+        limit: u32,
+        offset: u32,
+    ) -> (Vec<(Tx, sango_rpc::TxLocation)>, u64) {
+        self.handle.with_node(|n| {
+            n.get_transactions_by_address(address, limit, offset)
+                .unwrap_or_default()
+        })
     }
 
     fn send_transaction(&self, tx: &Transaction) -> Result<Hash32, RpcError> {
@@ -82,6 +110,35 @@ impl RpcBackend for NodeBackend {
     }
 
     // --- EVM ---------------------------------------------------------------
+
+    fn eth_get_transaction_with_location(
+        &self,
+        hash: &Hash32,
+    ) -> Option<(EvmTx, sango_rpc::TxLocation)> {
+        self.handle
+            .with_node(|n| n.eth_get_transaction_with_location(hash).ok().flatten())
+    }
+
+    fn eth_get_receipt_bundle(
+        &self,
+        hash: &Hash32,
+    ) -> Option<(Receipt, sango_rpc::TxLocation, u64)> {
+        self.handle
+            .with_node(|n| n.eth_get_receipt_bundle(hash).ok().flatten())
+    }
+
+    fn eth_get_block_with_receipts_by_number(&self, height: u64) -> Option<(Block, Vec<Receipt>)> {
+        self.handle.with_node(|n| {
+            n.eth_get_block_with_receipts_by_number(height)
+                .ok()
+                .flatten()
+        })
+    }
+
+    fn eth_get_block_with_receipts_by_hash(&self, hash: &Hash32) -> Option<(Block, Vec<Receipt>)> {
+        self.handle
+            .with_node(|n| n.eth_get_block_with_receipts_by_hash(hash).ok().flatten())
+    }
 
     fn eth_chain_id(&self) -> u64 {
         self.handle.with_node(|n| n.evm_chain_id())

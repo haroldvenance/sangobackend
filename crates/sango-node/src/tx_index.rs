@@ -10,21 +10,26 @@
 //! 2. **Lister les txs d'une adresse** : à partir d'une `NativeAddress`,
 //!    paginer les transactions natives qu'elle a émises.
 //!
+//! ## Dépendance
+//!
+//! [`TxLocation`] et les constantes `TX_TAG_*` vivent dans
+//! [`sango_rpc::backend`] : le trait `RpcBackend` doit les voir sans
+//! que `sango-rpc` ne dépende de `sango-node`. On les réexporte ici
+//! pour commodité.
+//!
 //! ## Colonnes RocksDB
 //!
 //! ### `TxLocations`
 //!
 //! ```text
-//! clé   = tx_hash (32 bytes)
-//! valeur = height(8 LE) || block_hash(32) || tx_index(4 LE) || tag(1)
+//! clé    = tx_hash (32 bytes)
+//! valeur = TxLocation::encode()  (45 bytes)
 //! ```
-//!
-//! Taille fixe : **45 bytes**.
 //!
 //! ### `TxBySender`
 //!
 //! ```text
-//! clé   = sender(20) || height_be(8) || tx_index_be(4)   (32 bytes)
+//! clé    = sender(20) || height_be(8) || tx_index_be(4)   (32 bytes)
 //! valeur = tx_hash (32 bytes)
 //! ```
 //!
@@ -34,101 +39,16 @@
 //!
 //! **Important** : seules les txs `Tx::Native` sont indexées par
 //! sender. Les txs EVM ont un sender EVM (`EvmAddress`) et un
-//! namespace RPC distinct (`eth_getTransactionsByAddress`) qui sera
-//! ajouté plus tard.
+//! namespace RPC distinct (`eth_*`) qui sera ajouté plus tard.
 
 use sango_primitives::{Hash32, NativeAddress};
 use sango_storage::{Batch, Column};
 use sango_types::Tx;
 
-/// Tag : transaction native.
-pub const TX_TAG_NATIVE: u8 = 0x01;
-
-/// Tag : transaction EVM.
-pub const TX_TAG_EVM: u8 = 0x02;
-
-/// Taille d'une valeur `TxLocations` encodée.
-pub const TX_LOCATION_ENCODED_LEN: usize = 45;
+pub use sango_rpc::backend::{TxLocation, TX_LOCATION_ENCODED_LEN, TX_TAG_EVM, TX_TAG_NATIVE};
 
 /// Longueur d'une clé `TxBySender`.
 pub const TX_BY_SENDER_KEY_LEN: usize = 32;
-
-/// Localisation d'une transaction dans la chaîne.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TxLocation {
-    /// Hauteur du bloc contenant la tx.
-    pub height: u64,
-    /// Hash du bloc contenant la tx.
-    pub block_hash: Hash32,
-    /// Index de la tx dans `Block::transactions`.
-    pub tx_index: u32,
-    /// Tag de type : [`TX_TAG_NATIVE`] ou [`TX_TAG_EVM`].
-    pub tag: u8,
-}
-
-impl TxLocation {
-    /// Encode en 45 bytes fixes.
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(TX_LOCATION_ENCODED_LEN);
-        out.extend_from_slice(&self.height.to_le_bytes());
-        out.extend_from_slice(self.block_hash.as_bytes());
-        out.extend_from_slice(&self.tx_index.to_le_bytes());
-        out.push(self.tag);
-        out
-    }
-
-    /// Décode 45 bytes.
-    ///
-    /// # Erreurs
-    ///
-    /// [`TxIndexError::BadLength`] si la slice n'a pas exactement
-    /// [`TX_LOCATION_ENCODED_LEN`] bytes.
-    pub fn decode(bytes: &[u8]) -> Result<Self, TxIndexError> {
-        if bytes.len() != TX_LOCATION_ENCODED_LEN {
-            return Err(TxIndexError::BadLength {
-                expected: TX_LOCATION_ENCODED_LEN,
-                got: bytes.len(),
-            });
-        }
-        let mut h = [0u8; 8];
-        h.copy_from_slice(&bytes[..8]);
-        let mut bh = [0u8; 32];
-        bh.copy_from_slice(&bytes[8..40]);
-        let mut ti = [0u8; 4];
-        ti.copy_from_slice(&bytes[40..44]);
-        Ok(Self {
-            height: u64::from_le_bytes(h),
-            block_hash: Hash32::from_bytes(bh),
-            tx_index: u32::from_le_bytes(ti),
-            tag: bytes[44],
-        })
-    }
-}
-
-/// Erreur produite par l'index.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TxIndexError {
-    /// Longueur de valeur inattendue.
-    BadLength {
-        /// Longueur attendue.
-        expected: usize,
-        /// Longueur reçue.
-        got: usize,
-    },
-}
-
-impl std::fmt::Display for TxIndexError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TxIndexError::BadLength { expected, got } => {
-                write!(f, "bad length: expected {expected}, got {got}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for TxIndexError {}
 
 /// Construit la clé `TxBySender`.
 ///
@@ -229,7 +149,7 @@ mod tests {
         }
     }
 
-    // --- TxLocation encode/decode -----------------------------------------
+    // --- TxLocation (délégué à sango-rpc) ---------------------------------
 
     #[test]
     fn tx_location_encode_length_is_fixed() {
@@ -258,8 +178,7 @@ mod tests {
     #[test]
     fn tx_location_decode_rejects_bad_length() {
         for bad_len in [0, 44, 46, 100] {
-            let err = TxLocation::decode(&vec![0u8; bad_len]).unwrap_err();
-            assert!(matches!(err, TxIndexError::BadLength { .. }));
+            assert!(TxLocation::decode(&vec![0u8; bad_len]).is_none());
         }
     }
 
@@ -310,7 +229,6 @@ mod tests {
         ];
         keys.sort();
 
-        // sender_a d'abord, trié par (height, tx_index).
         let expected = vec![
             tx_by_sender_key(&sender_a, 2, 0),
             tx_by_sender_key(&sender_a, 2, 3),
@@ -392,7 +310,6 @@ mod tests {
         write_tx_index(&mut batch, &tx, 10, hash(0xcc), 3);
         storage.write_batch(batch).unwrap();
 
-        // Location écrite.
         let loc_bytes = storage
             .get(Column::TxLocations, tx_hash.as_bytes())
             .unwrap()
@@ -400,7 +317,6 @@ mod tests {
         let loc = TxLocation::decode(&loc_bytes).unwrap();
         assert_eq!(loc.tag, TX_TAG_EVM);
 
-        // Pas d'entrée sender.
         let all_senders = storage.iter_column(Column::TxBySender).unwrap();
         assert!(all_senders.is_empty());
     }

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::thread;
 
 use sango_primitives::NativeAddress;
-use sango_rpc::http::{read_request, write_json_status, HttpRequest};
+use sango_rpc::http::{read_request, write_json_status, write_preflight_ok, HttpRequest};
 
 mod config;
 mod faucet;
@@ -117,6 +117,18 @@ fn handle_connection(
         };
         served += 1;
         let keep_alive = req.keep_alive && served < MAX_REQUESTS;
+
+        // CORS preflight : répondre 204 avant tout traitement de méthode,
+        // sinon le navigateur reçoit un 404 sans Allow-*.
+        if req.method == "OPTIONS" {
+            if write_preflight_ok(reader.get_mut(), keep_alive, "GET, POST, OPTIONS").is_err() {
+                return Ok(());
+            }
+            if !keep_alive {
+                return Ok(());
+            }
+            continue;
+        }
 
         // Dispatch.
         let (status, reason, body) = dispatch(&faucet, &req, peer);

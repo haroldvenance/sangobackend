@@ -4595,6 +4595,8 @@ dependencies = [
  "rustls-pemfile",
  "rustls-pki-types",
  "sango-codec",
+ "sango-crypto",
+ "sango-evm",
  "sango-primitives",
  "sango-types",
  "serde",

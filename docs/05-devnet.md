@@ -20,18 +20,49 @@ Flag	Rôle
 --no-p2p	Désactive le réseau P2P (devnet mono-nœud)
 Structure du Genesis — examples/devnet.json
 
-    ⚠️ Vérifier les champs exacts dans examples/devnet.json.
+Exemple réel :
+json
 
-Champs attendus :
+{
+  "_comment": "Devnet à un seul validateur. Les seeds sont PUBLIQUES — usage démo uniquement.",
+  "chain_id_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "initial_supply_sango": "2000000000",
+  "rewards_enabled": true,
+  "self_validator_seed_hex": "01010101…",
+  "validators": [
+    {
+      "seed_hex": "01010101…",
+      "voting_power_sango": "100000",
+      "commission_bps": 700
+    }
+  ],
+  "allocations": [
+    { "address_hex": "11111111…", "amount_sango": "500000000" },
+    { "address_hex": "02291e07…", "amount_sango": "500000000",
+      "public_key_hex": "c6822637…" },
+    { "address_hex": "0x119a2d28…", "amount_sango": "1000000000" }
+  ]
+}
+
 Champ	Rôle
-chain_id	32 bytes hex, identifiant unique de la chaîne
-accounts	Liste d'adresses pré-financées
-validators	Validateurs initiaux (adresse + stake)
-params	Paramètres consensus (block time, etc.)
-genesis_time	Timestamp de démarrage
+chain_id_hex	32 bytes hex — identifiant unique de la chaîne
+initial_supply_sango	Supply totale, en SANGO décimal
+rewards_enabled	Active le calcul des récompenses de staking
+self_validator_seed_hex	Seed du validateur « auto » (celle du nœud)
+validators[]	Validateurs initiaux
+validators[].seed_hex	Seed Ed25519 du validateur
+validators[].voting_power_sango	Self-stake initial, en SANGO
+validators[].commission_bps	Commission (basis points, 700 = 7 %)
+allocations[]	Comptes pré-financés
+allocations[].address_hex	Adresse native (avec ou sans 0x)
+allocations[].amount_sango	Montant en SANGO décimal
+allocations[].public_key_hex	Optionnel — clé publique si connue
+Comptes « fantômes »
 
-Le chain_id est crucial : il signe chaque transaction et empêche
-le replay entre réseaux. Change-le pour isoler un réseau de test.
+Une allocation sans public_key_hex crée un compte « fantôme » :
+l'adresse a un solde, mais aucune clé publique n'est enregistrée. Le
+protocole accepte une seule tx bootstrap de ce compte, qui déclare
+la clé publique (le wallet le fait automatiquement à la première tx).
 Multi-nœuds
 
 Pour simuler plusieurs validateurs :
@@ -53,8 +84,9 @@ cargo run -p sango-node -- \
 
 Seeds publiques
 
-En devnet, les seeds sont jetables. Ne les utilise pas pour autre
-chose qu'un test local. Le réseau peut être wipé à tout moment.
+En devnet, les seeds sont jetables et publiques : 01010101…
+et 11111111… sont dans examples/ et ne protègent rien. Ne les
+utilise pas ailleurs qu'en local.
 Wipe et relance
 
 Pour repartir de zéro :

@@ -14,7 +14,10 @@ use sango_primitives::{
 use sango_state::{MetadataKey, NativeState};
 use sango_storage::{metadata_key, Batch, Column, Storage};
 use sango_tx::{validate_transaction, SenderInfo, ValidationContext};
-use sango_types::{Block, BlockHeader, ChainTip, EvmLog, Receipt, Transaction, Tx};
+use sango_types::{
+    Block, BlockHeader, ChainTip, Delegation, EvmLog, EvmTx, PendingUnbonding, Receipt,
+    Transaction, Tx,
+};
 
 use crate::base_fee::{next_base_fee, INITIAL_BASE_FEE};
 use crate::diff::{diff_evm, diff_state, EvmDiff};
@@ -616,7 +619,7 @@ impl Node {
         let Some(loc_bytes) = self.storage.get(Column::TxLocations, hash.as_bytes())? else {
             return Ok(None);
         };
-        let location = crate::tx_index::TxLocation::decode(&loc_bytes).map_err(|_| {
+        let location = crate::tx_index::TxLocation::decode(&loc_bytes).ok_or({
             NodeError::Storage(sango_storage::StorageError::Codec(
                 sango_codec::CodecError::MalformedPayload {
                     reason: "invalid TxLocation",
@@ -702,6 +705,130 @@ impl Node {
         }
 
         Ok((out, total))
+    }
+
+    /// Liste les délégations émises par un délégateur donné.
+    #[must_use]
+    pub fn get_delegations_of(&self, delegator: &NativeAddress) -> Vec<Delegation> {
+        self.state.delegations_of(delegator)
+    }
+
+    /// Liste les unbondings en attente de maturation pour un
+    /// délégateur donné.
+    #[must_use]
+    pub fn get_pending_unbondings_for(&self, delegator: &NativeAddress) -> Vec<PendingUnbonding> {
+        self.state
+            .iter_pending_unbondings()
+            .into_iter()
+            .filter(|p| p.delegator == *delegator)
+            .collect()
+    }
+
+    /// Charge un receipt par hash.
+    fn load_receipt(&self, hash: &Hash32) -> Result<Option<Receipt>, NodeError> {
+        let Some(bytes) = self.storage.get(Column::Receipts, hash.as_bytes())? else {
+            return Ok(None);
+        };
+        Receipt::decode_exact(&bytes)
+            .map(Some)
+            .map_err(|e| NodeError::Storage(sango_storage::StorageError::Codec(e)))
+    }
+
+    /// Charge tous les receipts d'un bloc, dans l'ordre des txs.
+    ///
+    /// Retourne `None` si un receipt est manquant (incohérence storage).
+    fn load_receipts_for_block(&self, block: &Block) -> Result<Option<Vec<Receipt>>, NodeError> {
+        let mut out = Vec::with_capacity(block.transactions.len());
+        for tx in &block.transactions {
+            let hash = tx.hash();
+            let Some(receipt) = self.load_receipt(&hash)? else {
+                return Ok(None);
+            };
+            out.push(receipt);
+        }
+        Ok(Some(out))
+    }
+
+    /// Tx EVM par hash, avec localisation (`eth_getTransactionByHash`).
+    ///
+    /// Retourne `None` si la tx est inconnue ou si c'est une native
+    /// (pas de représentation Ethereum).
+    pub fn eth_get_transaction_with_location(
+        &self,
+        hash: &Hash32,
+    ) -> Result<Option<(EvmTx, crate::tx_index::TxLocation)>, NodeError> {
+        let Some((tx, loc)) = self.get_transaction_with_location(hash)? else {
+            return Ok(None);
+        };
+        match tx {
+            Tx::Evm(evm) => Ok(Some((evm, loc))),
+            Tx::Native(_) => Ok(None),
+        }
+    }
+
+    /// Receipt + localisation + `log_index_base`
+    /// (`eth_getTransactionReceipt`).
+    ///
+    /// Le `log_index_base` est le nombre de logs émis par les
+    /// transactions précédentes dans le même bloc. Utilisé pour calculer
+    /// `logIndex` global (Ethereum-style).
+    pub fn eth_get_receipt_bundle(
+        &self,
+        hash: &Hash32,
+    ) -> Result<Option<(Receipt, crate::tx_index::TxLocation, u64)>, NodeError> {
+        let Some((_, loc)) = self.get_transaction_with_location(hash)? else {
+            return Ok(None);
+        };
+        if loc.tag != crate::tx_index::TX_TAG_EVM {
+            return Ok(None);
+        }
+        let Some(receipt) = self.load_receipt(hash)? else {
+            return Ok(None);
+        };
+
+        // Calcul du log_index_base : compte les logs des txs précédentes
+        // dans le même bloc.
+        let Some(block) = self.get_block_by_height(loc.height)? else {
+            return Ok(None);
+        };
+        let mut base: u64 = 0;
+        for (i, tx) in block.transactions.iter().enumerate() {
+            if i as u32 >= loc.tx_index {
+                break;
+            }
+            if let Some(r) = self.load_receipt(&tx.hash())? {
+                base = base.saturating_add(r.logs.len() as u64);
+            }
+        }
+        Ok(Some((receipt, loc, base)))
+    }
+
+    /// Bloc + ses receipts par hauteur (`eth_getBlockByNumber`).
+    pub fn eth_get_block_with_receipts_by_number(
+        &self,
+        height: u64,
+    ) -> Result<Option<(Block, Vec<Receipt>)>, NodeError> {
+        let Some(block) = self.get_block_by_height(height)? else {
+            return Ok(None);
+        };
+        let Some(receipts) = self.load_receipts_for_block(&block)? else {
+            return Ok(None);
+        };
+        Ok(Some((block, receipts)))
+    }
+
+    /// Bloc + ses receipts par hash (`eth_getBlockByHash`).
+    pub fn eth_get_block_with_receipts_by_hash(
+        &self,
+        hash: &Hash32,
+    ) -> Result<Option<(Block, Vec<Receipt>)>, NodeError> {
+        let Some(block) = self.get_block_by_hash(hash)? else {
+            return Ok(None);
+        };
+        let Some(receipts) = self.load_receipts_for_block(&block)? else {
+            return Ok(None);
+        };
+        Ok(Some((block, receipts)))
     }
 
     /// Liste tous les validateurs enregistrés.

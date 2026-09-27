@@ -69,7 +69,7 @@ pub mod tls;
 
 pub use backend::{
     BlockTag, EthCallRequest, EthCallResult, EthLog, EthLogFilter, EthProof, EthStorageProof,
-    RpcBackend,
+    RpcBackend, TxLocation, TX_LOCATION_ENCODED_LEN, TX_TAG_EVM, TX_TAG_NATIVE,
 };
 pub use error::RpcError;
 pub use json::{ErrorObject, Request, Response};

@@ -218,7 +218,7 @@ where
         // sans exécuter le RPC. Doit être AVANT le check `method != POST`,
         // sinon OPTIONS tombe dans le 405.
         if req.method == "OPTIONS" {
-            if write_preflight_ok(reader.get_mut(), keep_alive).is_err() {
+            if write_preflight_ok(reader.get_mut(), keep_alive, "POST, OPTIONS").is_err() {
                 reader.get_mut().graceful_close();
                 return Ok(());
             }
