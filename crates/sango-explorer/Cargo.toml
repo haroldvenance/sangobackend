@@ -1,0 +1,25 @@
+[package]
+name = "sango-explorer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sango-explorer"
+path = "src/main.rs"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+sango-primitives.workspace = true
+sango-codec.workspace = true
+sango-types.workspace = true
+sango-rpc.workspace = true
+sango-wallet.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

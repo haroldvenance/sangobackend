@@ -1,0 +1,6 @@
+{
+  "_comment": "Config explorer devnet. Lance un node sur 8545 d'abord.",
+  "rpc_url": "http://127.0.0.1:8545",
+  "listen_addr": "127.0.0.1:9500",
+  "network_name": "Sango Devnet"
+}
