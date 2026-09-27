@@ -6,7 +6,8 @@ use sango_primitives::{Amount, NativeAddress};
 use sango_state::NativeState;
 use sango_tx::ValidatedTransaction;
 use sango_types::{
-    staking_params, Delegation, PendingUnbonding, Transaction, TxKind, ValidatorInfo,
+    staking_params, Delegation, PendingUnbonding, Transaction, TxKind, TxOutcome, TxOutcomeStatus,
+    ValidatorInfo,
 };
 
 use crate::apply::AppliedTransaction;
@@ -67,20 +68,57 @@ pub fn apply_staking_no_rollback(
     let account_public_key = account.public_key;
 
     // (2) Dispatcher sur l'opération.
-    match tx.tx_kind {
-        TxKind::Bond => apply_bond(state, sender, value, total_fee, ctx)?,
-        TxKind::Unbond => apply_unbond(state, sender, value, total_fee, ctx)?,
+    //
+    // `outcome` porte le résultat financier persistant pour les TxKind
+    // qui produisent un effet métier observable côté wallet
+    // (récompenses réclamées, montant débloqué, maturité).
+    let outcome: Option<TxOutcome> = match tx.tx_kind {
+        TxKind::Bond => {
+            apply_bond(state, sender, value, total_fee, ctx)?;
+            None
+        }
+        TxKind::Unbond => {
+            apply_unbond(state, sender, value, total_fee, ctx)?;
+            let mature_at = ctx
+                .current_time
+                .saturating_add(staking_params::UNBONDING_PERIOD_SECS);
+            Some(TxOutcome {
+                status: TxOutcomeStatus::Success,
+                gas_used,
+                claimed_rewards: None,
+                unbond_amount: Some(value),
+                unbond_mature_at: Some(mature_at),
+            })
+        }
         TxKind::Delegate => {
             let recipient = tx.recipient.ok_or(ApplyError::MissingRecipient)?;
             apply_delegate(state, sender, recipient, value, total_fee)?;
+            None
         }
         TxKind::Undelegate => {
             let recipient = tx.recipient.ok_or(ApplyError::MissingRecipient)?;
             apply_undelegate(state, sender, recipient, value, total_fee, ctx)?;
+            let mature_at = ctx
+                .current_time
+                .saturating_add(staking_params::UNBONDING_PERIOD_SECS);
+            Some(TxOutcome {
+                status: TxOutcomeStatus::Success,
+                gas_used,
+                claimed_rewards: None,
+                unbond_amount: Some(value),
+                unbond_mature_at: Some(mature_at),
+            })
         }
         TxKind::ClaimRewards => {
             let recipient = tx.recipient.ok_or(ApplyError::MissingRecipient)?;
-            apply_claim_rewards(state, sender, recipient, total_fee)?;
+            let claimed = apply_claim_rewards(state, sender, recipient, total_fee)?;
+            Some(TxOutcome {
+                status: TxOutcomeStatus::Success,
+                gas_used,
+                claimed_rewards: Some(claimed),
+                unbond_amount: None,
+                unbond_mature_at: None,
+            })
         }
         TxKind::RegisterValidator => {
             apply_register_validator(
@@ -91,13 +129,18 @@ pub fn apply_staking_no_rollback(
                 total_fee,
                 tx.data.as_slice(),
             )?;
+            None
         }
         TxKind::UpdateCommission => {
             apply_update_commission(state, sender, total_fee, tx.data.as_slice(), ctx)?;
+            None
         }
-        TxKind::Unjail => apply_unjail(state, sender, total_fee, ctx)?,
+        TxKind::Unjail => {
+            apply_unjail(state, sender, total_fee, ctx)?;
+            None
+        }
         other => return Err(ApplyError::UnsupportedTxKind(other)),
-    }
+    };
 
     // (3) Paiement des frais au validator courant.
     state
@@ -125,6 +168,7 @@ pub fn apply_staking_no_rollback(
         validator_fee,
         burn_fee,
         bootstrap_public_key: validated.bootstrap_public_key,
+        outcome,
     })
 }
 
@@ -348,7 +392,7 @@ fn apply_claim_rewards(
     sender: NativeAddress,
     validator: NativeAddress,
     total_fee: u128,
-) -> Result<(), ApplyError> {
+) -> Result<Amount, ApplyError> {
     let mut d =
         state
             .get_delegation(&sender, &validator)
@@ -371,7 +415,7 @@ fn apply_claim_rewards(
     state
         .debit(sender, Amount::from_base_units(total_fee))
         .map_err(map_state_error)?;
-    Ok(())
+    Ok(rewards)
 }
 
 fn apply_register_validator(

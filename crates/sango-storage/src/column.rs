@@ -38,6 +38,14 @@ pub enum Column {
     /// paginer « plus récent d'abord », itérer à l'envers sur le
     /// préfixe `sender`.
     TxBySender,
+    /// Résultat financier par transaction.
+    ///
+    /// Clé = `tx_hash` (32 bytes).
+    /// Valeur = `TxOutcome` encodé canonique.
+    ///
+    /// Contient les effets métier persistants (`claimedRewards`,
+    /// `unbondAmount`, `unbondMatureAt`) — voir `sango-types::TxOutcome`.
+    TxOutcomes,
     /// Entrées du SMT d'état natif indexées par `key_hash`.
     StateNative,
     /// État validateurs.
@@ -88,6 +96,7 @@ impl Column {
         Column::Receipts,
         Column::TxLocations,
         Column::TxBySender,
+        Column::TxOutcomes,
         Column::StateNative,
         Column::Validators,
         Column::Staking,
@@ -110,6 +119,7 @@ impl Column {
             Column::Receipts => "receipts",
             Column::TxLocations => "tx_locations",
             Column::TxBySender => "tx_by_sender",
+            Column::TxOutcomes => "tx_outcomes",
             Column::StateNative => "state_native",
             Column::Validators => "validators",
             Column::Staking => "staking",
@@ -145,6 +155,7 @@ mod tests {
         assert_eq!(Column::Receipts.name(), "receipts");
         assert_eq!(Column::TxLocations.name(), "tx_locations");
         assert_eq!(Column::TxBySender.name(), "tx_by_sender");
+        assert_eq!(Column::TxOutcomes.name(), "tx_outcomes");
         assert_eq!(Column::StateNative.name(), "state_native");
         assert_eq!(Column::Validators.name(), "validators");
         assert_eq!(Column::Staking.name(), "staking");
@@ -158,6 +169,6 @@ mod tests {
 
     #[test]
     fn all_contains_every_variant() {
-        assert_eq!(Column::ALL.len(), 16);
+        assert_eq!(Column::ALL.len(), 17);
     }
 }

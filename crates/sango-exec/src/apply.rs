@@ -50,7 +50,9 @@ use sango_evm::{evm_transact, EvmBlockEnv, EvmState, TxEnvExtras};
 use sango_primitives::{Amount, ChainId32, EvmAddress, Hash32, NativeAddress, PublicKey, U256};
 use sango_state::{NativeState, StateError};
 use sango_tx::{split_fee, ValidatedTransaction as ValidatedNativeTransaction};
-use sango_types::{Block, EvmLog, LogsBloom, Receipt, ReceiptStatus, Transaction, Tx, TxKind};
+use sango_types::{
+    Block, EvmLog, LogsBloom, Receipt, ReceiptStatus, Transaction, Tx, TxKind, TxOutcome,
+};
 
 use crate::error::ApplyError;
 
@@ -125,6 +127,11 @@ pub struct AppliedTransaction {
     pub burn_fee: u128,
     /// Clé publique enregistrée lors d'un bootstrap, si applicable.
     pub bootstrap_public_key: Option<PublicKey>,
+    /// Résultat financier persistant (récompenses réclamées, unbond…).
+    ///
+    /// `None` pour les transferts et `Bond`. `Some` pour `Unbond`,
+    /// `Undelegate`, `ClaimRewards`.
+    pub outcome: Option<TxOutcome>,
 }
 
 /// Résultat d'exécution d'une transaction EVM.
@@ -214,6 +221,15 @@ impl Applied {
         match self {
             Applied::Native(a) => a.burn_fee,
             Applied::Evm(_) => 0,
+        }
+    }
+
+    /// Résultat financier persistant (uniquement pour les natifs).
+    #[must_use]
+    pub fn native_outcome(&self) -> Option<TxOutcome> {
+        match self {
+            Applied::Native(a) => a.outcome.clone(),
+            Applied::Evm(_) => None,
         }
     }
 }
@@ -980,6 +996,7 @@ pub(crate) fn apply_transfer_no_rollback(
         validator_fee,
         burn_fee,
         bootstrap_public_key: validated.bootstrap_public_key,
+        outcome: None,
     })
 }
 

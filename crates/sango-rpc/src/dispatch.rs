@@ -6,7 +6,7 @@ use sango_codec::{Decode as _, Encode as _};
 use sango_primitives::{EvmAddress, Hash32, NativeAddress, U256};
 use sango_types::{
     Block, Delegation, EvmAccessListItem, EvmAuthorization, EvmTx, PendingUnbonding, Receipt,
-    ReceiptStatus, Transaction, Tx, ValidatorInfo,
+    ReceiptStatus, Transaction, Tx, TxOutcome, TxOutcomeStatus, ValidatorInfo,
 };
 
 use crate::backend::{EthCallRequest, RpcBackend, TxLocation};
@@ -201,6 +201,20 @@ fn pending_unbonding_to_json(p: &PendingUnbonding) -> Value {
     })
 }
 
+/// Sérialise un `TxOutcome` en JSON.
+fn tx_outcome_to_json(o: &TxOutcome) -> Value {
+    json!({
+        "status": match o.status {
+            TxOutcomeStatus::Success => "success",
+            TxOutcomeStatus::Failed => "failed",
+        },
+        "gasUsed": o.gas_used,
+        "claimedRewards": o.claimed_rewards.map(|a| a.base_units().to_string()),
+        "unbondAmount": o.unbond_amount.map(|a| a.base_units().to_string()),
+        "unbondMatureAt": o.unbond_mature_at,
+    })
+}
+
 fn sango_get_transaction_by_hash<B: RpcBackend>(
     backend: &B,
     params: &Value,
@@ -214,7 +228,15 @@ fn sango_get_transaction_by_hash<B: RpcBackend>(
         .map_err(|e| RpcError::InvalidParams(format!("bad hash: {e}")))?;
     match backend.get_transaction_with_location(&hash) {
         None => Ok(Value::Null),
-        Some((tx, loc)) => Ok(tx_to_json(&tx, &loc)),
+        Some((tx, loc)) => {
+            let mut json = tx_to_json(&tx, &loc);
+            if let Some(outcome) = backend.get_tx_outcome(&hash) {
+                if let Some(obj) = json.as_object_mut() {
+                    obj.insert("outcome".into(), tx_outcome_to_json(&outcome));
+                }
+            }
+            Ok(json)
+        }
     }
 }
 

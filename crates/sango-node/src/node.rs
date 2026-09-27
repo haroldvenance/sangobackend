@@ -16,7 +16,7 @@ use sango_storage::{metadata_key, Batch, Column, Storage};
 use sango_tx::{validate_transaction, SenderInfo, ValidationContext};
 use sango_types::{
     Block, BlockHeader, ChainTip, Delegation, EvmLog, EvmTx, PendingUnbonding, Receipt,
-    Transaction, Tx,
+    Transaction, Tx, TxOutcome,
 };
 
 use crate::base_fee::{next_base_fee, INITIAL_BASE_FEE};
@@ -254,6 +254,20 @@ impl Node {
     ///
     /// Le `Vec<ValidatedTransaction>` retourné correspond 1:1 aux txs du
     /// bloc, dans le même ordre.
+    ///
+    /// ## Retour
+    ///
+    /// `(block, validated, rejected)` :
+    ///
+    /// - `block` : le bloc candidat.
+    /// - `validated` : les txs validées, 1:1 avec `block.transactions`.
+    /// - `rejected` : hashes des txs **rejetées** (business logic,
+    ///   validation ou apply). Le driver les évince du mempool.
+    ///
+    /// **Note V1** : on `break` au premier rejet (préserve l'invariant
+    /// d'atomicité de la pré-validation). Donc au plus 1 rejet par
+    /// appel. Les éventuels autres rejets seront détectés au bloc
+    /// suivant.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_block_from_candidates(
@@ -265,7 +279,7 @@ impl Node {
         proposer: NativeAddress,
         timestamp: u64,
         evidences: Vec<sango_types::Evidence>,
-    ) -> (Block, Vec<ValidatedTransaction>) {
+    ) -> (Block, Vec<ValidatedTransaction>, Vec<Hash32>) {
         use sango_exec::{apply_tx_no_rollback, gas_for, ExecutionContext, NATIVE_TRANSFER_GAS};
 
         // ------------------------------------------------------------------
@@ -283,6 +297,10 @@ impl Node {
         let mut trial_evm = self.evm.clone();
         let mut accepted: Vec<Tx> = Vec::new();
         let mut validated: Vec<ValidatedTransaction> = Vec::new();
+        // Txs rejetées de manière déterministe (business logic). Le driver
+        // les évince du mempool après l'appel, sinon elles restent
+        // sélectionnées à chaque bloc et bloquent le sender.
+        let mut rejected: Vec<Hash32> = Vec::new();
 
         // `EvmBlockEnv` commun à la pré-validation (phase 1) et à la
         // simulation complète (phase 2). Doit être identique, sinon
@@ -299,6 +317,7 @@ impl Node {
         };
 
         for tx in candidates.into_iter().take(max_txs) {
+            let tx_hash = tx.hash();
             match tx {
                 Tx::Native(native) => {
                     let sender = Self::sender_info_from_state(&trial_filter, native.sender);
@@ -311,10 +330,11 @@ impl Node {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!(
-                                tx = %format!("0x{}", native.hash().to_hex()),
+                                tx = %format!("0x{}", tx_hash.to_hex()),
                                 reason = ?e,
                                 "native tx rejected at validation"
                             );
+                            rejected.push(tx_hash);
                             break;
                         }
                     };
@@ -334,10 +354,11 @@ impl Node {
                         apply_tx_no_rollback(&mut trial_filter, &native, &vn, gas_used, &exec_ctx)
                     {
                         tracing::warn!(
-                            tx = %format!("0x{}", native.hash().to_hex()),
+                            tx = %format!("0x{}", tx_hash.to_hex()),
                             reason = ?e,
                             "native tx rejected at apply"
                         );
+                        rejected.push(tx_hash);
                         break;
                     }
                     accepted.push(Tx::Native(native));
@@ -348,9 +369,11 @@ impl Node {
                         Ok(v) => v,
                         Err(reason) => {
                             tracing::warn!(
+                                tx = %format!("0x{}", tx_hash.to_hex()),
                                 reason = %reason,
                                 "evm tx rejected at validation"
                             );
+                            rejected.push(tx_hash);
                             break;
                         }
                     };
@@ -363,9 +386,11 @@ impl Node {
                     // `Err` (nonce invalide, fonds insuffisants…) rejette.
                     if let Err(e) = evm_transact(&mut trial_evm, &evm, &evm_block_env, extras) {
                         tracing::warn!(
+                            tx = %format!("0x{}", tx_hash.to_hex()),
                             reason = ?e,
                             "evm tx rejected at apply"
                         );
+                        rejected.push(tx_hash);
                         break;
                     }
                     accepted.push(Tx::Evm(evm));
@@ -454,7 +479,7 @@ impl Node {
             evidences,
             transactions: accepted,
         };
-        (final_block, validated)
+        (final_block, validated, rejected)
     }
 
     /// Lit un bloc par hauteur.
@@ -744,6 +769,22 @@ impl Node {
             .into_iter()
             .filter(|p| p.delegator == *delegator)
             .collect()
+    }
+
+    /// Lit le résultat financier d'une tx (récompenses réclamées,
+    /// montant débloqué, maturité).
+    ///
+    /// Retourne `None` si :
+    /// - la tx n'a pas produit d'outcome (transfert, bond) ;
+    /// - la tx appartient à un bloc appliqué avant l'introduction de
+    ///   la colonne `TxOutcomes` (migration devnet).
+    pub fn get_tx_outcome(&self, hash: &Hash32) -> Result<Option<TxOutcome>, NodeError> {
+        let Some(bytes) = self.storage.get(Column::TxOutcomes, hash.as_bytes())? else {
+            return Ok(None);
+        };
+        TxOutcome::decode_exact(&bytes)
+            .map(Some)
+            .map_err(|e| NodeError::Storage(sango_storage::StorageError::Codec(e)))
     }
 
     /// Charge un receipt par hash.
@@ -1155,6 +1196,16 @@ impl Node {
                 receipt.tx_hash.as_bytes(),
                 receipt.encode_to_vec(),
             );
+        }
+        // Persiste le résultat financier (claimedRewards, unbond…).
+        for applied in &result.apply_result.applied {
+            if let Some(outcome) = applied.native_outcome() {
+                batch.put(
+                    Column::TxOutcomes,
+                    applied.tx_hash().as_bytes(),
+                    outcome.encode_to_vec(),
+                );
+            }
         }
         for (k, v) in &diff.inserts {
             batch.put(Column::StateNative, k.as_bytes(), v.clone());

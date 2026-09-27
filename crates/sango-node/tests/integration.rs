@@ -37,7 +37,7 @@ fn build_block(node: &Node, candidates: Vec<Transaction>) -> Block {
         None => (Hash32::ZERO, 0),
     };
     let timestamp = 1_700_000_000 + height;
-    let (block, _validated) = node.prepare_block_from_candidates(
+    let (block, _validated, _rejected) = node.prepare_block_from_candidates(
         Epoch::new(0),
         Round::new(0),
         candidates,

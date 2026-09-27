@@ -17,6 +17,7 @@ mod receipt;
 mod staking;
 mod transaction;
 mod tx;
+mod tx_outcome;
 
 pub use account::NativeAccount;
 pub use block::Block;
@@ -42,6 +43,7 @@ pub use receipt::{EvmLog, LogsBloom, Receipt, ReceiptStatus, LOGS_BLOOM_BYTES, M
 pub use staking::{params as staking_params, Delegation, PendingUnbonding, ValidatorInfo};
 pub use transaction::{Transaction, TxKind};
 pub use tx::{Tx, TX_DISCRIMINANT_EVM, TX_DISCRIMINANT_NATIVE};
+pub use tx_outcome::{TxOutcome, TxOutcomeStatus};
 
 /// Version courante du protocole Sango.
 pub const PROTOCOL_VERSION_V1: u32 = 1;

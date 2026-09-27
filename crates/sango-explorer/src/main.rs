@@ -195,12 +195,12 @@ fn route(explorer: &Explorer, req: &HttpRequest) -> (u16, &'static str, String) 
         "/health" => (200, "OK", pages::health(&explorer.rpc)),
         "/validators" => (200, "OK", pages::validators(&explorer.rpc, network)),
         "/blocks" => {
-            let page = query
-                .iter()
-                .find(|(k, _)| k == "page")
-                .and_then(|(_, v)| v.parse().ok())
-                .unwrap_or(1u64);
-            (200, "OK", pages::blocks(&explorer.rpc, network, page))
+            let (limit, offset) = parse_pagination(&query, 20, 100);
+            (
+                200,
+                "OK",
+                pages::blocks(&explorer.rpc, network, limit, offset),
+            )
         }
         "/search" => {
             let q = query
@@ -225,15 +225,11 @@ fn route(explorer: &Explorer, req: &HttpRequest) -> (u16, &'static str, String) 
                 return (200, "OK", pages::tx(&explorer.rpc, network, rest));
             }
             if let Some(rest) = path.strip_prefix("/address/") {
-                let page = query
-                    .iter()
-                    .find(|(k, _)| k == "page")
-                    .and_then(|(_, v)| v.parse().ok())
-                    .unwrap_or(1u32);
+                let (limit, offset) = parse_pagination(&query, 20, 100);
                 return (
                     200,
                     "OK",
-                    pages::address(&explorer.rpc, network, rest, page),
+                    pages::address(&explorer.rpc, network, rest, limit as u32, offset as u32),
                 );
             }
             (
@@ -260,6 +256,49 @@ fn parse_query(full: &str) -> (&str, Vec<(String, String)>) {
         }
     }
     (path, query)
+}
+
+/// Parse les paramètres de pagination.
+///
+/// ## Format recommandé
+///
+/// `?limit=N&offset=M` — `limit` plafonné à `max_limit`, `offset`
+/// non borné. Les deux valent leur défaut si absents ou invalides.
+///
+/// ## Compatibilité `?page=N`
+///
+/// `?page=N` reste accepté : équivaut à `offset = (N − 1) × limit`.
+/// Si `page` et `offset` sont tous deux fournis, `page` est prioritaire.
+fn parse_pagination(query: &[(String, String)], default_limit: u64, max_limit: u64) -> (u64, u64) {
+    let mut limit = default_limit;
+    let mut offset = 0u64;
+    let mut page: Option<u64> = None;
+    for (k, v) in query {
+        match k.as_str() {
+            "limit" => {
+                if let Ok(n) = v.parse::<u64>() {
+                    limit = n.clamp(1, max_limit);
+                }
+            }
+            "offset" => {
+                if let Ok(n) = v.parse::<u64>() {
+                    offset = n;
+                }
+            }
+            "page" => {
+                if let Ok(n) = v.parse::<u64>() {
+                    page = Some(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(p) = page {
+        if p >= 1 {
+            offset = (p - 1).saturating_mul(limit);
+        }
+    }
+    (limit, offset)
 }
 
 /// Écrit une réponse HTML.
@@ -363,5 +402,53 @@ mod tests {
     fn parse_query_multiple() {
         let (_, q) = parse_query("/x?a=1&b=2");
         assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn pagination_defaults() {
+        let (l, o) = parse_pagination(&[], 20, 100);
+        assert_eq!(l, 20);
+        assert_eq!(o, 0);
+    }
+
+    #[test]
+    fn pagination_limit_and_offset() {
+        let q = vec![
+            ("limit".to_string(), "50".to_string()),
+            ("offset".to_string(), "100".to_string()),
+        ];
+        let (l, o) = parse_pagination(&q, 20, 100);
+        assert_eq!(l, 50);
+        assert_eq!(o, 100);
+    }
+
+    #[test]
+    fn pagination_limit_clamped() {
+        let q = vec![("limit".to_string(), "1000".to_string())];
+        let (l, _) = parse_pagination(&q, 20, 100);
+        assert_eq!(l, 100);
+    }
+
+    #[test]
+    fn pagination_page_fallback() {
+        // ?page=3 avec limit 20 → offset = 40.
+        let q = vec![
+            ("page".to_string(), "3".to_string()),
+            ("limit".to_string(), "20".to_string()),
+        ];
+        let (l, o) = parse_pagination(&q, 20, 100);
+        assert_eq!(l, 20);
+        assert_eq!(o, 40);
+    }
+
+    #[test]
+    fn pagination_page_overrides_offset() {
+        let q = vec![
+            ("page".to_string(), "2".to_string()),
+            ("offset".to_string(), "999".to_string()),
+            ("limit".to_string(), "10".to_string()),
+        ];
+        let (_, o) = parse_pagination(&q, 20, 100);
+        assert_eq!(o, 10);
     }
 }

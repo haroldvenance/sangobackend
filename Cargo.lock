@@ -4508,6 +4508,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "sango-codec",
+ "sango-crypto",
  "sango-primitives",
  "sango-rpc",
  "sango-types",

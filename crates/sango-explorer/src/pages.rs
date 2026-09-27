@@ -1,19 +1,37 @@
 //! Rendu HTML de chaque page.
 
+use sango_crypto::bech32m;
 use sango_primitives::{Hash32, NativeAddress};
 use sango_types::{Block, Transaction, Tx};
 
 use crate::html::{escape, format_amount, layout, relative_time, shorten};
 use crate::rpc::{Rpc, TxWithLoc};
 
-/// Nombre de blocs par page dans `/blocks`.
-pub const BLOCKS_PER_PAGE: u64 = 20;
-
 /// Blocs affichés sur le dashboard.
 pub const DASHBOARD_BLOCKS: u64 = 10;
 
-/// Nombre de txs affichées par page dans `/address/:addr`.
-pub const TXS_PER_PAGE: u32 = 20;
+/// Parse une adresse en acceptant soit l'hex (`0x…`, 40 chars), soit
+/// bech32m (`sango1…` mainnet, `tsango1…` testnet/devnet).
+///
+/// ## Priorité
+///
+/// 1. `0x…` ou `0X…` → hex.
+/// 2. `sango1…` / `tsango1…` → bech32m.
+/// 3. Sinon, tentative hex sans préfixe (compat).
+pub fn parse_address(s: &str) -> Result<NativeAddress, String> {
+    let s = s.trim();
+    if s.starts_with("0x") || s.starts_with("0X") {
+        return NativeAddress::from_hex(s).map_err(|e| format!("hex: {e}"));
+    }
+    if s.starts_with("sango1") || s.starts_with("tsango1") {
+        // `try_decode_any_network` accepte `sango` (mainnet) et
+        // `tsango` (testnet + devnet) sans présumer du réseau.
+        return bech32m::try_decode_any_network(s)
+            .map(|(addr, _net)| addr)
+            .map_err(|e| format!("bech32m: {e}"));
+    }
+    NativeAddress::from_hex(s).map_err(|e| format!("hex: {e}"))
+}
 
 // --- Dashboard -------------------------------------------------------------
 
@@ -103,9 +121,12 @@ fn block_row(block: &Block) -> String {
 // --- Liste des blocs -------------------------------------------------------
 
 /// Liste paginée des blocs.
+///
+/// `limit` (≤ 100) et `offset` sont respectés. Les liens de pagination
+/// utilisent le format `?limit=&offset=`.
 #[must_use]
-pub fn blocks(rpc: &Rpc, network: &str, page: u64) -> String {
-    let page = page.max(1);
+pub fn blocks(rpc: &Rpc, network: &str, limit: u64, offset: u64) -> String {
+    let limit = limit.clamp(1, 100);
     let tip = match rpc.block_number() {
         Ok(Some(h)) => h,
         Ok(None) => {
@@ -118,7 +139,6 @@ pub fn blocks(rpc: &Rpc, network: &str, page: u64) -> String {
         Err(e) => return error_page(network, &format!("RPC: {e}")),
     };
 
-    let offset = (page - 1) * BLOCKS_PER_PAGE;
     if offset > tip {
         return layout(
             "Blocs",
@@ -127,10 +147,10 @@ pub fn blocks(rpc: &Rpc, network: &str, page: u64) -> String {
         );
     }
     let to = tip.saturating_sub(offset);
-    let from = to.saturating_sub(BLOCKS_PER_PAGE - 1);
+    let from = to.saturating_sub(limit - 1);
 
-    let mut body = String::from("<div class=\"card\"><h2>Blocs <span class=\"muted\">page ");
-    body.push_str(&page.to_string());
+    let mut body = String::from("<div class=\"card\"><h2>Blocs <span class=\"muted\">");
+    body.push_str(&format!("{from}–{to} (tip {tip})"));
     body.push_str("</span></h2>");
     body.push_str(
         "<table><thead><tr>\
@@ -146,18 +166,17 @@ pub fn blocks(rpc: &Rpc, network: &str, page: u64) -> String {
     body.push_str("</tbody></table>");
 
     body.push_str("<div class=\"pagination\">");
-    if page > 1 {
+    if offset > 0 {
+        let prev = offset.saturating_sub(limit);
         body.push_str(&format!(
-            "<a href=\"/blocks?page={}\">← Précédent</a>",
-            page - 1
+            "<a href=\"/blocks?limit={limit}&offset={prev}\">← Précédent</a>"
         ));
     }
-    body.push_str(&format!("<span class=\"muted\">Page {page}</span>"));
-    let next_offset = offset + BLOCKS_PER_PAGE;
+    body.push_str(&format!("<span class=\"muted\">offset {offset}</span>"));
+    let next_offset = offset + limit;
     if next_offset <= tip {
         body.push_str(&format!(
-            "<a href=\"/blocks?page={}\">Suivant →</a>",
-            page + 1
+            "<a href=\"/blocks?limit={limit}&offset={next_offset}\">Suivant →</a>"
         ));
     }
     body.push_str("</div>");
@@ -539,6 +558,11 @@ pub fn search(rpc: &Rpc, network: &str, query: &str) -> String {
         }
     }
 
+    // Bech32m (sango1… / tsango1…) → adresse.
+    if (q.starts_with("sango1") || q.starts_with("tsango1")) && parse_address(q).is_ok() {
+        return address(rpc, network, q, 20, 0);
+    }
+
     // 0x + hex.
     if let Some(hex) = q.strip_prefix("0x").or_else(|| q.strip_prefix("0X")) {
         match hex.len() {
@@ -566,7 +590,7 @@ pub fn search(rpc: &Rpc, network: &str, query: &str) -> String {
                 );
             }
             40 => {
-                return address(rpc, network, q, 1);
+                return address(rpc, network, q, 20, 0);
             }
             _ => {
                 return error_page(
@@ -582,7 +606,7 @@ pub fn search(rpc: &Rpc, network: &str, query: &str) -> String {
 
     error_page(
         network,
-        "Format non reconnu. Utilise : nombre (bloc), 0x…40 (adresse), 0x…64 (tx)",
+        "Format non reconnu. Utilise : nombre (bloc), 0x…40 ou sango1…/tsango1… (adresse), 0x…64 (tx)",
     )
 }
 
@@ -659,9 +683,11 @@ fn evm_tx_fields(body: &mut String, t: &sango_types::EvmTx) {
 // --- Adresse ---------------------------------------------------------------
 
 /// Détail d'une adresse.
+///
+/// Accepte `0x…` (hex) ou `sango1…`/`tsango1…` (bech32m).
 #[must_use]
-pub fn address(rpc: &Rpc, network: &str, addr_hex: &str, page: u32) -> String {
-    let addr = match NativeAddress::from_hex(addr_hex) {
+pub fn address(rpc: &Rpc, network: &str, addr_str: &str, limit: u32, offset: u32) -> String {
+    let addr = match parse_address(addr_str) {
         Ok(a) => a,
         Err(e) => return error_page(network, &format!("Adresse invalide : {e}")),
     };
@@ -791,8 +817,7 @@ pub fn address(rpc: &Rpc, network: &str, addr_hex: &str, page: u32) -> String {
         }
     }
 
-    let offset = page.saturating_sub(1) * TXS_PER_PAGE;
-    match rpc.txs_by_address(&addr, TXS_PER_PAGE, offset) {
+    match rpc.txs_by_address(&addr, limit, offset) {
         Ok((txs, total)) => {
             body.push_str("<div class=\"card\"><h2>Transactions émises <span class=\"muted\">");
             body.push_str(&format!("{total} au total"));
@@ -812,22 +837,24 @@ pub fn address(rpc: &Rpc, network: &str, addr_hex: &str, page: u32) -> String {
                 }
                 body.push_str("</tbody></table>");
 
-                let total_pages = (total as u32).div_ceil(TXS_PER_PAGE);
-                if total_pages > 1 {
+                let total_u64 = total;
+                let offset_u64 = offset as u64;
+                let limit_u64 = limit as u64;
+                if offset_u64 > 0 || offset_u64 + limit_u64 < total_u64 {
                     body.push_str("<div class=\"pagination\">");
-                    if page > 1 {
+                    if offset_u64 > 0 {
+                        let prev = offset_u64.saturating_sub(limit_u64);
                         body.push_str(&format!(
-                            "<a href=\"/address/{addr_hex}?page={}\">← Précédent</a>",
-                            page - 1
+                            "<a href=\"/address/{addr_str}?limit={limit_u64}&offset={prev}\">← Précédent</a>"
                         ));
                     }
                     body.push_str(&format!(
-                        "<span class=\"muted\">Page {page} / {total_pages}</span>"
+                        "<span class=\"muted\">offset {offset_u64} / {total_u64}</span>"
                     ));
-                    if page < total_pages {
+                    let next_offset = offset_u64 + limit_u64;
+                    if next_offset < total_u64 {
                         body.push_str(&format!(
-                            "<a href=\"/address/{addr_hex}?page={}\">Suivant →</a>",
-                            page + 1
+                            "<a href=\"/address/{addr_str}?limit={limit_u64}&offset={next_offset}\">Suivant →</a>"
                         ));
                     }
                     body.push_str("</div>");
@@ -993,4 +1020,27 @@ pub fn error_page(network: &str, msg: &str) -> String {
         escape(msg)
     );
     layout("Erreur", network, &body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_address_hex() {
+        let a = parse_address("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        assert_eq!(a.to_hex(), "aa".repeat(20));
+    }
+
+    #[test]
+    fn parse_address_hex_no_prefix() {
+        let a = parse_address("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        assert_eq!(a.to_hex(), "bb".repeat(20));
+    }
+
+    #[test]
+    fn parse_address_rejects_garbage() {
+        assert!(parse_address("not-an-address").is_err());
+        assert!(parse_address("0xnot-hex").is_err());
+    }
 }

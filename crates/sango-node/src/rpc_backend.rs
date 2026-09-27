@@ -7,7 +7,7 @@
 use sango_primitives::{Amount, ChainId32, EvmAddress, Hash32, NativeAddress, U256};
 use sango_rpc::{EthCallRequest, EthCallResult, RpcBackend, RpcError};
 use sango_types::{
-    Block, Delegation, EvmTx, NativeAccount, PendingUnbonding, Receipt, Transaction, Tx,
+    Block, Delegation, EvmTx, NativeAccount, PendingUnbonding, Receipt, Transaction, Tx, TxOutcome,
     ValidatorInfo,
 };
 
@@ -94,6 +94,11 @@ impl RpcBackend for NodeBackend {
             n.get_transactions_by_address(address, limit, offset)
                 .unwrap_or_default()
         })
+    }
+
+    fn get_tx_outcome(&self, hash: &Hash32) -> Option<TxOutcome> {
+        self.handle
+            .with_node(|n| n.get_tx_outcome(hash).ok().flatten())
     }
 
     fn send_transaction(&self, tx: &Transaction) -> Result<Hash32, RpcError> {

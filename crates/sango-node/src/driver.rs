@@ -306,7 +306,7 @@ impl Driver {
         let round = self.runner.ctx().round;
         let height = self.runner.ctx().height;
         let timestamp = 1_700_000_000u64.saturating_add(height.get());
-        let (block, _validated) = self.handle.with_node(|n| {
+        let (block, _validated, rejected) = self.handle.with_node(|n| {
             n.prepare_block_from_candidates(
                 epoch,
                 round,
@@ -317,6 +317,29 @@ impl Driver {
                 evidences,
             )
         });
+
+        // Évince du mempool les txs rejetées de manière déterministe
+        // (business logic : SelfDelegation, ValidatorNotFound, etc.).
+        // Sans ça, la tx reste sélectionnée à chaque bloc et bloque
+        // le sender indéfiniment.
+        //
+        // Trade-off V1 : on évince même les rejets « state-dependent »
+        // (InsufficientBalance). Si l'état change, l'utilisateur doit
+        // re-soumettre. En pratique, ça n'arrive pas car le mempool
+        // valide balance/nonce à l'insertion.
+        if !rejected.is_empty() {
+            self.handle.with_mempool(|pool| {
+                for h in &rejected {
+                    let _ = pool.remove(h);
+                }
+            });
+            self.handle.with_evm_mempool(|pool| {
+                for h in &rejected {
+                    let _ = pool.remove(h);
+                }
+            });
+            tracing::debug!(count = rejected.len(), "evicted rejected txs from mempools");
+        }
 
         self.runner.propose(block)?;
         self.process_actions()
@@ -515,7 +538,7 @@ impl Driver {
     }
 
     fn prune_native_mempool(&self) {
-        tracing::debug!("prune_native_mempool");
+        tracing::trace!("prune_native_mempool");
         let senders: Vec<NativeAddress> = self.handle.with_mempool(|pool| {
             let mut s = HashSet::new();
             for h in pool.hashes() {
@@ -545,6 +568,7 @@ impl Driver {
     /// nonce est déjà appliqué, et évince celles dont le max_fee est
     /// passé sous la nouvelle base fee.
     fn prune_evm_mempool(&self) {
+        tracing::trace!("prune_evm_mempool");
         let senders: Vec<sango_primitives::EvmAddress> = self.handle.with_evm_mempool(|pool| {
             let mut s = HashSet::new();
             for h in pool.hashes() {

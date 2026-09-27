@@ -9,7 +9,7 @@
 
 use sango_primitives::{Amount, ChainId32, EvmAddress, Hash32, NativeAddress, U256};
 use sango_types::{
-    Block, Delegation, EvmTx, NativeAccount, PendingUnbonding, Receipt, Transaction, Tx,
+    Block, Delegation, EvmTx, NativeAccount, PendingUnbonding, Receipt, Transaction, Tx, TxOutcome,
     ValidatorInfo,
 };
 
@@ -337,6 +337,16 @@ pub trait RpcBackend: Send + Sync + 'static {
     /// Retourne `None` si le hash est inconnu (index absent ou tx
     /// absente). Défaut : `None`.
     fn get_transaction_with_location(&self, _hash: &Hash32) -> Option<(Tx, TxLocation)> {
+        None
+    }
+
+    /// Résultat financier persistant d'une transaction.
+    ///
+    /// Contient `claimedRewards` (ClaimRewards), `unbondAmount` +
+    /// `unbondMatureAt` (Unbond / Undelegate). Retourne `None` pour
+    /// les transferts, les bonds, et les blocs appliqués avant
+    /// l'introduction de la colonne. Défaut : `None`.
+    fn get_tx_outcome(&self, _hash: &Hash32) -> Option<TxOutcome> {
         None
     }
 
