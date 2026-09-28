@@ -100,15 +100,18 @@ USAGE:
     sango-wallet [--rpc URL] [--keyfile PATH] <commande> [--flags...]
 
 COMMANDES NATIVES:
-    new                                 Génère un nouveau keyfile
-    address                             Affiche l'adresse native
-    pubkey                              Affiche la clé publique Ed25519
-    balance [ADDR]                      Solde natif
-    nonce [ADDR]                        Nonce natif
+    new [--bip39 [--words 12|24]]       Génère un nouveau keyfile
+                                        (sans --bip39 : keyfile V1 en clair,
+                                         avec    : keyfile V3 chiffré)
+    import                              Importe une mnemonic BIP-39 (V3)
+    export-mnemonic                     Affiche la mnemonic (V3 uniquement)
+    address [--account N]               Adresse native
+    pubkey [--account N]                Clé publique Ed25519
+    balance [ADDR] [--account N]        Solde natif
+    nonce [ADDR] [--account N]          Nonce natif
     info                                Informations chaîne
     history [ADDR] [--limit N] [--offset M]
                                         Transactions natives d'une adresse
-                                        (défaut : limit=20, offset=0)
     send --to ADDR --amount SANGO       Transfert natif
     stake|unstake --amount SANGO
     delegate|undelegate --validator ADDR --amount SANGO
@@ -119,9 +122,9 @@ COMMANDES NATIVES:
 
 COMMANDES EVM:
     evm-new                             Attache une clé secp256k1
-    evm-address                         Adresse EVM locale
-    evm-balance [ADDR]                  Solde EVM (eth_getBalance)
-    evm-nonce [ADDR]                    Nonce EVM
+    evm-address [--account N]           Adresse EVM locale
+    evm-balance [ADDR] [--account N]    Solde EVM (eth_getBalance)
+    evm-nonce [ADDR] [--account N]      Nonce EVM
     evm-call --to ADDR [--data HEX] [--value N]
     evm-sign --to ADDR --value N [--data HEX]
              [--tx-type legacy|2930|1559] [--gas N]
@@ -132,9 +135,31 @@ GESTION DU KEYFILE:
     keyfile-decrypt                     Déchiffre le keyfile (v2 → v1, ⚠️ clair)
     keyfile-info                        Affiche les métadonnées sans déchiffrer
 
-SÉCURITÉ:
-    La passphrase peut être fournie via $SANGO_WALLET_PASSPHRASE
-    (recommandé : utiliser le prompt interactif).
+FORMATS DE KEYFILE (auto-détectés) :
+    V1   seed Ed25519 en clair (legacy)
+    V2   seed Ed25519 chiffrée (Argon2id + ChaCha20-Poly1305)
+    V3   mnemonic BIP-39 chiffrée + dérivation HD multi-chain
+         (Sango natif : m/44'/100001'/0'/0'/N'
+          EVM         : m/44'/60'/0'/0/N)
+
+SÉCURITÉ — DEUX SECRETS DISTINCTS :
+    • Keyfile password   : chiffre/déchiffre le keyfile (V2/V3).
+                           Fourni via $SANGO_WALLET_PASSPHRASE ou prompt.
+    • BIP-39 passphrase  : 25ᵉ mot, participe à la dérivation (V3).
+                           Prompt interactif uniquement. Jamais d'env var.
+
+    Ne JAMAIS passer ces secrets en argument CLI.
+
+OPTION --account :
+    --account N               Index de compte HD (défaut 0).
+                              Supporté par : address, pubkey, balance,
+                              nonce, history, send, stake, unstake,
+                              delegate, undelegate, claim,
+                              register-validator, update-commission,
+                              unjail, evm-address, evm-balance,
+                              evm-nonce, evm-sign.
+                              Refusé (erreur explicite) sur les formats
+                              V1/V2 pour N > 0 : une seed unique.
 
 OPTIONS GLOBALES:
     --rpc URL                 Endpoint RPC (défaut : 127.0.0.1:8545)

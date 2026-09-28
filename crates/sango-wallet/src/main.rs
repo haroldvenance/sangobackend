@@ -76,9 +76,20 @@ fn run(args: &[String]) -> Result<(), WalletError> {
         "pubkey",
         "balance",
         "nonce",
+        "history",
+        "send",
+        "stake",
+        "unstake",
+        "delegate",
+        "undelegate",
+        "claim",
+        "register-validator",
+        "update-commission",
+        "unjail",
         "evm-address",
         "evm-balance",
         "evm-nonce",
+        "evm-sign",
     ];
     let account = if ACCOUNT_COMMANDS.contains(&cmd.as_str()) {
         parse_account_flag(&rest)?
@@ -97,16 +108,16 @@ fn run(args: &[String]) -> Result<(), WalletError> {
         "balance" => cmd_balance(&rpc, kf_path, &rest, account),
         "nonce" => cmd_nonce(&rpc, kf_path, &rest, account),
         "info" => cmd_info(&rpc),
-        "history" => cmd_history(&rpc, kf_path, &rest),
-        "send" => cmd_send(&rpc, kf_path, &rest),
-        "stake" => cmd_stake(&rpc, kf_path, &rest),
-        "unstake" => cmd_unstake(&rpc, kf_path, &rest),
-        "delegate" => cmd_delegate(&rpc, kf_path, &rest),
-        "undelegate" => cmd_undelegate(&rpc, kf_path, &rest),
-        "claim" => cmd_claim(&rpc, kf_path, &rest),
-        "register-validator" => cmd_register(&rpc, kf_path, &rest),
-        "update-commission" => cmd_update_commission(&rpc, kf_path, &rest),
-        "unjail" => cmd_unjail(&rpc, kf_path, &rest),
+        "history" => cmd_history(&rpc, kf_path, &rest, account),
+        "send" => cmd_send(&rpc, kf_path, &rest, account),
+        "stake" => cmd_stake(&rpc, kf_path, &rest, account),
+        "unstake" => cmd_unstake(&rpc, kf_path, &rest, account),
+        "delegate" => cmd_delegate(&rpc, kf_path, &rest, account),
+        "undelegate" => cmd_undelegate(&rpc, kf_path, &rest, account),
+        "claim" => cmd_claim(&rpc, kf_path, &rest, account),
+        "register-validator" => cmd_register(&rpc, kf_path, &rest, account),
+        "update-commission" => cmd_update_commission(&rpc, kf_path, &rest, account),
+        "unjail" => cmd_unjail(&rpc, kf_path, &rest, account),
 
         // --- EVM ---
         "evm-new" => cmd_evm_new(kf_path),
@@ -114,7 +125,7 @@ fn run(args: &[String]) -> Result<(), WalletError> {
         "evm-balance" => cmd_evm_balance(&rpc, kf_path, &rest, account),
         "evm-nonce" => cmd_evm_nonce(&rpc, kf_path, &rest, account),
         "evm-call" => cmd_evm_call(&rpc, &rest),
-        "evm-sign" => cmd_evm_sign(&rpc, kf_path, &rest),
+        "evm-sign" => cmd_evm_sign(&rpc, kf_path, &rest, account),
 
         // --- Gestion du keyfile ---
         "keyfile-encrypt" => cmd_keyfile_encrypt(kf_path),
@@ -296,8 +307,9 @@ fn cmd_history(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
-    let addr = resolve_address(keyfile_path, args, 0)?;
+    let addr = resolve_address(keyfile_path, args, account)?;
 
     let mut limit: u32 = 20;
     let mut offset: u32 = 0;
@@ -386,6 +398,7 @@ fn cmd_send(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
     let flags = parse_flags(args)?;
     let to = parse_address_arg(&require_flag(&flags, "to")?)?;
@@ -393,6 +406,7 @@ fn cmd_send(
     submit_tx(
         rpc,
         keyfile_path,
+        account,
         TxParams {
             chain_id: Default::default(),
             nonce: 0,
@@ -411,12 +425,14 @@ fn cmd_stake(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
     let flags = parse_flags(args)?;
     let amount = parse_sango_decimal(&require_flag(&flags, "amount")?)?;
     submit_tx(
         rpc,
         keyfile_path,
+        account,
         TxParams {
             chain_id: Default::default(),
             nonce: 0,
@@ -435,12 +451,14 @@ fn cmd_unstake(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
     let flags = parse_flags(args)?;
     let amount = parse_sango_decimal(&require_flag(&flags, "amount")?)?;
     submit_tx(
         rpc,
         keyfile_path,
+        account,
         TxParams {
             chain_id: Default::default(),
             nonce: 0,
@@ -459,6 +477,7 @@ fn cmd_delegate(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
     let flags = parse_flags(args)?;
     let validator = parse_address_arg(&require_flag(&flags, "validator")?)?;
@@ -466,6 +485,7 @@ fn cmd_delegate(
     submit_tx(
         rpc,
         keyfile_path,
+        account,
         TxParams {
             chain_id: Default::default(),
             nonce: 0,
@@ -484,6 +504,7 @@ fn cmd_undelegate(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
     let flags = parse_flags(args)?;
     let validator = parse_address_arg(&require_flag(&flags, "validator")?)?;
@@ -491,6 +512,7 @@ fn cmd_undelegate(
     submit_tx(
         rpc,
         keyfile_path,
+        account,
         TxParams {
             chain_id: Default::default(),
             nonce: 0,
@@ -509,12 +531,14 @@ fn cmd_claim(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
     let flags = parse_flags(args)?;
     let validator = parse_address_arg(&require_flag(&flags, "validator")?)?;
     submit_tx(
         rpc,
         keyfile_path,
+        account,
         TxParams {
             chain_id: Default::default(),
             nonce: 0,
@@ -533,6 +557,7 @@ fn cmd_register(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
     let flags = parse_flags(args)?;
     let commission_bps: u32 = require_flag(&flags, "commission-bps")?
@@ -544,6 +569,7 @@ fn cmd_register(
     submit_tx(
         rpc,
         keyfile_path,
+        account,
         TxParams {
             chain_id: Default::default(),
             nonce: 0,
@@ -562,6 +588,7 @@ fn cmd_update_commission(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
     let flags = parse_flags(args)?;
     let new_bps: u32 = require_flag(&flags, "new-bps")?
@@ -572,6 +599,7 @@ fn cmd_update_commission(
     submit_tx(
         rpc,
         keyfile_path,
+        account,
         TxParams {
             chain_id: Default::default(),
             nonce: 0,
@@ -590,11 +618,13 @@ fn cmd_unjail(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
     let _flags = parse_flags(args)?;
     submit_tx(
         rpc,
         keyfile_path,
+        account,
         TxParams {
             chain_id: Default::default(),
             nonce: 0,
@@ -735,6 +765,7 @@ fn cmd_evm_sign(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
     let flags = parse_flags(args)?;
     let to_str = require_flag(&flags, "to")?;
@@ -747,8 +778,10 @@ fn cmd_evm_sign(
         None => Vec::new(),
     };
 
-    let kf = KeyFile::load(keyfile_path)?;
-    let kp = kf.evm_keypair()?;
+    let lk = load_keyfile(keyfile_path, true)?;
+    let kp = lk
+        .any
+        .evm_keypair(account, lk.bip39_passphrase.as_deref())?;
     let addr = kp.address();
 
     // Chain ID EVM.
@@ -1128,22 +1161,26 @@ fn parse_u256_flag(flags: &[(String, String)], name: &str) -> Option<U256> {
 fn submit_tx(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
+    account: u32,
     mut params: TxParams,
 ) -> Result<(), WalletError> {
-    let kf = KeyFile::load(keyfile_path)?;
+    let lk = load_keyfile(keyfile_path, true)?;
+    let kp = lk
+        .any
+        .sango_keypair(account, lk.bip39_passphrase.as_deref())?;
+    let addr = lk.any.address(account, lk.bip39_passphrase.as_deref())?;
 
     params.chain_id = fetch_chain_id(rpc)?;
-    let addr = kf.address()?;
     let (nonce, _, onchain_pk) = fetch_account(rpc, &addr)?;
     params.nonce = nonce;
 
     let declare_pk = if onchain_pk.is_none() {
-        Some(kf.public_key()?)
+        Some(kp.public_key())
     } else {
         None
     };
 
-    let tx = params.build_and_sign(&kf, declare_pk)?;
+    let tx = params.build_and_sign_with_keypair(&kp, addr, declare_pk);
     let tx_hash = send_transaction(rpc, &tx)?;
     println!("✓ Transaction envoyée");
     println!("  Hash : {tx_hash}");

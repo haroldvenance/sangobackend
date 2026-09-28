@@ -128,6 +128,36 @@ pub struct TxParams {
 }
 
 impl TxParams {
+    /// Construit et signe la transaction à partir d'un `NativeKeypair`
+    /// + adresse explicites.
+    ///
+    /// Variante bas niveau pour les wallets V3 (dérivation HD) où la
+    /// clé privée n'est pas matérialisée dans un `KeyFile`.
+    pub fn build_and_sign_with_keypair(
+        self,
+        kp: &sango_crypto::NativeKeypair,
+        sender: NativeAddress,
+        declare_public_key: Option<PublicKey>,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            version: sango_types::PROTOCOL_VERSION_V1,
+            chain_id: self.chain_id,
+            nonce: self.nonce,
+            sender,
+            public_key: declare_public_key,
+            gas_limit: self.gas_limit,
+            max_fee: self.max_fee,
+            priority_fee: self.priority_fee,
+            value: self.value,
+            tx_kind: self.tx_kind,
+            recipient: self.recipient,
+            data: self.data,
+            signature: Signature::ZERO,
+        };
+        tx = tx.sign(kp);
+        tx
+    }
+
     /// Construit et signe la transaction.
     ///
     /// `declare_public_key` est `Some(pk)` si le compte n'a pas encore de

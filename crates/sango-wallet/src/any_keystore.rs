@@ -49,6 +49,30 @@ pub enum AnyKeyFile {
 }
 
 impl AnyKeyFile {
+    /// Lit uniquement le champ `version` du fichier, sans le déchiffrer.
+    ///
+    /// Utile à la CLI pour décider si un prompt KDF est nécessaire
+    /// **avant** d'appeler [`Self::load`].
+    pub fn peek_version(path: &Path) -> Result<KeyFileVersion, WalletError> {
+        let bytes = std::fs::read(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                WalletError::KeyfileNotFound(path.display().to_string())
+            } else {
+                WalletError::Io(e)
+            }
+        })?;
+        let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let v = raw.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+        match v {
+            1 => Ok(KeyFileVersion::V1),
+            2 => Ok(KeyFileVersion::V2),
+            3 => Ok(KeyFileVersion::V3),
+            other => Err(WalletError::InvalidKeyfile(format!(
+                "unsupported version: {other}"
+            ))),
+        }
+    }
+
     /// Charge un keyfile en détectant sa version.
     ///
     /// ## Paramètres
