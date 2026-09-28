@@ -296,7 +296,7 @@ m_cost	65536 KiB (64 MiB)	OWASP 2024
 t_cost	3	OWASP 2024
 p_cost	4	défaut
 output_len	32 bytes	longueur de clé ChaCha20
-salt_len	32 bytes	aléatoire, non secret
+salt_len	16 bytes	aléatoire, non secret (aligné sur `crypto::SALT_LEN` V2/V3) |
 
 Le sel est généré par OsRng (crate rand_core avec feature getrandom).
 Un sel unique par keyfile, jamais réutilisé, jamais dérivé de
@@ -385,7 +385,7 @@ Input :
   password    = "correct horse battery staple"
   mnemonic    = "abandon abandon … about"  (12 mots, test vector BIP-39)
   passphrase  = "" (vide, donc bip39_passphrase_used = false)
-  salt        = 0x000102…1f (32 bytes, fixés pour le test)
+  salt        = 0x000102…0f (16 bytes, fixés pour le test)
   nonce       = 0x000102…0b (12 bytes, fixés pour le test)
   label       = "test-wallet"
   created_at  = 1700000000
