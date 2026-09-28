@@ -19,7 +19,7 @@ pub mod hash;
 pub mod hd;
 pub mod mnemonic;
 
-pub use address::derive_native_address;
+pub use address::{derive_native_address, evm_checksum_hex};
 pub use bech32m::{
     decode_native_address, encode_native_address, try_decode_any_network, Bech32mError, Network,
 };
