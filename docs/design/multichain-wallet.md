@@ -1,7 +1,6 @@
-
 # Design — Wallet multi-chain Sango (V2)
 
-- **Statut** : proposition, v0.2
+- **Statut** : **validé — W1 fermé**, v0.2.1
 - **Auteur** : équipe backend Sango
 - **Date** : 2026-09-28
 - **Impact** : `sango-crypto`, `sango-wallet`, frontend
@@ -111,8 +110,10 @@ Crates :
     BIP-32 : bip32 (rust-bitcoin).
 
     SLIP-0010 : slip10 (crate autonome) ou implémentation locale basée
-    sur hmac + sha2 + ed25519-dalek. Décision à figer en W3,
-    après revue des deux.
+    sur hmac + sha2 + ed25519-dalek. Décision : slip10 d'abord,
+    revue formelle en début de W3. Si le crate amont ne satisfait pas la
+    revue (maintenance, qualité, golden vectors), bascule sur
+    implémentation locale.
 
 D3 — Chemins de dérivation par chaîne
 
@@ -177,21 +178,18 @@ Règles absolues :
     lancé avec --network mainnet|testnet|devnet. Le coin type effectif
     dépend de cette configuration. Pas de fallback silencieux.
 
-    Une fois le coin type mainnet attribué (via SLIP-0044 ou décision
-    collégiale), il est immuable. Toute PR ultérieure qui tenterait de
-    le changer doit être rejetée en bloc.
+    Une fois le coin type mainnet attribué, il est immuable. Toute
+    PR ultérieure qui tenterait de le changer doit être rejetée en bloc.
 
 Stratégie d'obtention du coin type mainnet :
 
-Option A (long terme, recommandée) : ouvrir une PR SLIP-0044 une
+Option A (long terme, retenue) : ouvrir une PR SLIP-0044 une
 fois le testnet public stable. Délai : plusieurs semaines/mois, hors de
 notre contrôle. Une fois attribué, on fige.
 
-Option B (repli si SLIP-0044 bloque) : décision collégiale d'utiliser
-un coin type dans une zone non conflictuelle, documenté publiquement.
-
-Recommandation : A en priorité. B seulement si SLIP-0044 refuse ou
-traîne indéfiniment.
+Option B (repli) : décision collégiale d'utiliser un coin type dans
+une zone non conflictuelle, documenté publiquement. Utilisée seulement
+si SLIP-0044 refuse ou traîne indéfiniment.
 
 Note : le coin type n'apparaît jamais dans une transaction ou
 dans le protocole. C'est purement local au wallet. Aucun impact
@@ -233,8 +231,11 @@ Justification :
     Garder la mnemonic permet de changer de passphrase, de re-dériver
     à volonté, de vérifier la saisie utilisateur.
 
-    Le seed est re-dérivable depuis (mnemonic, passphrase), mais l'inverse
-    est faux (PBKDF2 n'est pas inversible).
+    La transformation (mnemonic, passphrase) → seed est déterministe
+    et reproductible : les mêmes entrées produisent toujours le même
+    seed. Elle n'est pas réversible : à partir du seed seul, on ne
+    peut retrouver ni la mnemonic ni la passphrase. C'est cette asymétrie
+    qui justifie de conserver la mnemonic comme secret canonique.
 
 Représentation :
 rust
@@ -371,6 +372,10 @@ meta. Un attaquant peut lire ces métadonnées, ce qui est acceptable
 (elles n'aident pas à casser le chiffrement).
 
 Champs chiffrés : uniquement ciphertext_hex.
+
+Format retenu : JSON canonique. Justification : inspectable,
+versionnable, testable byte-à-byte, portable Rust ↔ TypeScript/WASM.
+Le secret reste entièrement dans ciphertext_hex.
 D7.5 — Golden vector V6 (keyfile V3 complet)
 
 Obligatoire en W4. Vecteur figé :
@@ -423,43 +428,43 @@ Séparation backend / frontend
 Décision : frontière stricte, contrats explicites.
 text
 
-┌─────────────────────────────────────────────────────┐
-│ Backend / wallet-core (Rust, sango-crypto + sango-wallet) │
-│                                                       │
-│  Produit :                                            │
-│    • mnemonic BIP-39 (génération, validation)         │
-│    • dérivation BIP-32 / SLIP-0010                    │
-│    • keyfile V3 (spec D7)                             │
-│    • signatures Ed25519 (Sango natif)                 │
-│    • signatures secp256k1 (EVM)                       │
-│    • golden vectors CI                                │
-│                                                       │
-│  Contrats exposés au frontend :                       │
-│    • créer une mnemonic  → [String]                   │
-│    • valider une mnemonic → bool                      │
-│    • dériver adresse Sango à l'index N → "tsango1…"   │
-│    • dériver adresse EVM à l'index N  → "0x…"         │
-│    • signer tx native → bytes                         │
-│    • signer tx EVM    → bytes                         │
-│    • créer un keyfile V3 → bytes JSON                 │
-│    • ouvrir un keyfile V3 → WalletV3                  │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│ Backend / wallet-core (Rust, sango-crypto + sango-wallet)   │
+│                                                              │
+│  Produit :                                                   │
+│    • mnemonic BIP-39 (génération, validation)                │
+│    • dérivation BIP-32 / SLIP-0010                           │
+│    • keyfile V3 (spec D7)                                    │
+│    • signatures Ed25519 (Sango natif)                        │
+│    • signatures secp256k1 (EVM)                              │
+│    • golden vectors CI                                       │
+│                                                              │
+│  Contrats exposés au frontend :                              │
+│    • créer une mnemonic  → [String]                          │
+│    • valider une mnemonic → bool                             │
+│    • dériver adresse Sango à l'index N → "tsango1…"          │
+│    • dériver adresse EVM à l'index N  → "0x…"                │
+│    • signer tx native → bytes                                │
+│    • signer tx EVM    → bytes                                │
+│    • créer un keyfile V3 → bytes JSON                        │
+│    • ouvrir un keyfile V3 → WalletV3                         │
+└─────────────────────────────────────────────────────────────┘
                        │
                        ▼
-┌─────────────────────────────────────────────────────┐
-│ Frontend (TypeScript)                                 │
-│                                                       │
-│  Possède :                                            │
-│    • UX onboarding mnemonic (affichage, vérification) │
-│    • UX import / restore                              │
-│    • UX verrouillage / déverrouillage                 │
-│    • préférences utilisateur                          │
-│    • affichage des comptes                            │
-│                                                       │
-│  Ne possède PAS :                                     │
-│    • d'implémentation cryptographique                 │
-│    • de copie de la logique de dérivation             │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│ Frontend (TypeScript)                                        │
+│                                                              │
+│  Possède :                                                   │
+│    • UX onboarding mnemonic (affichage, vérification)        │
+│    • UX import / restore                                     │
+│    • UX verrouillage / déverrouillage                        │
+│    • préférences utilisateur                                 │
+│    • affichage des comptes                                   │
+│                                                              │
+│  Ne possède PAS :                                            │
+│    • d'implémentation cryptographique                        │
+│    • de copie de la logique de dérivation                    │
+└─────────────────────────────────────────────────────────────┘
 
 Règles :
 
@@ -575,7 +580,7 @@ partagent m/44'/60'/… : pas de travail supplémentaire, juste un
 RPC différent.
 Plan d'implémentation
 Étape	Contenu	Effort	Bloqueur
-W1	Design doc (v0.1 → v0.2)	2h	—
+W1	Design doc (v0.1 → v0.2.1)	2h	—
 W2	sango-crypto::mnemonic (BIP-39) + V1	4h	W1
 W3	sango-crypto::hd (BIP-32 + SLIP-0010) + V2, V3	6h	W2
 W4	keyfile V3 + CLI + golden V4A/B/C, V6	8h	W3
@@ -585,21 +590,20 @@ W6	Frontend onboarding mnemonic	1 sem	W5
 Total backend : ~24h.
 
 Contrainte globale : aucune implémentation W2–W6 avant validation de
-W1 (ce doc, v0.2). Aucun développement frontend V3 avant W5 vert.
-Points ouverts à trancher
+W1 (ce doc, v0.2.1). Aucun développement frontend V3 avant W5 vert.
+Décisions W1 (fermées)
 
-    Stratégie coin type mainnet : SLIP-0044 (Option A) ou décision
-    collégiale (Option B) ? Décision W1, avant tout wallet mainnet.
+Les 5 points ouverts ont été tranchés en revue de W1.
+#	Point	Décision	Notes
+1	Coin type mainnet	SLIP-0044 en priorité (Option A)	PR ouverte dès le testnet public stable. Repli collégial (Option B) uniquement si SLIP-0044 refuse ou traîne indéfiniment.
+2	Crate SLIP-0010	slip10 d'abord, revue avant adoption	Si le crate amont ne satisfait pas la revue (maintenance, qualité, golden vectors), bascule sur implémentation locale hmac + sha2 + ed25519-dalek. Revue formelle en début de W3.
+3	Support 12 vs 24 mots	Les deux, 24 par défaut	24 recommandé par l'UI, 12 accepté pour compatibilité. La validation BIP-39 accepte indifféremment.
+4	Format keyfile V3	JSON canonique	Format inspectable, portable Rust ↔ TS/WASM, byte-à-byte testable. Le secret reste entièrement dans ciphertext_hex (spec D7.4).
+5	Auto-détection CLI	Oui, pas de flag --format	Le champ version en clair est lu au chargement, le parser est choisi automatiquement. Un flag explicite serait une source d'erreur (mismatch silencieux).
 
-    Crate SLIP-0010 : slip10 ou implémentation locale ? Revue en
-    W3.
-
-    Support 12 vs 24 mots : les deux, avec 24 recommandé par défaut.
-
-    Format keyfile V3 : JSON (proposé en D7.4) vs binaire.
-
-    Auto-détection CLI : oui (proposé), pas de flag --format.
-
+Ces décisions sont verrouillées : toute modification ultérieure
+nécessite un nouveau passage en revue W1 et une mise à jour de ce
+document.
 Références
 
     BIP-32 — HD Wallets
@@ -629,26 +633,7 @@ Références
 Historique
 Date	Version	Changement
 2026-09-28	0.1	Version initiale
-2026-09-28	0.2	Intègre les retours de revue :
-— D4 : règles strictes par réseau, mainnet TBD, aucun wallet V3 mainnet avant décision
-— D6 (nouveau) : représentation en mémoire = mnemonic + passphrase (pas seed)
-— D7 (nouveau) : spécification cryptographique complète du keyfile V3 (Argon2id + ChaCha20-Poly1305 + golden vector V6)
-— D3 : clarification explicite « tous les niveaux Ed25519 hardened » pour Sango et Solana, avec golden vector interop Phantom
-— Section « Séparation backend / frontend » ajoutée
-EOF		
-
-echo "✓ docs/design/multichain-wallet.md → v0.2"
-wc -l docs/design/multichain-wallet.md
-text
-
-
-## Ce qui a changé en v0.2
-
-| # | Retour reçu | Traitement |
-|---|---|---|
-| 1 | Coin type strict par réseau | **D4 réécrite.** Tableau `Devnet=100001 / Testnet=100001 / Mainnet=TBD`. Règle : aucun wallet V3 mainnet tant que `TBD`. Binaire mainnet **refuse** `100001` par défaut. |
-| 2 | `WalletV3` ne stocke pas le seed | **D6 ajoutée.** `mnemonic: Zeroizing<String>` + `passphrase: Option<Zeroizing<String>>`. Dérivation à la demande, `bip39_seed()` privé. |
-| 3 | Spec crypto keyfile V3 | **D7 ajoutée** (7.1 → 7.5). Argon2id `m=64MiB, t=3, p=4`, ChaCha20-Poly1305 IETF, AAD, format JSON complet, golden vector V6. |
-| 4 | Contradiction SOL/SLIP-0010 | **D3 clarifiée.** Section « Règle hardened » explicite : `m/44'/501'/0'/0'` = 4 niveaux tous hardened. Golden vector V4C interop Phantom obligatoire. |
-| 5 | Séparation backend/frontend | **Section ajoutée.** Contrats exposés vs possédés. Règle : aucun dev frontend V3 avant W5. |
-| 6 | Paramètres frontend | Note ajoutée : « Paramètres » = conteneur, « Préférences » séparé de « Sécurité / Wallet ». |
+2026-09-28	0.2	Intègre les retours de revue : D4 règles strictes par réseau, D6 (mnemonic en mémoire), D7 (spec keyfile), clarification D3 hardened, section séparation backend/frontend
+2026-09-28	0.2.1	Corrections finales + fermeture des points ouverts :
+— D6 : « réversible » remplacé par « déterministe et reproductible », précise que seed → mnemonic est impossible
+— Section « Décisions W1 (fermées) » : SLIP-0044, slip10, 12+24 (24 par défaut), JSON canonique, auto-détection CLI
