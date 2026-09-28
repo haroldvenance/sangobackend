@@ -1,0 +1,5 @@
+{
+  "rpc_url": "http://node-0:8545",
+  "listen_addr": "0.0.0.0:8090",
+  "network_name": "Sango Devnet (docker)"
+}

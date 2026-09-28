@@ -1,0 +1,32 @@
+# --- Build stage ------------------------------------------------------------
+FROM rust:1.83-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang \
+        libclang-dev \
+        cmake \
+        pkg-config \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+COPY examples/ ./examples/
+
+RUN cargo build --release -p sango-explorer
+
+# --- Runtime stage ----------------------------------------------------------
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/sango-explorer /usr/local/bin/sango-explorer
+
+WORKDIR /work
+
+ENTRYPOINT ["sango-explorer"]

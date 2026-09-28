@@ -1,0 +1,184 @@
+# Sango — devnet 4 validateurs + faucet + explorer.
+#
+# Usage :
+#   docker compose --env-file .env up -d       # (si .env existe)
+#   docker compose up -d                       # sinon, defaults du fichier
+#   docker compose logs -f node-0
+#   docker compose down                        # stoppe, garde les données
+#   docker compose down -v                     # stoppe + efface les volumes
+
+services:
+  # -------- Validateurs ----------------------------------------------------
+  node-0:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.node
+    image: sango-node:dev
+    container_name: sango-node-0
+    restart: unless-stopped
+    command:
+      - --config
+      - /configs/node-0.json
+      - --data-dir
+      - /data
+      - --rpc-addr
+      - 0.0.0.0:8545
+      - --p2p-listen
+      - /ip4/0.0.0.0/udp/9000/quic-v1
+      - --mdns
+    ports:
+      - "${NODE_0_RPC_PORT:-8545}:8545"
+      - "${NODE_0_P2P_PORT:-9000}:9000/udp"
+    volumes:
+      - ./configs/devnet-4v/node-0.json:/configs/node-0.json:ro
+      - node-0-data:/data
+    networks:
+      - sango-devnet
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          curl -sf -X POST
+          -H 'Content-Type: application/json'
+          -d '{"jsonrpc":"2.0","method":"sango_blockNumber","params":[],"id":1}'
+          http://127.0.0.1:8545/rpc > /dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  node-1:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.node
+    image: sango-node:dev
+    container_name: sango-node-1
+    restart: unless-stopped
+    depends_on:
+      - node-0
+    command:
+      - --config
+      - /configs/node-1.json
+      - --data-dir
+      - /data
+      - --rpc-addr
+      - 0.0.0.0:8545
+      - --p2p-listen
+      - /ip4/0.0.0.0/udp/9001/quic-v1
+      - --mdns
+    ports:
+      - "${NODE_1_RPC_PORT:-8555}:8545"
+      - "${NODE_1_P2P_PORT:-9001}:9001/udp"
+    volumes:
+      - ./configs/devnet-4v/node-1.json:/configs/node-1.json:ro
+      - node-1-data:/data
+    networks:
+      - sango-devnet
+
+  node-2:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.node
+    image: sango-node:dev
+    container_name: sango-node-2
+    restart: unless-stopped
+    depends_on:
+      - node-0
+    command:
+      - --config
+      - /configs/node-2.json
+      - --data-dir
+      - /data
+      - --rpc-addr
+      - 0.0.0.0:8545
+      - --p2p-listen
+      - /ip4/0.0.0.0/udp/9002/quic-v1
+      - --mdns
+    ports:
+      - "${NODE_2_RPC_PORT:-8565}:8545"
+      - "${NODE_2_P2P_PORT:-9002}:9002/udp"
+    volumes:
+      - ./configs/devnet-4v/node-2.json:/configs/node-2.json:ro
+      - node-2-data:/data
+    networks:
+      - sango-devnet
+
+  node-3:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.node
+    image: sango-node:dev
+    container_name: sango-node-3
+    restart: unless-stopped
+    depends_on:
+      - node-0
+    command:
+      - --config
+      - /configs/node-3.json
+      - --data-dir
+      - /data
+      - --rpc-addr
+      - 0.0.0.0:8545
+      - --p2p-listen
+      - /ip4/0.0.0.0/udp/9003/quic-v1
+      - --mdns
+    ports:
+      - "${NODE_3_RPC_PORT:-8575}:8545"
+      - "${NODE_3_P2P_PORT:-9003}:9003/udp"
+    volumes:
+      - ./configs/devnet-4v/node-3.json:/configs/node-3.json:ro
+      - node-3-data:/data
+    networks:
+      - sango-devnet
+
+  # -------- Faucet ---------------------------------------------------------
+  faucet:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.faucet
+    image: sango-faucet:dev
+    container_name: sango-faucet
+    restart: unless-stopped
+    depends_on:
+      node-0:
+        condition: service_healthy
+    command:
+      - --config
+      - /configs/faucet.json
+    ports:
+      - "${FAUCET_PORT:-3001}:3001"
+    volumes:
+      - ./configs/faucet.json:/configs/faucet.json:ro
+    networks:
+      - sango-devnet
+
+  # -------- Explorer -------------------------------------------------------
+  explorer:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.explorer
+    image: sango-explorer:dev
+    container_name: sango-explorer
+    restart: unless-stopped
+    depends_on:
+      node-0:
+        condition: service_healthy
+    command:
+      - --config
+      - /configs/explorer.json
+    ports:
+      - "${EXPLORER_PORT:-8090}:8090"
+    volumes:
+      - ./configs/explorer.json:/configs/explorer.json:ro
+    networks:
+      - sango-devnet
+
+networks:
+  sango-devnet:
+    driver: bridge
+
+volumes:
+  node-0-data:
+  node-1-data:
+  node-2-data:
+  node-3-data:
