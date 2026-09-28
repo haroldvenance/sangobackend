@@ -603,7 +603,7 @@ fn build_aad(v2: &RawV2) -> Vec<u8> {
     aad
 }
 
-fn hex_to_fixed<const N: usize>(s: &str, field: &str) -> Result<[u8; N], WalletError> {
+pub(crate) fn hex_to_fixed<const N: usize>(s: &str, field: &str) -> Result<[u8; N], WalletError> {
     let bytes = hex::decode(s)?;
     if bytes.len() != N {
         return Err(WalletError::InvalidKeyfile(format!(
@@ -616,7 +616,7 @@ fn hex_to_fixed<const N: usize>(s: &str, field: &str) -> Result<[u8; N], WalletE
     Ok(out)
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), WalletError> {
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), WalletError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

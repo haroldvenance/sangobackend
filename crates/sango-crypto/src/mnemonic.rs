@@ -143,22 +143,22 @@ impl Mnemonic {
         Zeroizing::new(bip.to_seed(pass))
     }
 
-    /// Accès brut à la mnemonic (usage interne pour chiffrement V3).
+    /// Retourne une copie **effaçable** de la mnemonic.
     ///
-    /// **`pub(crate)`** : réservé au code interne de `sango-crypto`.
-    /// Pour un accès depuis `sango-wallet` (W4), une API dédiée sera
-    /// ajoutée avec audit des call-sites, plutôt que d'exposer la
-    /// mnemonic en clair publiquement.
+    /// ## Sensibilité
     ///
-    /// **Pourquoi `#[allow(dead_code)]`** : cette méthode est
-    /// introduite en W2 mais son premier appelant réel vit en W4
-    /// (chiffrement du keyfile V3). Sans l'annotation, `clippy
-    /// -D warnings` refuse la compilation. À retirer en W4 dès que
-    /// le chiffrement consomme la méthode.
+    /// Le résultat expose le secret en clair. Réservé aux usages
+    /// **audités** :
+    ///
+    /// - chiffrement du keyfile V3 (W4) ;
+    /// - affichage explicite de la mnemonic (commande `export-mnemonic`).
+    ///
+    /// Toute autre utilisation doit être justifiée et documentée.
+    /// Le buffer retourné est un [`Zeroizing<String>`] : il est effacé
+    /// au `Drop`.
     #[must_use]
-    #[allow(dead_code)]
-    pub(crate) fn as_str(&self) -> &str {
-        self.inner.as_str()
+    pub fn expose(&self) -> Zeroizing<String> {
+        Zeroizing::new(self.inner.as_str().to_string())
     }
 }
 
@@ -192,7 +192,7 @@ mod tests {
     fn generate_is_random() {
         let a = Mnemonic::generate(MnemonicLength::Words12).unwrap();
         let b = Mnemonic::generate(MnemonicLength::Words12).unwrap();
-        assert_ne!(a.as_str(), b.as_str());
+        assert_ne!(a.expose().as_str(), b.expose().as_str());
     }
 
     // --- Parsing -----------------------------------------------------------
@@ -200,17 +200,17 @@ mod tests {
     #[test]
     fn parse_roundtrip() {
         let m = Mnemonic::generate(MnemonicLength::Words12).unwrap();
-        let s = m.as_str().to_string();
+        let s = m.expose().as_str().to_string();
         let m2 = Mnemonic::parse(&s).unwrap();
-        assert_eq!(m.as_str(), m2.as_str());
+        assert_eq!(m.expose().as_str(), m2.expose().as_str());
     }
 
     #[test]
     fn parse_extra_whitespace_is_tolerated() {
         let m = Mnemonic::generate(MnemonicLength::Words12).unwrap();
-        let s = format!("  {}  ", m.as_str());
+        let s = format!("  {}  ", m.expose().as_str());
         let m2 = Mnemonic::parse(&s).unwrap();
-        assert_eq!(m.as_str(), m2.as_str());
+        assert_eq!(m.expose().as_str(), m2.expose().as_str());
     }
 
     #[test]

@@ -318,6 +318,52 @@ impl KeyFileV3 {
         write_json_atomic(path.as_ref(), &raw)
     }
 
+    /// **Test uniquement** : construit le JSON V3 avec salt et nonce
+    /// fournis, sans écrire sur disque.
+    ///
+    /// Utilisé par les golden vectors V6 (byte-à-byte). La production
+    /// passe par [`Self::write`], qui génère salt/nonce via `OsRng`.
+    #[cfg(test)]
+    pub(crate) fn build_json_with_salt_nonce(
+        &self,
+        kdf_passphrase: &[u8],
+        salt: [u8; SALT_LEN],
+        nonce: [u8; NONCE_LEN],
+    ) -> Result<Vec<u8>, WalletError> {
+        let plain = PlaintextV3 {
+            mnemonic: self.wallet.mnemonic_owned().as_str().to_string(),
+            bip39_passphrase_used: self.wallet.passphrase_used(),
+            next_account_index: self.next_account_index,
+        };
+        let mut plaintext_bytes = zeroize::Zeroizing::new(serde_json::to_vec(&plain)?);
+
+        let blob = crate::crypto::encrypt_with_salt_nonce(
+            &plaintext_bytes,
+            kdf_passphrase,
+            KEYFILE_V3_AAD,
+            &self.kdf_params,
+            salt,
+            nonce,
+        )?;
+        plaintext_bytes.zeroize();
+
+        let raw = RawV3 {
+            version: 3,
+            created_at: self.created_at,
+            kdf: "argon2id".into(),
+            kdf_params: RawKdfParams {
+                m_cost_kib: self.kdf_params.m_cost_kib,
+                t_cost: self.kdf_params.t_cost,
+                p_cost: self.kdf_params.p_cost,
+                salt_hex: hex::encode(blob.salt),
+            },
+            cipher: "chacha20poly1305".into(),
+            nonce_hex: hex::encode(blob.nonce),
+            ciphertext_hex: hex::encode(&blob.ciphertext),
+        };
+        Ok(serde_json::to_vec_pretty(&raw)?)
+    }
+
     /// Retourne une copie effaçable de la mnemonic.
     ///
     /// Usage : commande CLI `export-mnemonic`, tests.
@@ -530,5 +576,157 @@ mod tests {
         let s = format!("{kf:?}");
         assert!(s.contains("redacted"));
         assert!(!s.contains("abandon"));
+    }
+
+    // --- Golden V6 (keyfile V3 byte-à-byte) ------------------------------
+
+    mod golden_v6 {
+        use super::*;
+
+        /// Mot de passe KDF figé.
+        const PASSWORD: &[u8] = b"correct horse battery staple";
+
+        /// Salt Argon2id figé (16 bytes hex, sans `0x`).
+        ///
+        /// **Note** : `crypto::SALT_LEN = 16`, partagé V2/V3. Le
+        /// design doc D7.1 annonçait 32 bytes ; on aligne sur le
+        /// code (128 bits d'entropie suffisent). À corriger dans le
+        /// doc W1.
+        const SALT_HEX: &str = "000102030405060708090a0b0c0d0e0f";
+
+        /// Nonce ChaCha20 figé (12 bytes hex).
+        const NONCE_HEX: &str = "000102030405060708090a0b";
+
+        /// Timestamp figé.
+        const CREATED_AT: u64 = 1_700_000_000;
+
+        /// ⚠️ **À remplir** après la première exécution :
+        ///
+        /// ```text
+        /// cargo test -p sango-wallet golden_v6::print -- --nocapture
+        /// ```
+        ///
+        /// Copier la sortie (le JSON complet) dans cette constante.
+        /// Golden V6 complet — keyfile chiffré avec paramètres figés.
+        ///
+        /// ## Comment régénérer
+        ///
+        /// ```text
+        /// cargo test -p sango-wallet golden_v6::print -- --nocapture
+        /// ```
+        ///
+        /// Copier la sortie **sans le newline final** dans cette
+        /// constante. Toute divergence = hard fork de wallet.
+        const EXPECTED_JSON: &str = r#"{
+  "version": 3,
+  "created_at": 1700000000,
+  "kdf": "argon2id",
+  "kdf_params": {
+    "m_cost_kib": 65536,
+    "t_cost": 3,
+    "p_cost": 4,
+    "salt_hex": "000102030405060708090a0b0c0d0e0f"
+  },
+  "cipher": "chacha20poly1305",
+  "nonce_hex": "000102030405060708090a0b",
+  "ciphertext_hex": "cc2ab77434e6079cef735fd8b8ece0731467f9dd935f9a4ac4a8d56de1eeab8c7e0b7c3ebdb65ed728cb8b27b3cd6605fbb320ddde2476b9d229db1fd20a7c41f5e4b72bde7e2c1ebd2c3c535ee391af18c90804cf4c7a750942f76ecbe9c3aff78e454c27b015544f08e7818f38063d70c5b3759861adf133300ad2279617e19dc6121f7b24a07baa6c5ebbe557e535216875f0d23700151d87475864caff3fef6a36320bee998e3fb97553b5679e4843"
+}"#;
+
+        /// Construit le keyfile V6 golden.
+        fn build() -> Vec<u8> {
+            let kf = KeyFileV3 {
+                created_at: CREATED_AT,
+                kdf_params: KdfParams {
+                    m_cost_kib: 65_536,
+                    t_cost: 3,
+                    p_cost: 4,
+                },
+                next_account_index: 0,
+                bip39_passphrase_used: false,
+                wallet: WalletV3::from_mnemonic_str(TEST_MNEMONIC, None).unwrap(),
+            };
+
+            let salt_bytes = hex::decode(SALT_HEX).unwrap();
+            let mut salt = [0u8; SALT_LEN];
+            salt.copy_from_slice(&salt_bytes);
+
+            let nonce_bytes = hex::decode(NONCE_HEX).unwrap();
+            let mut nonce = [0u8; NONCE_LEN];
+            nonce.copy_from_slice(&nonce_bytes);
+
+            kf.build_json_with_salt_nonce(PASSWORD, salt, nonce)
+                .unwrap()
+        }
+
+        /// Affiche le JSON attendu (usage : remplir [`EXPECTED_JSON`]).
+        #[test]
+        fn print() {
+            let json = build();
+            let s = String::from_utf8(json).unwrap();
+            println!(
+                "
+===== V6 GOLDEN JSON (byte-à-byte) =====\n"
+            );
+            println!("{s}");
+            println!("===== FIN =====\n");
+        }
+
+        /// Vérifie que le JSON produit correspond au golden figé.
+        ///
+        /// Tant que [`EXPECTED_JSON`] n'est pas rempli, le test passe en
+        /// avertissement (mais affiche un message explicite).
+        #[test]
+        fn json_matches_golden() {
+            if EXPECTED_JSON == "PLACEHOLDER" {
+                eprintln!(
+                    "\n⚠️  EXPECTED_JSON non rempli.\
+                     \n   Lance : cargo test -p sango-wallet golden_v6::print -- --nocapture\
+                     \n   et copie la sortie dans la constante.\n"
+                );
+                return;
+            }
+            let got = String::from_utf8(build()).unwrap();
+            assert_eq!(got, EXPECTED_JSON, "V6 golden JSON mismatch");
+        }
+
+        /// Round-trip : un keyfile V6 produit par `build()` se recharge
+        /// correctement, mnemonic identique.
+        ///
+        /// Ce test passe indépendamment du golden figé.
+        #[test]
+        fn roundtrip_through_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wallet-v6.json");
+            std::fs::write(&path, build()).unwrap();
+
+            let kf = KeyFileV3::load_encrypted(&path, PASSWORD, None).unwrap();
+            assert_eq!(kf.mnemonic_owned().as_str(), TEST_MNEMONIC);
+            assert!(!kf.bip39_passphrase_used());
+            assert_eq!(kf.next_account_index, 0);
+            assert_eq!(kf.created_at, CREATED_AT);
+        }
+
+        /// Une modification d'un seul byte du ciphertext doit faire
+        /// échouer le déchiffrement (tag Poly1305).
+        #[test]
+        fn any_ciphertext_mutation_fails() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wallet-v6.json");
+
+            let mut raw: serde_json::Value = serde_json::from_slice(&build()).unwrap();
+
+            // Altérer le premier byte du ciphertext (hex).
+            let ct_hex = raw["ciphertext_hex"].as_str().unwrap().to_string();
+            let mut ct_bytes = hex::decode(&ct_hex).unwrap();
+            if !ct_bytes.is_empty() {
+                ct_bytes[0] ^= 0x01;
+            }
+            raw["ciphertext_hex"] = serde_json::json!(hex::encode(&ct_bytes));
+
+            std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+            let err = KeyFileV3::load_encrypted(&path, PASSWORD, None).unwrap_err();
+            assert!(matches!(err, WalletError::InvalidPassphrase));
+        }
     }
 }

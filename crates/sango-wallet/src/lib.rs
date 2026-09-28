@@ -39,9 +39,15 @@ pub mod crypto;
 mod error;
 pub mod evm;
 pub mod keystore;
+pub mod keystore_v3;
 pub mod rpc_client;
+pub mod wallet_v3;
 
 pub use crypto::KdfParams;
 pub use error::WalletError;
 pub use keystore::KeyFile;
+pub use keystore_v3::KeyFileV3;
 pub use rpc_client::RpcClient;
+pub use wallet_v3::{
+    evm_hd_path, sango_coin_type, sango_hd_path, WalletV3, EVM_COIN_TYPE, SANGO_COIN_TYPE_TESTNET,
+};

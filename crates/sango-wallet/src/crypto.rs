@@ -156,6 +156,53 @@ pub fn encrypt(
     })
 }
 
+/// Chiffre `plaintext` avec **salt et nonce fournis** (usage test).
+///
+/// ## Pourquoi
+///
+/// [`encrypt`] génère salt et nonce via `OsRng`, ce qui rend impossible
+/// tout golden vector byte-à-byte. Cette variante, réservée aux tests
+/// déterministes, accepte les deux en paramètres.
+///
+/// **Ne pas utiliser en production** : la sécurité de ChaCha20-Poly1305
+/// exige un nonce unique par clé. Fournir un nonce constant casserait
+/// cette garantie.
+#[cfg(test)]
+pub(crate) fn encrypt_with_salt_nonce(
+    plaintext: &[u8],
+    passphrase: &[u8],
+    aad: &[u8],
+    params: &KdfParams,
+    salt: [u8; SALT_LEN],
+    nonce: [u8; NONCE_LEN],
+) -> Result<EncryptedBlob, WalletError> {
+    if passphrase.is_empty() {
+        return Err(WalletError::EmptyPassphrase);
+    }
+
+    let mut key = derive_key(passphrase, &salt, params)?;
+
+    let cipher = ChaCha20Poly1305::new((&key).into());
+    let nonce_ga = Nonce::from_slice(&nonce);
+    let ciphertext = cipher
+        .encrypt(
+            nonce_ga,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|e| WalletError::Aead(e.to_string()))?;
+
+    key.zeroize();
+
+    Ok(EncryptedBlob {
+        salt,
+        nonce,
+        ciphertext,
+    })
+}
+
 /// Déchiffre `blob` avec `passphrase`.
 ///
 /// Retourne le plaintext, ou [`WalletError::InvalidPassphrase`] si la
