@@ -806,6 +806,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bip39"
+version = "2.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90dbd31c98227229239363921e60fcf5e558e43ec69094d46fc4996f08d1d5bc"
+dependencies = [
+ "bitcoin_hashes",
+ "rand_core 0.6.4",
+ "serde",
+ "unicode-normalization",
+ "zeroize",
+]
+
+[[package]]
 name = "bitcoin-consensus-encoding"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4462,12 +4475,18 @@ name = "sango-crypto"
 version = "0.1.0"
 dependencies = [
  "bech32",
+ "bip39",
  "ed25519-dalek",
+ "hex",
  "hex-literal",
+ "hmac",
+ "k256",
  "rand_core 0.6.4",
  "sango-primitives",
+ "sha2 0.10.9",
  "sha3 0.10.9",
  "thiserror 2.0.20",
+ "zeroize",
 ]
 
 [[package]]
@@ -5409,6 +5428,15 @@ name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-segmentation"
