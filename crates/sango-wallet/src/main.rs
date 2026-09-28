@@ -10,8 +10,10 @@ use sango_wallet::commands::{
     TxParams,
 };
 use sango_wallet::evm::{EvmTxBuilder, FeeType};
-use sango_wallet::keystore::KeyFile;
+use sango_wallet::keystore::{KeyFile, KeyFileVersion};
+use sango_wallet::keystore_v3::KeyFileV3;
 use sango_wallet::rpc_client::{RpcClient, TlsClientOptions, TrustMode};
+use sango_wallet::AnyKeyFile;
 use sango_wallet::WalletError;
 
 const DEFAULT_RPC: &str = "127.0.0.1:8545";
@@ -68,13 +70,32 @@ fn run(args: &[String]) -> Result<(), WalletError> {
     // Construire le client RPC une seule fois (HTTP ou HTTPS).
     let rpc = build_rpc_client(&opts)?;
 
+    // `--account` : uniquement sur les commandes qui dérivent un compte.
+    const ACCOUNT_COMMANDS: &[&str] = &[
+        "address",
+        "pubkey",
+        "balance",
+        "nonce",
+        "evm-address",
+        "evm-balance",
+        "evm-nonce",
+    ];
+    let account = if ACCOUNT_COMMANDS.contains(&cmd.as_str()) {
+        parse_account_flag(&rest)?
+    } else {
+        reject_account_flag(&rest, &cmd)?;
+        0
+    };
+
     match cmd.as_str() {
         // --- Natif ---
-        "new" => cmd_new(kf_path),
-        "address" => cmd_address(kf_path),
-        "pubkey" => cmd_pubkey(kf_path),
-        "balance" => cmd_balance(&rpc, kf_path, &rest),
-        "nonce" => cmd_nonce(&rpc, kf_path, &rest),
+        "new" => cmd_new(kf_path, &rest),
+        "import" => cmd_import(kf_path),
+        "export-mnemonic" => cmd_export_mnemonic(kf_path),
+        "address" => cmd_address(kf_path, account),
+        "pubkey" => cmd_pubkey(kf_path, account),
+        "balance" => cmd_balance(&rpc, kf_path, &rest, account),
+        "nonce" => cmd_nonce(&rpc, kf_path, &rest, account),
         "info" => cmd_info(&rpc),
         "history" => cmd_history(&rpc, kf_path, &rest),
         "send" => cmd_send(&rpc, kf_path, &rest),
@@ -89,9 +110,9 @@ fn run(args: &[String]) -> Result<(), WalletError> {
 
         // --- EVM ---
         "evm-new" => cmd_evm_new(kf_path),
-        "evm-address" => cmd_evm_address(kf_path),
-        "evm-balance" => cmd_evm_balance(&rpc, kf_path, &rest),
-        "evm-nonce" => cmd_evm_nonce(&rpc, kf_path, &rest),
+        "evm-address" => cmd_evm_address(kf_path, account),
+        "evm-balance" => cmd_evm_balance(&rpc, kf_path, &rest, account),
+        "evm-nonce" => cmd_evm_nonce(&rpc, kf_path, &rest, account),
         "evm-call" => cmd_evm_call(&rpc, &rest),
         "evm-sign" => cmd_evm_sign(&rpc, kf_path, &rest),
 
@@ -106,9 +127,16 @@ fn run(args: &[String]) -> Result<(), WalletError> {
 
 // --- Commandes natives (inchangées) ---------------------------------------
 
-fn cmd_new(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
+fn cmd_new(keyfile_path: &std::path::Path, args: &[String]) -> Result<(), WalletError> {
+    // Détecter --bip39.
+    let use_bip39 = args.iter().any(|a| a == "--bip39");
+
+    if use_bip39 {
+        return cmd_new_bip39(keyfile_path, args);
+    }
+
     let kf = KeyFile::create(keyfile_path)?;
-    println!("✓ Keyfile créé : {}", keyfile_path.display());
+    println!("✓ Keyfile créé (V1 en clair) : {}", keyfile_path.display());
     println!("  Adresse native : 0x{}", kf.address_hex);
     println!("  ⚠ Sauvegardez ce fichier — sans lui, vos fonds sont perdus.");
     println!();
@@ -117,19 +145,112 @@ fn cmd_new(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
         "    sango-wallet --keyfile {} keyfile-encrypt",
         keyfile_path.display()
     );
-    println!("  (ou ajoutez une clé EVM avec `evm-new`.)");
+    println!("  (ou créez un wallet V3 avec `new --bip39`.)");
     Ok(())
 }
 
-fn cmd_address(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
-    let kf = KeyFile::load_silent(keyfile_path)?;
-    println!("0x{}", kf.address_hex);
+/// `new --bip39 [--words 12|24]` : crée un keyfile V3 chiffré.
+fn cmd_new_bip39(keyfile_path: &std::path::Path, args: &[String]) -> Result<(), WalletError> {
+    use sango_crypto::mnemonic::MnemonicLength;
+
+    let words = parse_words_flag(args)?;
+    let length = match words {
+        12 => MnemonicLength::Words12,
+        24 => MnemonicLength::Words24,
+        other => {
+            return Err(WalletError::Usage(format!(
+                "--words must be 12 or 24, got {other}"
+            )));
+        }
+    };
+
+    println!("⚠️  Vous allez créer un wallet V3 (mnemonic BIP-39).");
+    println!("    La mnemonic est générée aléatoirement.");
+    println!("    Vous devrez la sauvegarder sur papier après la création.");
+    println!();
+
+    let kdf_pass = read_passphrase_confirmed()?;
+
+    let kf = KeyFileV3::create(keyfile_path, length, &kdf_pass)?;
+    let addr = kf.address(0)?;
+    let evm_addr = kf.evm_address(0)?;
+
+    println!("✓ Keyfile V3 créé : {}", keyfile_path.display());
+    println!("  Adresse native (account 0) : 0x{}", addr.to_hex());
+    println!("  Adresse EVM    (account 0) : 0x{}", evm_addr.to_hex());
+    println!();
+    println!("  ⚠️  SAUVEGARDEZ LA MNEMONIC avec :");
+    println!(
+        "        sango-wallet --keyfile {} export-mnemonic",
+        keyfile_path.display()
+    );
+    println!("  Sans elle, vos fonds sont perdus.");
     Ok(())
 }
 
-fn cmd_pubkey(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
-    let kf = KeyFile::load_silent(keyfile_path)?;
-    println!("0x{}", kf.public_key_hex()?);
+/// `import` : saisie interactive d'une mnemonic existante.
+fn cmd_import(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
+    println!("Import d'une mnemonic BIP-39 dans un nouveau keyfile V3.");
+    println!();
+
+    let mnemonic = read_mnemonic_line()?;
+    // Valider immédiatement (via `Mnemonic::parse`).
+    let _ = sango_crypto::mnemonic::Mnemonic::parse(&mnemonic)
+        .map_err(|e| WalletError::Usage(format!("invalid mnemonic: {e}")))?;
+
+    let bip39_pass = read_bip39_passphrase_optional()?;
+    let kdf_pass = read_passphrase_confirmed()?;
+
+    let kf = KeyFileV3::import(
+        keyfile_path,
+        &mnemonic,
+        bip39_pass.map(|s| s.to_string()),
+        &kdf_pass,
+    )?;
+
+    println!("✓ Keyfile V3 importé : {}", keyfile_path.display());
+    println!("  Mnemonic valide.");
+    println!("  Vérifiez l'adresse avec :");
+    println!(
+        "        sango-wallet --keyfile {} address",
+        keyfile_path.display()
+    );
+    let _ = kf;
+    Ok(())
+}
+
+/// `export-mnemonic` : affiche la mnemonic V3.
+fn cmd_export_mnemonic(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
+    eprintln!("⚠️  Cette commande imprime la mnemonic (secret) sur stdout.");
+    eprintln!("    Ne pas rediriger, logger, piper, ou coller dans un outil non fiable.");
+    eprintln!();
+
+    let lk = load_keyfile(keyfile_path, false)?;
+
+    match lk.any.mnemonic_owned() {
+        Some(m) => {
+            println!("{}", m.as_str());
+            Ok(())
+        }
+        None => Err(WalletError::Usage(
+            "export-mnemonic requires a V3 keyfile".into(),
+        )),
+    }
+}
+
+fn cmd_address(keyfile_path: &std::path::Path, account: u32) -> Result<(), WalletError> {
+    let lk = load_keyfile(keyfile_path, true)?;
+    let addr = lk.any.address(account, lk.bip39_passphrase.as_deref())?;
+    println!("0x{}", addr.to_hex());
+    Ok(())
+}
+
+fn cmd_pubkey(keyfile_path: &std::path::Path, account: u32) -> Result<(), WalletError> {
+    let lk = load_keyfile(keyfile_path, true)?;
+    let kp = lk
+        .any
+        .sango_keypair(account, lk.bip39_passphrase.as_deref())?;
+    println!("0x{}", kp.public_key().to_hex());
     Ok(())
 }
 
@@ -137,8 +258,9 @@ fn cmd_balance(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
-    let addr = resolve_address(keyfile_path, args)?;
+    let addr = resolve_address(keyfile_path, args, account)?;
     let (_, balance, _) = fetch_account(rpc, &addr)?;
     println!(
         "{} base units ({} SANGO)",
@@ -152,8 +274,9 @@ fn cmd_nonce(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
-    let addr = resolve_address(keyfile_path, args)?;
+    let addr = resolve_address(keyfile_path, args, account)?;
     let (nonce, _, _) = fetch_account(rpc, &addr)?;
     println!("{nonce}");
     Ok(())
@@ -174,7 +297,7 @@ fn cmd_history(
     keyfile_path: &std::path::Path,
     args: &[String],
 ) -> Result<(), WalletError> {
-    let addr = resolve_address(keyfile_path, args)?;
+    let addr = resolve_address(keyfile_path, args, 0)?;
 
     let mut limit: u32 = 20;
     let mut offset: u32 = 0;
@@ -543,9 +666,11 @@ fn cmd_evm_new(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
     Ok(())
 }
 
-fn cmd_evm_address(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
-    let kf = KeyFile::load_silent(keyfile_path)?;
-    let addr = kf.evm_address()?;
+fn cmd_evm_address(keyfile_path: &std::path::Path, account: u32) -> Result<(), WalletError> {
+    let lk = load_keyfile(keyfile_path, true)?;
+    let addr = lk
+        .any
+        .evm_address(account, lk.bip39_passphrase.as_deref())?;
     println!("0x{}", addr.to_hex());
     Ok(())
 }
@@ -554,8 +679,9 @@ fn cmd_evm_balance(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
-    let addr = resolve_evm_address(keyfile_path, args)?;
+    let addr = resolve_evm_address(keyfile_path, args, account)?;
     let result = rpc.call(
         "eth_getBalance",
         serde_json::json!([format!("0x{}", addr.to_hex()), "latest"]),
@@ -571,8 +697,9 @@ fn cmd_evm_nonce(
     rpc: &RpcClient,
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<(), WalletError> {
-    let addr = resolve_evm_address(keyfile_path, args)?;
+    let addr = resolve_evm_address(keyfile_path, args, account)?;
     let result = rpc.call(
         "eth_getTransactionCount",
         serde_json::json!([format!("0x{}", addr.to_hex()), "latest"]),
@@ -748,60 +875,224 @@ fn cmd_keyfile_info(keyfile_path: &std::path::Path) -> Result<(), WalletError> {
     let bytes = fs::read(keyfile_path)?;
     let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
     let version = raw.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-    let address_hex = raw
-        .get("address_hex")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
     let created_at = raw.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
 
     println!("Keyfile : {}", keyfile_path.display());
-    println!("  version    : {version}");
-    println!("  address    : 0x{address_hex}");
+    println!("  Format     : V{version}");
     println!("  created_at : {created_at}");
+
     match version {
         1 => {
-            println!("  chiffré    : ❌ NON (v1 en clair)");
+            let address_hex = raw
+                .get("address_hex")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            println!("  address    : 0x{address_hex}");
+            println!("  chiffré    : ❌ NON (V1 en clair)");
             println!("  → migration recommandée : `sango-wallet keyfile-encrypt`");
         }
         2 => {
-            let kdf = raw.get("kdf").and_then(|v| v.as_str()).unwrap_or("?");
-            let cipher = raw.get("cipher").and_then(|v| v.as_str()).unwrap_or("?");
-            println!("  chiffré    : ✅ OUI (v2)");
-            println!("  kdf        : {kdf}");
-            println!("  cipher     : {cipher}");
-            if let Some(params) = raw.get("kdf_params") {
-                let m = params
-                    .get("m_cost_kib")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let t = params.get("t_cost").and_then(|v| v.as_u64()).unwrap_or(0);
-                let p = params.get("p_cost").and_then(|v| v.as_u64()).unwrap_or(0);
-                println!("  argon2     : m={m} KiB, t={t}, p={p}");
-            }
+            let address_hex = raw
+                .get("address_hex")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            println!("  address    : 0x{address_hex}");
+            println!("  chiffré    : ✅ OUI");
+            println!("  BIP-39     : non (seed Ed25519 brute)");
+            print_kdf_cipher_info(&raw);
+        }
+        3 => {
+            // V3 : pas d'address_hex en clair. On signale seulement.
+            println!("  chiffré    : ✅ OUI");
+            println!("  BIP-39     : oui (mnemonic)");
+            println!(
+                "  passphrase : {}",
+                if raw.get("ciphertext_hex").is_some() {
+                    "inconnu sans déchiffrement (utiliser un load)"
+                } else {
+                    "?"
+                }
+            );
+            print_kdf_cipher_info(&raw);
+            println!();
+            println!("  Note : l'adresse n'est pas en clair dans V3.");
+            println!("         Utiliser `sango-wallet keyfile-info` d'une autre manière ?");
+            println!("         Pour afficher l'adresse : `sango-wallet address`.");
         }
         _ => println!("  chiffré    : (version inconnue)"),
     }
+
+    // Pour V3 avec KDF password, on peut calculer `bip39_passphrase_used`
+    // sans le déchiffrer. On évite pour rester simple.
     Ok(())
+}
+
+/// Imprime `kdf` + `cipher` + paramètres Argon2 si présents.
+fn print_kdf_cipher_info(raw: &serde_json::Value) {
+    if let Some(kdf) = raw.get("kdf").and_then(|v| v.as_str()) {
+        println!("  kdf        : {kdf}");
+    }
+    if let Some(cipher) = raw.get("cipher").and_then(|v| v.as_str()) {
+        println!("  cipher     : {cipher}");
+    }
+    if let Some(params) = raw.get("kdf_params") {
+        let m = params
+            .get("m_cost_kib")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let t = params.get("t_cost").and_then(|v| v.as_u64()).unwrap_or(0);
+        let p = params.get("p_cost").and_then(|v| v.as_u64()).unwrap_or(0);
+        println!("  argon2     : m={m} KiB, t={t}, p={p}");
+    }
 }
 
 // --- Helpers ---------------------------------------------------------------
 
+/// Keyfile chargé + passphrase BIP-39 éventuelle.
+struct LoadedKeyfile {
+    any: AnyKeyFile,
+    bip39_passphrase: Option<String>,
+}
+
+/// Charge un keyfile en auto-détectant la version.
+///
+/// ## Comportement
+///
+/// 1. Lit le champ `version` en clair (pas de prompt inutile pour V1).
+/// 2. V1 → load direct, pas de prompt.
+///    V2/V3 → prompt du mot de passe KDF, puis load.
+/// 3. V3 + `bip39_passphrase_used == true` + `prompt_bip39 == true`
+///    → prompt séparé de la passphrase BIP-39.
+///
+/// ## Deux secrets distincts
+///
+/// Voir doc [`sango_wallet::AnyKeyFile`] : le KDF password déchiffre
+/// le keyfile ; la BIP-39 passphrase dérive le seed.
+fn load_keyfile(path: &std::path::Path, prompt_bip39: bool) -> Result<LoadedKeyfile, WalletError> {
+    let version = AnyKeyFile::peek_version(path)?;
+
+    let kdf_pass: Vec<u8> = match version {
+        KeyFileVersion::V1 => Vec::new(),
+        _ => read_passphrase("Keyfile password: ")?,
+    };
+
+    let any = AnyKeyFile::load(path, &kdf_pass)?;
+
+    let bip39_passphrase = if prompt_bip39 && any.bip39_passphrase_used() {
+        read_bip39_passphrase_optional()?
+    } else {
+        None
+    };
+
+    Ok(LoadedKeyfile {
+        any,
+        bip39_passphrase,
+    })
+}
+
+/// Lit la passphrase BIP-39 (autorise le vide).
+///
+/// ## Pas de `$SANGO_BIP39_PASSPHRASE`
+///
+/// Décision W4.c : la passphrase BIP-39 est un secret **distinct** du
+/// mot de passe KDF. On ne crée pas de seconde variable
+/// d'environnement pour ne pas multiplier les chemins d'exposition.
+fn read_bip39_passphrase_optional() -> Result<Option<String>, WalletError> {
+    let s = rpassword::prompt_password("BIP-39 passphrase (empty for none): ")
+        .map_err(|e| WalletError::Io(std::io::Error::other(e.to_string())))?;
+    if s.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(s))
+    }
+}
+
+/// Lit un mot de passe KDF avec confirmation.
+fn read_passphrase_confirmed() -> Result<Vec<u8>, WalletError> {
+    let p1 = read_passphrase("Keyfile password: ")?;
+    let p2 = read_passphrase("Confirm keyfile password: ")?;
+    if p1 != p2 {
+        return Err(WalletError::Usage("passwords do not match".into()));
+    }
+    Ok(p1)
+}
+
+/// Lit une mnemonic sur une ligne (stdin).
+fn read_mnemonic_line() -> Result<String, WalletError> {
+    use std::io::BufRead;
+    eprintln!("Enter mnemonic (12 or 24 words, space-separated):");
+    eprint!("> ");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(WalletError::Io)?;
+    Ok(line.trim().to_string())
+}
+
+/// Extrait `--account N` (défaut 0).
+fn parse_account_flag(args: &[String]) -> Result<u32, WalletError> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--account" {
+            let v = args
+                .get(i + 1)
+                .ok_or_else(|| WalletError::Usage("--account needs a value".into()))?;
+            return v
+                .parse()
+                .map_err(|e| WalletError::Usage(format!("--account: {e}")));
+        }
+        i += 1;
+    }
+    Ok(0)
+}
+
+/// Refuse `--account` sur les commandes qui ne le supportent pas.
+fn reject_account_flag(args: &[String], cmd: &str) -> Result<(), WalletError> {
+    if args.iter().any(|a| a == "--account") {
+        return Err(WalletError::Usage(format!(
+            "--account is not supported by command `{cmd}`"
+        )));
+    }
+    Ok(())
+}
+
+/// Extrait `--words N` (défaut 12).
+fn parse_words_flag(args: &[String]) -> Result<u32, WalletError> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--words" {
+            let v = args
+                .get(i + 1)
+                .ok_or_else(|| WalletError::Usage("--words needs a value".into()))?;
+            return v
+                .parse()
+                .map_err(|e| WalletError::Usage(format!("--words: {e}")));
+        }
+        i += 1;
+    }
+    Ok(12)
+}
+
 fn resolve_address(
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<NativeAddress, WalletError> {
     if let Some(arg) = args.first() {
         if !arg.starts_with("--") {
             return parse_address_arg(arg);
         }
     }
-    let kf = KeyFile::load_silent(keyfile_path)?;
-    kf.address()
+    let lk = load_keyfile(keyfile_path, true)?;
+    lk.any.address(account, lk.bip39_passphrase.as_deref())
 }
 
 fn resolve_evm_address(
     keyfile_path: &std::path::Path,
     args: &[String],
+    account: u32,
 ) -> Result<EvmAddress, WalletError> {
     if let Some(arg) = args.first() {
         if !arg.starts_with("--") {
@@ -809,8 +1100,8 @@ fn resolve_evm_address(
                 .map_err(|e| WalletError::InvalidAddress(format!("{arg}: {e}")));
         }
     }
-    let kf = KeyFile::load_silent(keyfile_path)?;
-    kf.evm_address()
+    let lk = load_keyfile(keyfile_path, true)?;
+    lk.any.evm_address(account, lk.bip39_passphrase.as_deref())
 }
 
 fn parse_address_arg(s: &str) -> Result<NativeAddress, WalletError> {
