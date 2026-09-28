@@ -364,6 +364,31 @@ impl KeyFileV3 {
         Ok(serde_json::to_vec_pretty(&raw)?)
     }
 
+    /// Dérive le keypair natif Sango avec une passphrase BIP-39
+    /// **fournie à l'appel**.
+    ///
+    /// Voir [`WalletV3::sango_keypair_with_passphrase`] pour la
+    /// justification. Le `KeyFileV3` est chargé sans connaître la
+    /// passphrase ; elle est fournie au moment de la dérivation.
+    pub fn sango_keypair_with_passphrase(
+        &self,
+        account_index: u32,
+        passphrase: Option<&str>,
+    ) -> Result<NativeKeypair, WalletError> {
+        self.wallet
+            .sango_keypair_with_passphrase(Network::Devnet, account_index, passphrase)
+    }
+
+    /// Dérive le keypair EVM avec une passphrase BIP-39 dynamique.
+    pub fn evm_keypair_with_passphrase(
+        &self,
+        account_index: u32,
+        passphrase: Option<&str>,
+    ) -> Result<EvmKeypair, WalletError> {
+        self.wallet
+            .evm_keypair_with_passphrase(account_index, passphrase)
+    }
+
     /// Retourne une copie effaçable de la mnemonic.
     ///
     /// Usage : commande CLI `export-mnemonic`, tests.

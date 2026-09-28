@@ -110,6 +110,27 @@ struct Plaintext {
     evm_secret_hex: Option<String>,
 }
 
+/// Version de format d'un keyfile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum KeyFileVersion {
+    /// Format historique : seed Ed25519 en clair.
+    V1,
+    /// Format chiffré Argon2id + ChaCha20 (seed Ed25519).
+    V2,
+    /// Format chiffré (mnemonic BIP-39 + HD multi-chain).
+    V3,
+}
+
+impl core::fmt::Display for KeyFileVersion {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            KeyFileVersion::V1 => f.write_str("V1"),
+            KeyFileVersion::V2 => f.write_str("V2"),
+            KeyFileVersion::V3 => f.write_str("V3"),
+        }
+    }
+}
+
 // --- KeyFile (API publique) -----------------------------------------------
 
 /// Keyfile en mémoire, après déchiffrement éventuel.
@@ -132,6 +153,18 @@ pub struct KeyFile {
     /// Stockés ici pour pouvoir **réécrire** le keystore avec les mêmes
     /// params lors d'un `attach_evm_key`.
     pub kdf_params: Option<KdfParams>,
+}
+
+impl KeyFile {
+    /// Version du format, dérivée du champ `version`.
+    #[must_use]
+    pub fn file_version(&self) -> KeyFileVersion {
+        match self.version {
+            1 => KeyFileVersion::V1,
+            2 => KeyFileVersion::V2,
+            _ => unreachable!("KeyFile::version validated at load"),
+        }
+    }
 }
 
 impl Drop for KeyFile {

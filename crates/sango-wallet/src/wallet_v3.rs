@@ -143,6 +143,42 @@ impl WalletV3 {
         EvmKeypair::from_secret(*derived.private_key())
     }
 
+    /// Dérive le keypair natif Sango avec une passphrase BIP-39 **passée
+    /// à l'appel**.
+    ///
+    /// ## Différence avec [`Self::sango_keypair`]
+    ///
+    /// `sango_keypair` utilise la passphrase mémorisée à la
+    /// construction du wallet. Cette variante utilise une passphrase
+    /// **dynamique**, ce qui permet de charger un keyfile V3 sans
+    /// connaître la passphrase, puis de la fournir uniquement au moment
+    /// de la dérivation (modèle préféré W4.c).
+    pub fn sango_keypair_with_passphrase(
+        &self,
+        network: Network,
+        account_index: u32,
+        passphrase: Option<&str>,
+    ) -> Result<NativeKeypair, WalletError> {
+        let seed = self.mnemonic.to_seed(passphrase);
+        let xprv = XPrvEd25519::from_seed(&seed[..]);
+        let path = sango_hd_path(network, account_index)?;
+        let derived = xprv.derive_path(&path).map_err(map_hd_err)?;
+        Ok(derived.to_native_keypair())
+    }
+
+    /// Dérive le keypair EVM avec une passphrase BIP-39 dynamique.
+    pub fn evm_keypair_with_passphrase(
+        &self,
+        account_index: u32,
+        passphrase: Option<&str>,
+    ) -> Result<EvmKeypair, WalletError> {
+        let seed = self.mnemonic.to_seed(passphrase);
+        let xprv = XPrvSecp256k1::from_seed(&seed[..]).map_err(map_hd_err)?;
+        let path = evm_hd_path(account_index);
+        let derived = xprv.derive_path(&path).map_err(map_hd_err)?;
+        EvmKeypair::from_secret(*derived.private_key())
+    }
+
     /// Retourne une copie effaçable de la mnemonic.
     ///
     /// **`pub(crate)`** : usage interne (chiffrement keyfile V3,

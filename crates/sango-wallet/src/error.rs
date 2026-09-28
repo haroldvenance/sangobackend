@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::keystore::KeyFileVersion;
+
 /// Erreur produite par une opération du wallet.
 #[derive(Debug, Error)]
 pub enum WalletError {
@@ -82,4 +84,16 @@ pub enum WalletError {
     /// La passphrase est vide (interdit).
     #[error("passphrase must not be empty")]
     EmptyPassphrase,
+
+    /// Le format de keyfile ne supporte pas `--account > 0`.
+    ///
+    /// Les formats V1 et V2 ne contiennent qu'un seul compte
+    /// (la seed elle-même). Seul V3 supporte la dérivation multi-comptes.
+    #[error("keyfile format {format:?} contains a single account and does not support --account > 0 (asked for {account})")]
+    UnsupportedAccount {
+        /// Version du keyfile.
+        format: KeyFileVersion,
+        /// Index demandé.
+        account: u32,
+    },
 }
