@@ -16,6 +16,8 @@ pub mod bech32m;
 pub mod domain;
 pub mod ed25519;
 pub mod hash;
+pub mod hd;
+pub mod mnemonic;
 
 pub use address::derive_native_address;
 pub use bech32m::{
@@ -23,3 +25,5 @@ pub use bech32m::{
 };
 pub use ed25519::{sign_native, verify_native, CryptoError, NativeKeypair};
 pub use hash::{hash_domain, hash_domain_parts, keccak256};
+pub use hd::{ChildIndex, DerivationPath, HdError, XPrvEd25519, XPrvSecp256k1};
+pub use mnemonic::{Mnemonic, MnemonicError, MnemonicLength};

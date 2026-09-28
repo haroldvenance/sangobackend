@@ -9,11 +9,17 @@ repository.workspace = true
 [dependencies]
 thiserror.workspace = true
 sango-primitives.workspace = true
+zeroize.workspace = true
+bip39.workspace = true
 
 sha3 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 bech32.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+k256.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true
+hex.workspace = true
