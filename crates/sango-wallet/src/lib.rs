@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod any_keystore;
 pub mod cli;
 pub mod commands;
 pub mod crypto;
@@ -43,9 +44,10 @@ pub mod keystore_v3;
 pub mod rpc_client;
 pub mod wallet_v3;
 
+pub use any_keystore::AnyKeyFile;
 pub use crypto::KdfParams;
 pub use error::WalletError;
-pub use keystore::KeyFile;
+pub use keystore::{KeyFile, KeyFileVersion};
 pub use keystore_v3::KeyFileV3;
 pub use rpc_client::RpcClient;
 pub use wallet_v3::{

@@ -41,7 +41,7 @@ use crate::keystore::{KeyFile, KeyFileVersion};
 use crate::keystore_v3::KeyFileV3;
 
 /// Vue unifiée sur un keyfile V1, V2 ou V3.
-pub(crate) enum AnyKeyFile {
+pub enum AnyKeyFile {
     /// Keyfile V1 ou V2. `KeyFile` distingue via son champ `version`.
     Legacy(KeyFile),
     /// Keyfile V3 (mnemonic BIP-39 + HD).
@@ -66,7 +66,7 @@ impl AnyKeyFile {
     /// kdf_passphrase  →  déchiffre le keyfile
     /// bip39_passphrase →  dérive le seed depuis la mnemonic
     /// ```
-    pub(crate) fn load(path: &Path, kdf_passphrase: &[u8]) -> Result<Self, WalletError> {
+    pub fn load(path: &Path, kdf_passphrase: &[u8]) -> Result<Self, WalletError> {
         let bytes = std::fs::read(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 WalletError::KeyfileNotFound(path.display().to_string())
@@ -93,7 +93,7 @@ impl AnyKeyFile {
 
     /// Version du keyfile.
     #[must_use]
-    pub(crate) fn version(&self) -> KeyFileVersion {
+    pub fn version(&self) -> KeyFileVersion {
         match self {
             Self::Legacy(kf) => kf.file_version(),
             Self::V3(_) => KeyFileVersion::V3,
@@ -105,7 +105,7 @@ impl AnyKeyFile {
     /// V1/V2 : toujours `false` (pas de BIP-39).
     /// V3 : reflète le flag persisté au moment de la création/import.
     #[must_use]
-    pub(crate) fn bip39_passphrase_used(&self) -> bool {
+    pub fn bip39_passphrase_used(&self) -> bool {
         match self {
             Self::Legacy(_) => false,
             Self::V3(kf) => kf.bip39_passphrase_used(),
@@ -123,7 +123,7 @@ impl AnyKeyFile {
     /// ## `bip39_passphrase`
     ///
     /// Ignorée pour V1/V2. Utilisée pour V3.
-    pub(crate) fn sango_keypair(
+    pub fn sango_keypair(
         &self,
         account: u32,
         bip39_passphrase: Option<&str>,
@@ -143,7 +143,7 @@ impl AnyKeyFile {
     }
 
     /// Dérive le keypair EVM à l'index d'account donné.
-    pub(crate) fn evm_keypair(
+    pub fn evm_keypair(
         &self,
         account: u32,
         bip39_passphrase: Option<&str>,
@@ -163,7 +163,7 @@ impl AnyKeyFile {
     }
 
     /// Adresse native à l'index donné.
-    pub(crate) fn address(
+    pub fn address(
         &self,
         account: u32,
         bip39_passphrase: Option<&str>,
@@ -173,7 +173,7 @@ impl AnyKeyFile {
     }
 
     /// Adresse EVM à l'index donné.
-    pub(crate) fn evm_address(
+    pub fn evm_address(
         &self,
         account: u32,
         bip39_passphrase: Option<&str>,
@@ -186,7 +186,7 @@ impl AnyKeyFile {
     /// **Sensible** : retourner uniquement à la commande
     /// `export-mnemonic`, jamais dans un contexte de log.
     #[must_use]
-    pub(crate) fn mnemonic_owned(&self) -> Option<Zeroizing<String>> {
+    pub fn mnemonic_owned(&self) -> Option<Zeroizing<String>> {
         match self {
             Self::Legacy(_) => None,
             Self::V3(kf) => Some(kf.mnemonic_owned()),
