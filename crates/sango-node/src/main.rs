@@ -33,6 +33,8 @@ use std::time::Duration;
 use sango_p2p::{Multiaddr, PeerId};
 
 use sango_consensus::{LocalIdentity, Validator, ValidatorSet};
+use sango_node::metrics;
+use sango_node::metrics_server::MetricsServer;
 use sango_node::{Driver, Node, NodeBackend, NodeHandle, OutgoingMessage, RuntimeGenesis};
 use sango_p2p::{P2pConfig, P2pEvent};
 use sango_primitives::Epoch;
@@ -40,6 +42,7 @@ use sango_rpc::{RpcServer, TlsConfig};
 
 const DEFAULT_DATA_DIR: &str = "./sango-data";
 const DEFAULT_RPC_ADDR: &str = "127.0.0.1:8545";
+const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9090";
 const BLOCK_INTERVAL_MS: u64 = 500;
 const P2P_DRAIN_PER_TICK: usize = 100;
 
@@ -75,6 +78,9 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &[String]) -> Result<(), String> {
+    // Installer le recorder Prometheus avant tout (idempotent).
+    let _ = metrics::init_metrics();
+
     let opts = parse_args(args)?;
 
     // Extraire tous les champs dont on a besoin **avant** de déplacer quoi
@@ -93,6 +99,12 @@ fn run(args: &[String]) -> Result<(), String> {
         .unwrap_or_else(|| DEFAULT_RPC_ADDR.to_string())
         .parse()
         .map_err(|e| format!("invalid --rpc-addr: {e}"))?;
+    let metrics_addr: SocketAddr = opts
+        .metrics_addr
+        .clone()
+        .unwrap_or_else(|| DEFAULT_METRICS_ADDR.to_string())
+        .parse()
+        .map_err(|e| format!("invalid --metrics-addr: {e}"))?;
 
     // --- 1. Charger la config ---------------------------------------------
     let genesis = RuntimeGenesis::load(&config_path).map_err(|e| format!("config load: {e}"))?;
@@ -168,6 +180,15 @@ fn run(args: &[String]) -> Result<(), String> {
     let _rpc_thread = thread::spawn(move || {
         if let Err(e) = server.serve() {
             eprintln!("rpc server error: {e}");
+        }
+    });
+
+    // --- 7b. Metrics server (thread secondaire) ---------------------------
+    let metrics_server = MetricsServer::bind(metrics_addr)
+        .map_err(|e| format!("metrics bind {metrics_addr}: {e}"))?;
+    let _metrics_thread = thread::spawn(move || {
+        if let Err(e) = metrics_server.serve() {
+            eprintln!("metrics server error: {e}");
         }
     });
 
@@ -288,6 +309,10 @@ fn run(args: &[String]) -> Result<(), String> {
                 sango_node::DriverEvent::Committed {
                     height, block_hash, ..
                 } => {
+                    // Prometheus : compteur + hauteur.
+                    ::metrics::counter!("sango_blocks_committed_total").increment(1);
+                    ::metrics::gauge!("sango_block_height").set(height.get() as f64);
+
                     println!(
                         "✓ Bloc #{} commit 0x{}…",
                         height.get(),
@@ -299,6 +324,16 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
             }
         }
+
+        // 11e. Rafraîchir les jauges d'état (Prometheus).
+        let mempool_size = handle.with_mempool(|p| p.len());
+        let evm_mempool_size = handle.with_evm_mempool(|p| p.len());
+        let (base_fee, validators) =
+            handle.with_node(|n| (n.expected_base_fee().unwrap_or(1), n.all_validators().len()));
+        ::metrics::gauge!("sango_mempool_size").set(mempool_size as f64);
+        ::metrics::gauge!("sango_evm_mempool_size").set(evm_mempool_size as f64);
+        ::metrics::gauge!("sango_base_fee").set(base_fee as f64);
+        ::metrics::gauge!("sango_validators_total").set(validators as f64);
 
         thread::sleep(tick);
     }
@@ -376,6 +411,7 @@ struct CliOpts {
     config: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     rpc_addr: Option<String>,
+    metrics_addr: Option<String>,
     p2p_listen: Vec<String>,
     p2p_bootstrap: Vec<String>,
     mdns: bool,
@@ -403,6 +439,11 @@ fn parse_args(args: &[String]) -> Result<CliOpts, String> {
             "--rpc-addr" => {
                 let v = args.get(i + 1).ok_or("--rpc-addr needs a value")?;
                 opts.rpc_addr = Some(v.clone());
+                i += 2;
+            }
+            "--metrics-addr" => {
+                let v = args.get(i + 1).ok_or("--metrics-addr needs a value")?;
+                opts.metrics_addr = Some(v.clone());
                 i += 2;
             }
             "--p2p-listen" => {
@@ -460,6 +501,7 @@ fn print_help() {
          OPTIONS:\n\
          \x20   --data-dir <PATH>          Répertoire RocksDB (défaut : {DEFAULT_DATA_DIR})\n\
          \x20   --rpc-addr <ADDR>          Adresse d'écoute RPC (défaut : {DEFAULT_RPC_ADDR})\n\
+         \x20   --metrics-addr <ADDR>      Adresse d'écoute Prometheus (défaut : {DEFAULT_METRICS_ADDR})\n\
          \n\
          P2P (désactivé par défaut) :\n\
          \x20   --p2p-listen <MULTIADDR>   Adresse d'écoute (répétable)\n\

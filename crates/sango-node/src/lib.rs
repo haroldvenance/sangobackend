@@ -8,6 +8,8 @@ pub mod config;
 mod diff;
 mod driver;
 mod error;
+pub mod metrics;
+pub mod metrics_server;
 mod node;
 mod node_handle;
 mod rpc_backend;
