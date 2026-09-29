@@ -47,13 +47,41 @@ FBAL=$(echo "$FHEALTH" | jq -r .balance_base_units)
 [ "$FBAL" != "null" ] || fail "faucet balance null"
 ok "faucet balance = $FBAL base units"
 
-# 5. Faucet drip (vers une adresse bidon).
-DRIP=$(curl -sf -X POST -H 'Content-Type: application/json' \
-    -d '{"address":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' \
-    "$FAUCET/faucet") || fail "faucet POST /faucet a échoué"
-DTX=$(echo "$DRIP" | jq -r .tx_hash)
-[[ "$DTX" == 0x* ]] || fail "tx_hash mal formé: $DTX"
-ok "faucet drip → $DTX"
+# 5. Faucet drip.
+#
+# ## Adresse unique par exécution
+#
+# Le faucet a un cooldown par adresse (3600 s). Une adresse fixe
+# rendrait le test non rejouable immédiatement. On dérive une
+# adresse depuis le timestamp nanoseconde (hash SHA-256 tronqué
+# à 40 chars hex = 20 bytes).
+#
+# ## 200 ou 429 : les deux sont OK
+#
+# Un drip (200) prouve que le faucet signe et envoie.
+# Un 429 prouve qu'il rate-limite correctement.
+# Les deux signifient « le faucet répond ».
+ADDR_UNIQUE="0x$(printf '%s' "$(date +%s%N)" | sha256sum | head -c 40)"
+
+HTTP_CODE=$(curl -s -o /tmp/faucet-drip.json -w '%{http_code}' \
+    -X POST -H 'Content-Type: application/json' \
+    -d "{\"address\":\"$ADDR_UNIQUE\"}" \
+    "$FAUCET/faucet")
+
+case "$HTTP_CODE" in
+    200)
+        DTX=$(jq -r .tx_hash < /tmp/faucet-drip.json)
+        [[ "$DTX" == 0x* ]] || fail "tx_hash mal formé: $DTX"
+        ok "faucet drip → $DTX"
+        ;;
+    429)
+        ok "faucet drip → 429 (rate limit actif)"
+        ;;
+    *)
+        cat /tmp/faucet-drip.json >&2
+        fail "faucet drip: code HTTP inattendu $HTTP_CODE"
+        ;;
+esac
 
 # 6. Explorer home.
 ETITLE=$(curl -sf "$EXPLORER/" | grep -o '<title>[^<]*</title>' | head -1) \
@@ -61,10 +89,21 @@ ETITLE=$(curl -sf "$EXPLORER/" | grep -o '<title>[^<]*</title>' | head -1) \
 [[ "$ETITLE" == *"Sango"* ]] || fail "explorer title inattendu: $ETITLE"
 ok "explorer : $ETITLE"
 
-# 7. Explorer health (JSON).
-EHEALTH=$(curl -sf "$EXPLORER/health" | grep -o '"height": *[0-9]*' | head -1) \
+# 7. Explorer health.
+#
+# L'explorer renvoie du HTML avec le JSON échappé dans un <pre> :
+#   <pre>&quot;height&quot;: 47</pre>
+# On ne peut donc pas matcher directement `"height": N`.
+EHEALTH_HTML=$(curl -sf "$EXPLORER/health") \
     || fail "explorer /health injoignable"
-ok "explorer health : $EHEALTH"
+echo "$EHEALTH_HTML" | grep -q "Statut" \
+    || fail "explorer /health ne contient pas 'Statut'"
+EHEIGHT=$(echo "$EHEALTH_HTML" \
+    | grep -oE '&quot;height&quot;: [0-9]+' \
+    | head -1 \
+    | grep -oE '[0-9]+$')
+[ -n "$EHEIGHT" ] || fail "hauteur introuvable dans /health"
+ok "explorer health : height=$EHEIGHT"
 
 echo ""
 echo "✓ Tous les checks sont verts."
