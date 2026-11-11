@@ -105,5 +105,22 @@ EHEIGHT=$(echo "$EHEALTH_HTML" \
 [ -n "$EHEIGHT" ] || fail "hauteur introuvable dans /health"
 ok "explorer health : height=$EHEIGHT"
 
+# 8. Prometheus /metrics sur node-0 (port metrics interne :9090,
+#    NON publié sur l'hôte par défaut — on passe par node-0:9090 ou
+#    via le port publié si surchargé).
+#
+# Par défaut, le port metrics n'est PAS publié sur l'hôte (voir
+# docker-compose.yml). On teste via l'API Prometheus qui scrape les
+# nœuds en interne.
+PROM="${PROMETHEUS:-http://127.0.0.1:9090}"
+PUP=$(curl -sf "$PROM/-/ready" >/dev/null && echo "up" || echo "down")
+[ "$PUP" = "up" ] || fail "prometheus /-/ready injoignable"
+ok "prometheus ready"
+
+# Vérifier que Prometheus voit au moins un nœud.
+TARGETS=$(curl -sf "$PROM/api/v1/targets" | jq -r '.data.activeTargets | length' 2>/dev/null || echo "0")
+[ "$TARGETS" -ge 4 ] || fail "prometheus ne voit que $TARGETS targets (< 4)"
+ok "prometheus targets = $TARGETS"
+
 echo ""
 echo "✓ Tous les checks sont verts."

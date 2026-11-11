@@ -1,5 +1,5 @@
 # --- Build stage ------------------------------------------------------------
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.98-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         clang \
@@ -15,7 +15,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY examples/ ./examples/
 
-RUN cargo build --release -p sango-faucet
+RUN cargo build --release --locked -p sango-faucet
 
 # --- Runtime stage ----------------------------------------------------------
 FROM debian:bookworm-slim

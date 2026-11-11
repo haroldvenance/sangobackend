@@ -1,0 +1,53 @@
+# Règles d'alerte Sango.
+#
+# Toutes les alertes se déclenchent après 1 minute de condition vraie.
+# À connecter à Alertmanager en P3.6.3 pour notification.
+
+groups:
+  - name: sango-devnet
+    interval: 30s
+    rules:
+      - alert: SangoNodeDown
+        expr: up{job="sango-nodes"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Nœud Sango {{ $labels.instance }} down"
+          description: "Prometheus ne scrape plus {{ $labels.instance }} depuis 1 min."
+
+      - alert: SangoChainStalled
+        expr: rate(sango_block_height[2m]) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Chaîne Sango figée"
+          description: "Aucun nouveau bloc depuis 2 min."
+
+      - alert: SangoMempoolBacklog
+        expr: sango_mempool_size > 10000
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mempool saturé"
+          description: "{{ $value }} txs natives en attente."
+
+      - alert: SangoEvmMempoolBacklog
+        expr: sango_evm_mempool_size > 10000
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mempool EVM saturé"
+          description: "{{ $value }} txs EVM en attente."
+
+      - alert: SangoBaseFeeSpike
+        expr: sango_base_fee > 1000
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Base fee élevée"
+          description: "Base fee = {{ $value }} base units/gas (> 1000)."

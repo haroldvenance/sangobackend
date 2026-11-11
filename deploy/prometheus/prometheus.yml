@@ -1,0 +1,30 @@
+# Configuration Prometheus pour Sango devnet.
+#
+# Scrape les 4 validateurs sur /metrics (port 9090 interne).
+# Les noms de service Docker (`node-0`, `node-1`, ...) sont résolus
+# par le DNS interne de docker compose.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    network: sango-devnet
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: sango-nodes
+    static_configs:
+      - targets:
+          - node-0:9090
+          - node-1:9090
+          - node-2:9090
+          - node-3:9090
+        labels:
+          service: sango-node
+
+  - job_name: prometheus-self
+    static_configs:
+      - targets:
+          - localhost:9090

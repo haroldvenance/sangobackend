@@ -1,0 +1,13 @@
+# Provisioning des dashboards depuis /var/lib/grafana/dashboards.
+apiVersion: 1
+
+providers:
+  - name: sango
+    orgId: 1
+    folder: Sango
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
