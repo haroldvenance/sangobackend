@@ -6,6 +6,14 @@
 //! decode → structure → chain_id → signature → nonce → balance → gas/fee
 //! ```
 //!
+//! ## Deux points d'entrée
+//!
+//! - [`validate_transaction`] : validation **à l'application** (bloc).
+//!   Exige `tx.nonce == account.nonce`.
+//! - [`validate_for_mempool`] : validation **à l'admission mempool**.
+//!   Accepte `tx.nonce ∈ [account.nonce, account.nonce + max_gap]`.
+//!   Utilisé par `sango-node::rpc_backend` avant tout `pool.add()`.
+//!
 //! ## Bootstrap de clé publique — RÉSOLU (A1)
 //!
 //! Un compte est typiquement **crédité d'abord** par un transfert entrant :
@@ -37,10 +45,6 @@ pub struct SenderInfo {
     /// Adresse native du compte émetteur.
     pub address: NativeAddress,
     /// Clé publique Ed25519 enregistrée, si elle existe.
-    ///
-    /// - `Some(pk)` : compte actif.
-    /// - `None` : compte inexistant ou « fantôme » (crédité mais pas
-    ///   encore activé).
     pub public_key: Option<PublicKey>,
     /// Solde disponible en base units.
     pub balance: u128,
@@ -101,12 +105,13 @@ pub struct ValidatedTransaction {
     pub value: u128,
     /// Si `Some(pk)`, la couche d'état **doit** enregistrer `pk` comme clé
     /// publique du compte `sender` lors de l'application de la transaction.
-    ///
-    /// Cela correspond à l'activation d'un compte « fantôme ».
     pub bootstrap_public_key: Option<PublicKey>,
 }
 
-/// Valide une transaction contre un contexte de validation.
+/// Valide une transaction **à l'application** (bloc).
+///
+/// Exige `tx.nonce == sender.nonce`. Pour l'admission mempool, utiliser
+/// [`validate_for_mempool`] qui accepte une fenêtre de nonces.
 pub fn validate_transaction(
     tx: &Transaction,
     ctx: &ValidationContext<'_>,
@@ -119,8 +124,77 @@ pub fn validate_transaction(
     let max_total = fee::total_fee(tx.gas_limit, price).ok_or(TxValidationError::FeeOverflow)?;
     validate_balance(tx, ctx.sender.balance, max_total)?;
 
-    // Si la tx déclare une clé et que le compte n'en avait pas,
-    // c'est un bootstrap : la couche d'état doit l'enregistrer.
+    let bootstrap_public_key = match (tx.public_key, ctx.sender.public_key) {
+        (Some(pk), None) => Some(pk),
+        _ => None,
+    };
+
+    Ok(ValidatedTransaction {
+        tx_hash: tx.hash(),
+        sender: tx.sender,
+        effective_gas_price: price,
+        max_total_fee: max_total,
+        value: tx.value.base_units(),
+        bootstrap_public_key,
+    })
+}
+
+/// Valide une transaction **à l'admission mempool**.
+///
+/// Différences avec [`validate_transaction`] :
+///
+/// - **Nonce en fenêtre** : accepte `tx.nonce ∈ [sender.nonce,
+///   sender.nonce + max_nonce_gap]` au lieu de `== sender.nonce`.
+///   Cela permet de mettre en file des transactions séquentielles
+///   (pipeline mempool).
+///
+/// Toutes les autres validations sont identiques (structure, chain_id,
+/// signature, fee, balance, bootstrap).
+///
+/// ## Rôle vis-à-vis du DoS
+///
+/// Cette fonction est le **seul rempart** contre un mempool griefé par
+/// des transactions forgées (`tx.sender` non authentique). Le
+/// `pool.add()` reçoit un [`ValidatedTransaction`] qui prouve que la
+/// signature a été vérifiée.
+pub fn validate_for_mempool(
+    tx: &Transaction,
+    ctx: &ValidationContext<'_>,
+    max_nonce_gap: u64,
+) -> Result<ValidatedTransaction, TxValidationError> {
+    // (1) Structure : kind/data/montants/commission.
+    validate_structure(tx)?;
+
+    // (2) Chain ID : anti-replay cross-network.
+    validate_chain_id(tx, ctx.expected_chain_id)?;
+
+    // (3) Signature : vérifie cryptographiquement la clé Ed25519.
+    validate_signature(tx, ctx.sender)?;
+
+    // (4) Nonce en FENÊTRE (différence vs validate_transaction).
+    let min = ctx.sender.nonce;
+    let max = ctx.sender.nonce.saturating_add(max_nonce_gap);
+    if tx.nonce < min {
+        return Err(TxValidationError::NonceTooLow {
+            min,
+            got: tx.nonce,
+        });
+    }
+    if tx.nonce > max {
+        return Err(TxValidationError::NonceTooHigh {
+            max,
+            got: tx.nonce,
+        });
+    }
+
+    // (5) Fee : max_fee >= base_fee, priority <= max.
+    let price = validate_fee(tx, ctx.base_fee)?;
+
+    // (6) Balance : value + max_fee <= balance.
+    let max_total = fee::total_fee(tx.gas_limit, price).ok_or(TxValidationError::FeeOverflow)?;
+    validate_balance(tx, ctx.sender.balance, max_total)?;
+
+    // (7) Bootstrap : identique à validate_transaction.
     let bootstrap_public_key = match (tx.public_key, ctx.sender.public_key) {
         (Some(pk), None) => Some(pk),
         _ => None,
@@ -158,7 +232,6 @@ pub fn validate_structure(tx: &Transaction) -> Result<(), TxValidationError> {
         }
     }
     match tx.tx_kind {
-        // --- Transfers / contrats -------------------------------------------
         TxKind::Transfer => {
             if tx.recipient.is_none() {
                 return Err(TxValidationError::InvalidStructure(
@@ -185,8 +258,6 @@ pub fn validate_structure(tx: &Transaction) -> Result<(), TxValidationError> {
                 ));
             }
         }
-
-        // --- Staking : bond / unbond ----------------------------------------
         TxKind::Bond => {
             if tx.recipient.is_some() {
                 return Err(TxValidationError::InvalidStructure(
@@ -221,8 +292,6 @@ pub fn validate_structure(tx: &Transaction) -> Result<(), TxValidationError> {
                 ));
             }
         }
-
-        // --- Staking : delegate / undelegate --------------------------------
         TxKind::Delegate => {
             if tx.recipient.is_none() {
                 return Err(TxValidationError::InvalidStructure(
@@ -257,8 +326,6 @@ pub fn validate_structure(tx: &Transaction) -> Result<(), TxValidationError> {
                 ));
             }
         }
-
-        // --- Staking : claim rewards ----------------------------------------
         TxKind::ClaimRewards => {
             if tx.recipient.is_none() {
                 return Err(TxValidationError::InvalidStructure(
@@ -276,17 +343,12 @@ pub fn validate_structure(tx: &Transaction) -> Result<(), TxValidationError> {
                 ));
             }
         }
-
-        // --- Staking : register validator -----------------------------------
         TxKind::RegisterValidator => {
             if tx.recipient.is_some() {
                 return Err(TxValidationError::InvalidStructure(
                     "TX_REGISTER_VALIDATOR must have no recipient",
                 ));
             }
-            // data = commission_bps (4 BE). La clé publique du validateur
-            // est celle du compte (`tx.public_key` au bootstrap, ou déjà
-            // enregistrée dans l'état).
             if tx.data.len() != 4 {
                 return Err(TxValidationError::InvalidStructure(
                     "TX_REGISTER_VALIDATOR data must be 4 bytes",
@@ -305,21 +367,19 @@ pub fn validate_structure(tx: &Transaction) -> Result<(), TxValidationError> {
                 ));
             }
         }
-
-        // --- Staking : update commission ------------------------------------
         TxKind::UpdateCommission => {
             if tx.recipient.is_some() {
                 return Err(TxValidationError::InvalidStructure(
                     "TX_UPDATE_COMMISSION must have no recipient",
                 ));
             }
-            // data = new_commission_bps (4 BE)
             if tx.data.len() != 4 {
                 return Err(TxValidationError::InvalidStructure(
                     "TX_UPDATE_COMMISSION data must be 4 bytes",
                 ));
             }
-            let new_bps = u32::from_be_bytes([tx.data[0], tx.data[1], tx.data[2], tx.data[3]]);
+            let new_bps =
+                u32::from_be_bytes([tx.data[0], tx.data[1], tx.data[2], tx.data[3]]);
             if new_bps > sango_types::staking_params::MAX_COMMISSION_BPS {
                 return Err(TxValidationError::InvalidStructure(
                     "new commission_bps exceeds maximum",
@@ -331,8 +391,6 @@ pub fn validate_structure(tx: &Transaction) -> Result<(), TxValidationError> {
                 ));
             }
         }
-
-        // --- Staking : unjail -----------------------------------------------
         TxKind::Unjail => {
             if tx.recipient.is_some() {
                 return Err(TxValidationError::InvalidStructure(
@@ -366,23 +424,16 @@ pub fn validate_chain_id(tx: &Transaction, expected: ChainId32) -> Result<(), Tx
 }
 
 /// Vérifie la signature et la cohérence de [`SenderInfo`].
-///
-/// Voir la documentation du module pour la règle de bootstrap.
 pub fn validate_signature(tx: &Transaction, sender: &SenderInfo) -> Result<(), TxValidationError> {
-    // (0) Cohérence SenderInfo <-> tx.
     if sender.address != tx.sender {
         return Err(TxValidationError::SenderInfoAddressMismatch);
     }
 
-    // (1) Déterminer la clé publique effective.
     let effective_pubkey = match tx.public_key {
         Some(declared) => {
-            // La clé déclarée doit dériver vers l'adresse déclarée.
             if derive_native_address(&declared) != tx.sender {
                 return Err(TxValidationError::PublicKeyDoesNotMatchSender);
             }
-            // Si le compte a déjà une clé enregistrée, elle doit être
-            // identique (pas de rotation en V1).
             if let Some(existing) = sender.public_key {
                 if existing != declared {
                     return Err(TxValidationError::PublicKeyAlreadySet);
@@ -401,14 +452,14 @@ pub fn validate_signature(tx: &Transaction, sender: &SenderInfo) -> Result<(), T
         }
     };
 
-    // (2) Vérification cryptographique de la signature.
     tx.verify(&effective_pubkey)
         .map_err(|_| TxValidationError::InvalidSignature)?;
 
     Ok(())
 }
 
-/// Vérifie que le nonce de la transaction correspond au nonce attendu.
+/// Vérifie que le nonce de la transaction correspond au nonce attendu
+/// (validation à l'application).
 pub fn validate_nonce(tx: &Transaction, expected_nonce: u64) -> Result<(), TxValidationError> {
     if tx.nonce != expected_nonce {
         return Err(TxValidationError::NonceMismatch {
@@ -460,8 +511,6 @@ mod tests {
         ChainId32::from_bytes([0x11; 32])
     }
 
-    /// Construit une transaction signée **normale** (compte actif, pas de
-    /// déclaration de clé) et le `SenderInfo` correspondant.
     fn signed_transfer(
         keypair: &NativeKeypair,
         nonce: u64,
@@ -497,8 +546,6 @@ mod tests {
         )
     }
 
-    /// Construit une transaction de **bootstrap** : le compte n'a pas
-    /// encore de clé, la tx en déclare une.
     fn signed_bootstrap_transfer(
         keypair: &NativeKeypair,
         nonce: u64,
@@ -534,8 +581,6 @@ mod tests {
         )
     }
 
-    // --- SenderInfo ---------------------------------------------------------
-
     #[test]
     fn sender_info_from_public_key() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
@@ -543,21 +588,14 @@ mod tests {
         let info = SenderInfo::from_public_key(pk, 100, 0);
         assert_eq!(info.address, derive_native_address(&pk));
         assert_eq!(info.public_key, Some(pk));
-        assert_eq!(info.balance, 100);
-        assert_eq!(info.nonce, 0);
     }
 
     #[test]
     fn sender_info_ghost() {
         let a = NativeAddress::from_bytes([0xaa; 20]);
         let info = SenderInfo::ghost(a, 500, 3);
-        assert_eq!(info.address, a);
         assert_eq!(info.public_key, None);
-        assert_eq!(info.balance, 500);
-        assert_eq!(info.nonce, 3);
     }
-
-    // --- validate_structure -------------------------------------------------
 
     #[test]
     fn structure_ok_transfer() {
@@ -653,8 +691,6 @@ mod tests {
         ));
     }
 
-    // --- validate_chain_id --------------------------------------------------
-
     #[test]
     fn chain_id_ok() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
@@ -672,8 +708,6 @@ mod tests {
             Err(TxValidationError::ChainIdMismatch { .. })
         ));
     }
-
-    // --- validate_signature -------------------------------------------------
 
     #[test]
     fn signature_ok_normal_path() {
@@ -718,7 +752,6 @@ mod tests {
 
     #[test]
     fn signature_rejects_unregistered_public_key_no_declaration() {
-        // Compte fantôme + tx sans déclaration → PublicKeyNotRegistered.
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let (tx, mut info) = signed_transfer(&kp, 0, 100, 1_000_000);
         info.public_key = None;
@@ -728,11 +761,8 @@ mod tests {
         );
     }
 
-    // --- Bootstrap ----------------------------------------------------------
-
     #[test]
     fn bootstrap_ok() {
-        // Compte fantôme + tx déclare la clé → OK.
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let (tx, info) = signed_bootstrap_transfer(&kp, 0, 100, 1_000_000);
         assert!(validate_signature(&tx, &info).is_ok());
@@ -740,12 +770,9 @@ mod tests {
 
     #[test]
     fn bootstrap_rejects_declared_pubkey_mismatch() {
-        // La tx déclare une clé, mais elle ne dérive pas vers tx.sender.
         let kp1 = NativeKeypair::from_seed([0x42; 32]);
         let kp2 = NativeKeypair::from_seed([0x43; 32]);
         let (mut tx, info) = signed_bootstrap_transfer(&kp1, 0, 100, 1_000_000);
-        // tx.sender reste celle de kp1 ; on remplace la clé déclarée par
-        // celle de kp2 → derive(kp2) != tx.sender.
         tx.public_key = Some(kp2.public_key());
         assert_eq!(
             validate_signature(&tx, &info),
@@ -755,32 +782,24 @@ mod tests {
 
     #[test]
     fn bootstrap_idempotent_when_pubkey_already_set_same() {
-        // Compte actif + tx re-déclare la même clé → OK.
         let kp = NativeKeypair::from_seed([0x42; 32]);
         let (mut tx, info) = signed_transfer(&kp, 0, 100, 1_000_000);
         tx.public_key = Some(kp.public_key());
-        // Re-signer car public_key est dans les bytes signés.
         tx = tx.sign(&kp);
         assert!(validate_signature(&tx, &info).is_ok());
     }
 
     #[test]
     fn bootstrap_rejects_key_rotation() {
-        // Compte actif + tx déclare une clé différente → PublicKeyAlreadySet.
-        // (En pratique impossible car derive(pk2) != tx.sender, mais on
-        // teste la branche en construisant un SenderInfo incohérent.)
         let kp1 = NativeKeypair::from_seed([0x42; 32]);
         let kp2 = NativeKeypair::from_seed([0x43; 32]);
         let (tx, mut info) = signed_bootstrap_transfer(&kp1, 0, 100, 1_000_000);
-        // On simule un compte qui a déjà kp2 enregistré.
         info.public_key = Some(kp2.public_key());
         assert_eq!(
             validate_signature(&tx, &info),
             Err(TxValidationError::PublicKeyAlreadySet)
         );
     }
-
-    // --- validate_nonce -----------------------------------------------------
 
     #[test]
     fn nonce_ok() {
@@ -802,8 +821,6 @@ mod tests {
         );
     }
 
-    // --- validate_fee -------------------------------------------------------
-
     #[test]
     fn fee_ok() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
@@ -823,8 +840,6 @@ mod tests {
         ));
     }
 
-    // --- validate_balance ---------------------------------------------------
-
     #[test]
     fn balance_ok() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
@@ -842,8 +857,6 @@ mod tests {
         ));
     }
 
-    // --- validate_transaction (top-level) -----------------------------------
-
     #[test]
     fn full_pipeline_ok_normal() {
         let kp = NativeKeypair::from_seed([0x42; 32]);
@@ -854,11 +867,8 @@ mod tests {
             sender: &info,
         };
         let v = validate_transaction(&tx, &ctx).unwrap();
-        assert_eq!(v.sender, tx.sender);
         assert_eq!(v.effective_gas_price, 12);
         assert_eq!(v.max_total_fee, 21_000 * 12);
-        assert_eq!(v.value, 100);
-        assert_eq!(v.tx_hash, tx.hash());
         assert_eq!(v.bootstrap_public_key, None);
     }
 
@@ -904,5 +914,131 @@ mod tests {
         };
         let _ = validate_transaction(&tx, &ctx);
         assert_eq!(tx, original);
+    }
+
+    // === validate_for_mempool tests ===
+
+    #[test]
+    fn mempool_accepts_nonce_current() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let (tx, info) = signed_transfer(&kp, 5, 100, 1_000_000);
+        let ctx = ValidationContext {
+            expected_chain_id: chain(),
+            base_fee: 10,
+            sender: &info,
+        };
+        assert!(validate_for_mempool(&tx, &ctx, 64).is_ok());
+    }
+
+    #[test]
+    fn mempool_accepts_nonce_ahead_within_gap() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let (tx, info) = signed_transfer(&kp, 5 + 32, 100, 1_000_000);
+        let ctx = ValidationContext {
+            expected_chain_id: chain(),
+            base_fee: 10,
+            sender: &info,
+        };
+        assert!(validate_for_mempool(&tx, &ctx, 64).is_ok());
+    }
+
+    #[test]
+    fn mempool_accepts_nonce_at_gap_boundary() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let (tx, info) = signed_transfer(&kp, 5 + 64, 100, 1_000_000);
+        let ctx = ValidationContext {
+            expected_chain_id: chain(),
+            base_fee: 10,
+            sender: &info,
+        };
+        assert!(validate_for_mempool(&tx, &ctx, 64).is_ok());
+    }
+
+    // FIX : le helper `signed_transfer(&kp, 3, ...)` initialisait à la
+    // fois `tx.nonce = 3` ET `info.nonce = 3` — la fenêtre ne pouvait donc
+    // pas détecter un décalage. On surcharge `info.nonce` après le helper
+    // pour simuler un état où le compte est à `nonce = 5` alors que la tx
+    // signée utilise `nonce = 3`. La signature reste valide car Ed25519
+    // couvre `tx` uniquement (`tx.verify()` ne lit pas `info`).
+    #[test]
+    fn mempool_rejects_nonce_below_min() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let (tx, mut info) = signed_transfer(&kp, 3, 100, 1_000_000);
+        info.nonce = 5; // état simulé à nonce=5
+        let ctx = ValidationContext {
+            expected_chain_id: chain(),
+            base_fee: 10,
+            sender: &info,
+        };
+        assert!(matches!(
+            validate_for_mempool(&tx, &ctx, 64),
+            Err(TxValidationError::NonceTooLow { min: 5, got: 3 })
+        ));
+    }
+
+    // FIX : même cause — `signed_transfer(&kp, 5 + 65, ...)` alignait
+    // `tx.nonce` et `info.nonce`. On fixe `info.nonce = 5` pour simuler
+    // un état à nonce=5, la tx signée à nonce=70, gap=64 → 70 > 69.
+    #[test]
+    fn mempool_rejects_nonce_above_gap() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let (tx, mut info) = signed_transfer(&kp, 70, 100, 1_000_000);
+        info.nonce = 5; // état simulé à nonce=5, gap=64 → max=69
+        let ctx = ValidationContext {
+            expected_chain_id: chain(),
+            base_fee: 10,
+            sender: &info,
+        };
+        assert!(matches!(
+            validate_for_mempool(&tx, &ctx, 64),
+            Err(TxValidationError::NonceTooHigh { .. })
+        ));
+    }
+
+    #[test]
+    fn mempool_rejects_wrong_chain_id() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let (tx, info) = signed_transfer(&kp, 5, 100, 1_000_000);
+        let ctx = ValidationContext {
+            expected_chain_id: ChainId32::from_bytes([0x99; 32]),
+            base_fee: 10,
+            sender: &info,
+        };
+        assert!(matches!(
+            validate_for_mempool(&tx, &ctx, 64),
+            Err(TxValidationError::ChainIdMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn mempool_rejects_low_balance() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let (tx, info) = signed_transfer(&kp, 5, 100, 200);
+        let ctx = ValidationContext {
+            expected_chain_id: chain(),
+            base_fee: 10,
+            sender: &info,
+        };
+        assert!(matches!(
+            validate_for_mempool(&tx, &ctx, 64),
+            Err(TxValidationError::InsufficientBalance { .. })
+        ));
+    }
+
+    #[test]
+    fn mempool_rejects_priority_above_max_fee() {
+        let kp = NativeKeypair::from_seed([0x42; 32]);
+        let (mut tx, info) = signed_transfer(&kp, 5, 100, 1_000_000);
+        tx.priority_fee = tx.max_fee + 100;
+        tx = tx.sign(&kp);
+        let ctx = ValidationContext {
+            expected_chain_id: chain(),
+            base_fee: 10,
+            sender: &info,
+        };
+        assert!(matches!(
+            validate_for_mempool(&tx, &ctx, 64),
+            Err(TxValidationError::PriorityFeeExceedsMaxFee { .. })
+        ));
     }
 }

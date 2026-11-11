@@ -6,15 +6,7 @@
 //! jusqu'à sa validation, sans jamais toucher à l'état.
 //!
 //! ```text
-//! bytes
-//!   ↓
-//! decode
-//!   ↓
-//! Transaction
-//!   ↓
-//! validate (structure, chain_id, signature, nonce, fee, balance)
-//!   ↓
-//! ValidatedTransaction
+//! bytes → decode → Transaction → validate → ValidatedTransaction
 //! ```
 //!
 //! L'**application** d'une transaction validée (mutation d'état, fee
@@ -29,14 +21,21 @@
 //!
 //! Chaque étape est exposée comme fonction indépendante.
 //!
+//! ## Deux niveaux de validation
+//!
+//! - [`validate_transaction`] : validation **à l'application**
+//!   (`tx.nonce == account.nonce`). Utilisé par `sango-exec` au moment
+//!   de construire un bloc.
+//! - [`validate_for_mempool`] : validation **à l'admission mempool**
+//!   (`tx.nonce ∈ [account.nonce, account.nonce + max_gap]`). Utilisé
+//!   par `sango-node::rpc_backend::send_transaction`.
+//!
 //! ## Bootstrap de clé publique
 //!
 //! Un compte est typiquement **crédité d'abord** par un transfert entrant :
 //! il existe alors sous forme « fantôme » (`public_key == None`). Pour
 //! pouvoir dépenser, il doit **activer** sa clé publique en la déclarant
 //! dans sa première transaction (`tx.public_key = Some(pk)`).
-//!
-//! Voir [`validate_signature`] pour les règles exactes.
 //!
 //! ## Découplage
 //!
@@ -64,6 +63,7 @@ mod validate;
 pub use error::TxValidationError;
 pub use fee::{effective_gas_price, split_fee, total_fee};
 pub use validate::{
-    validate_balance, validate_chain_id, validate_fee, validate_nonce, validate_signature,
-    validate_structure, validate_transaction, SenderInfo, ValidatedTransaction, ValidationContext,
+    validate_balance, validate_chain_id, validate_fee, validate_for_mempool, validate_nonce,
+    validate_signature, validate_structure, validate_transaction, SenderInfo,
+    ValidatedTransaction, ValidationContext,
 };

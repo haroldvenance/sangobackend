@@ -36,9 +36,6 @@ pub enum TxValidationError {
     /// Le compte émetteur n'a pas de clé publique enregistrée
     /// (`SenderInfo.public_key == None`) et la transaction n'en déclare
     /// pas non plus (`tx.public_key == None`).
-    ///
-    /// Le compte doit soit être créé par Genesis, soit avoir déjà été
-    /// activé via une transaction déclarant sa clé publique.
     #[error("sender has no registered public key")]
     PublicKeyNotRegistered,
 
@@ -52,13 +49,38 @@ pub enum TxValidationError {
     #[error("signature verification failed")]
     InvalidSignature,
 
-    /// Nonce incorrect.
+    /// Nonce incorrect (validation à l'application : `tx.nonce == account.nonce`).
     #[error("nonce mismatch: expected {expected}, got {actual}")]
     NonceMismatch {
         /// Nonce attendu.
         expected: u64,
         /// Nonce reçu.
         actual: u64,
+    },
+
+    /// Nonce inférieur au nonce courant (validation mempool).
+    ///
+    /// Utilisé par [`crate::validate::validate_for_mempool`] : la
+    /// transaction cible un nonce déjà appliqué ou en dessous de la
+    /// fenêtre `[account.nonce, account.nonce + max_gap]`.
+    #[error("nonce too low: min {min}, got {got}")]
+    NonceTooLow {
+        /// Nonce minimal accepté.
+        min: u64,
+        /// Nonce reçu.
+        got: u64,
+    },
+
+    /// Nonce supérieur à la fenêtre acceptée par le mempool.
+    ///
+    /// Utilisé par [`crate::validate::validate_for_mempool`] : le nonce
+    /// dépasse `account.nonce + max_nonce_gap`.
+    #[error("nonce too high: max {max}, got {got}")]
+    NonceTooHigh {
+        /// Nonce maximal accepté.
+        max: u64,
+        /// Nonce reçu.
+        got: u64,
     },
 
     /// Solde insuffisant pour couvrir `value + gas_limit * effective_gas_price`.

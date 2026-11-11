@@ -4635,6 +4635,7 @@ dependencies = [
  "rlp",
  "sango-crypto",
  "sango-primitives",
+ "sango-tx",
  "sango-types",
  "thiserror 2.0.20",
 ]

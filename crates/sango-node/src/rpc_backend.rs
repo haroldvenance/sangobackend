@@ -1,11 +1,14 @@
 //! Implémentation de `sango_rpc::RpcBackend` pour un nœud Sango.
 //!
 //! Le backend lit l'état via un [`NodeHandle`] partagé avec le `Driver`.
-//! `send_transaction` pousse dans le mempool ; `eth_call` exécute une
-//! transaction EVM read-only sur un clone de l'`EvmState`.
+//! `send_transaction` valide **cryptographiquement** (via
+//! `sango_tx::validate_for_mempool`) **avant** d'insérer dans le
+//! mempool. `eth_call` exécute une transaction EVM read-only sur un
+//! clone de l'`EvmState`.
 
 use sango_primitives::{Amount, ChainId32, EvmAddress, Hash32, NativeAddress, U256};
 use sango_rpc::{EthCallRequest, EthCallResult, RpcBackend, RpcError};
+use sango_tx::{validate_for_mempool, SenderInfo, ValidationContext};
 use sango_types::{
     Block, Delegation, EvmTx, NativeAccount, PendingUnbonding, Receipt, Transaction, Tx, TxOutcome,
     ValidatorInfo,
@@ -101,15 +104,67 @@ impl RpcBackend for NodeBackend {
             .with_node(|n| n.get_tx_outcome(hash).ok().flatten())
     }
 
+    /// Soumet une transaction native au mempool.
+    ///
+    /// ## Pipeline (P0 sécurité)
+    ///
+    /// 1. Lecture (snapshot) : `chain_id`, `base_fee`, `SenderInfo`, `max_gap`.
+    /// 2. **Validation cryptographique complète** :
+    ///    `sango_tx::validate_for_mempool` vérifie structure, chain_id,
+    ///    signature Ed25519, nonce ∈ fenêtre, fee, balance.
+    ///    Toute tx invalide (signature fausse, chain_id erroné, nonce
+    ///    hors fenêtre, solde insuffisant) est **rejetée ici**, avant
+    ///    d'atteindre le mempool.
+    /// 3. Insertion mempool : `pool.add(tx, &validated)`. Le
+    ///    `ValidatedTransaction` sert de preuve que l'étape 2 a réussi.
+    ///
+    /// Sans cette validation, un attaquant pourrait forger des `tx.sender`
+    /// (signature = `Signature::ZERO`) et remplir le mempool en
+    /// marquant `per_sender_count[victim] = max_per_sender` → toutes
+    /// les tx réelles de `victim` seraient rejetées (`Full`).
     fn send_transaction(&self, tx: &Transaction) -> Result<Hash32, RpcError> {
-        let (base_fee, sender_nonce) = self.handle.with_node(|n| {
+        // (1) Snapshot état + config mempool.
+        //     Locks relâchés avant la validation cryptographique (qui
+        //     peut prendre ~100 µs avec Ed25519).
+        let (chain_id, base_fee, sender_info) = self.handle.with_node(|n| {
             let bf = n.expected_base_fee().unwrap_or(INITIAL_BASE_FEE);
-            let sn = n.state().nonce_of(&tx.sender);
-            (bf, sn)
+            let sender_info = match n.state().get_account(&tx.sender) {
+                Some(acc) => SenderInfo {
+                    address: acc.address,
+                    public_key: if acc.has_registered_public_key() {
+                        Some(acc.public_key)
+                    } else {
+                        None
+                    },
+                    balance: acc.balance.base_units(),
+                    nonce: acc.nonce,
+                },
+                None => SenderInfo::ghost(tx.sender, 0, 0),
+            };
+            (n.chain_id(), bf, sender_info)
         });
 
+        let max_gap = self
+            .handle
+            .with_mempool(|p| p.config().max_nonce_gap);
+
+        // (2) Validation cryptographique (cœur de la protection P0).
+        let ctx = ValidationContext {
+            expected_chain_id: chain_id,
+            base_fee,
+            sender: &sender_info,
+        };
+        let validated = validate_for_mempool(tx, &ctx, max_gap).map_err(|e| {
+            // Erreur de validation : on renvoie un message court au client.
+            // Le message complet peut contenir un chain_id, une adresse —
+            // c'est acceptable pour un RPC public (les mêmes données sont
+            // visibles on-chain), mais on évite toute stack trace.
+            RpcError::TransactionRejected(format!("{e}"))
+        })?;
+
+        // (3) Insertion mempool (protégée par le proof).
         self.handle.with_mempool(|pool| {
-            pool.add(tx.clone(), base_fee, sender_nonce)
+            pool.add(tx.clone(), &validated)
                 .map_err(|e| RpcError::TransactionRejected(e.to_string()))
         })
     }
@@ -198,6 +253,8 @@ impl RpcBackend for NodeBackend {
             .map_err(|e| RpcError::InvalidParams(format!("decode evm tx: {e}")))?;
 
         // (2) Récupérer le sender cryptographiquement.
+        //     C'est l'équivalent EVM de validate_signature : la signature
+        //     ECDSA secp256k1 est vérifiée et l'adresse dérivée.
         let sender = sango_evm::recover_sender(&tx)
             .map_err(|_| RpcError::InvalidParams("invalid evm signature".into()))?;
 
@@ -208,6 +265,13 @@ impl RpcBackend for NodeBackend {
         });
 
         // (4) Push dans l'EvmMempool.
+        //
+        // ⚠️ TODO(sécurité EVM) : l'EvmMempool ne reçoit pas encore de
+        // `ValidatedTransaction` équivalent. Recommandation : créer
+        // `sango_evm::validate_for_mempool(evm_tx, &evm_sender_info, &ctx)`
+        // et faire le même pattern que pour le natif (preuve → pool).
+        // Sans cela, le pool EVM reste exposé au même grief que le pool
+        // natif l'était avant ce patch.
         self.handle.with_evm_mempool(|pool| {
             pool.add(tx, base_fee_u256, nonce)
                 .map_err(|e| RpcError::TransactionRejected(e.to_string()))

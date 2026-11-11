@@ -1,11 +1,12 @@
 //! Serveur RPC : accepte des connexions TCP, parse HTTP, dispatch JSON-RPC.
 
+use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::{ServerConnection, StreamOwned};
 
@@ -13,22 +14,97 @@ use crate::backend::RpcBackend;
 use crate::http::{read_request, write_error, write_json_ok, write_preflight_ok, HttpError};
 use crate::tls::TlsConfig;
 
+/// Nombre maximal de connexions simultanées (protection OOM).
+const DEFAULT_MAX_CONNECTIONS: usize = 256;
+
+/// Cap dur sur le nombre de messages d'un batch (protection body DoS).
+pub const MAX_BATCH_SIZE: usize = 100;
+
+/// Token bucket par IP.
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new() -> Self {
+        Self {
+            tokens: 30.0, // rafale initiale
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Consomme 1 token. `true` = autorisé.
+    fn try_consume(&mut self, rate_per_sec: f64, capacity: f64) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * rate_per_sec).min(capacity);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Limiteur global (IP → token bucket), thread-safe.
+pub struct RateLimiter {
+    buckets: Mutex<HashMap<IpAddr, TokenBucket>>,
+    rate_per_sec: f64,
+    capacity: f64,
+    last_cleanup: Mutex<Instant>,
+}
+
+impl RateLimiter {
+    pub fn new(rate_per_sec: f64, capacity: f64) -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+            rate_per_sec,
+            capacity,
+            last_cleanup: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Autorise ou non `ip`. Purge les buckets inactifs (> 1h) toutes les 10 min.
+    pub fn allow(&self, ip: IpAddr) -> bool {
+        {
+            let mut guard = self.buckets.lock().unwrap();
+            let bucket = guard.entry(ip).or_insert_with(TokenBucket::new);
+            if !bucket.try_consume(self.rate_per_sec, self.capacity) {
+                return false;
+            }
+        }
+
+        // Cleanup périodique (throttlé à 10 min).
+        let mut last = self.last_cleanup.lock().unwrap();
+        if last.elapsed() > Duration::from_secs(600) {
+            let mut guard = self.buckets.lock().unwrap();
+            let now = Instant::now();
+            guard.retain(|_, b| now.duration_since(b.last_refill).as_secs() < 3600);
+            *last = now;
+        }
+        true
+    }
+}
+
 /// Serveur RPC.
 pub struct RpcServer<B: RpcBackend> {
     listener: TcpListener,
     backend: Arc<B>,
     shutdown: Arc<AtomicBool>,
-    /// Timeout d'inactivité sur chaque connexion (keep-alive).
     idle_timeout: Duration,
-    /// Nombre maximal de requêtes servies sur une même connexion
-    /// (protection anti-DoS).
     max_requests_per_connection: usize,
-    /// Configuration TLS. `None` → HTTP en clair.
     tls: Option<TlsConfig>,
+    /// Compteur de connexions actives.
+    active_connections: Arc<AtomicUsize>,
+    max_connections: usize,
+    /// Rate limiter par IP.
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl<B: RpcBackend> RpcServer<B> {
-    /// Bind sur `addr`.
     pub fn bind(addr: SocketAddr, backend: Arc<B>) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
@@ -39,43 +115,47 @@ impl<B: RpcBackend> RpcServer<B> {
             idle_timeout: Duration::from_secs(30),
             max_requests_per_connection: 100,
             tls: None,
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            // 20 req/s par IP, rafale 30.
+            rate_limiter: Arc::new(RateLimiter::new(20.0, 30.0)),
         })
     }
 
-    /// Bind sur `addr` avec **TLS** activé.
-    ///
-    /// - Le serveur s'authentifie auprès du client (TLS one-way).
-    /// - Le client n'est pas authentifié par cert.
     pub fn bind_tls(addr: SocketAddr, backend: Arc<B>, tls: TlsConfig) -> std::io::Result<Self> {
         let mut server = Self::bind(addr, backend)?;
         server.tls = Some(tls);
         Ok(server)
     }
 
-    /// Configure le timeout d'inactivité (keep-alive).
-    ///
-    /// Au-delà, la connexion est fermée sans réponse (408 silencieux côté
-    /// client, qui verra juste la connexion tomber).
     #[must_use]
     pub fn with_idle_timeout(mut self, d: Duration) -> Self {
         self.idle_timeout = d;
         self
     }
 
-    /// Configure le nombre maximal de requêtes servies sur une même
-    /// connexion (protection anti-DoS).
     #[must_use]
     pub fn with_max_requests(mut self, n: usize) -> Self {
         self.max_requests_per_connection = n;
         self
     }
 
-    /// Adresse locale effective.
+    #[must_use]
+    pub fn with_max_connections(mut self, n: usize) -> Self {
+        self.max_connections = n;
+        self
+    }
+
+    #[must_use]
+    pub fn with_rate_limit(mut self, rate_per_sec: f64, capacity: f64) -> Self {
+        self.rate_limiter = Arc::new(RateLimiter::new(rate_per_sec, capacity));
+        self
+    }
+
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
     }
 
-    /// Handle de shutdown.
     #[must_use]
     pub fn shutdown_handle(&self) -> ShutdownHandle {
         ShutdownHandle {
@@ -83,24 +163,48 @@ impl<B: RpcBackend> RpcServer<B> {
         }
     }
 
-    /// Boucle de service (bloquant).
-    ///
-    /// Retourne quand `shutdown()` a été appelé via un [`ShutdownHandle`].
     pub fn serve(self) -> std::io::Result<()> {
         let idle_timeout = self.idle_timeout;
         let max_requests = self.max_requests_per_connection;
         let tls = self.tls;
+        let active = Arc::clone(&self.active_connections);
+        let max_conn = self.max_connections;
+        let rate_limiter = Arc::clone(&self.rate_limiter);
+
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
                 return Ok(());
             }
             match self.listener.accept() {
-                Ok((stream, _peer)) => {
+                Ok((stream, peer)) => {
+                    // === Backpressure : rejeter si max atteint ===
+                    let current = active.fetch_add(1, Ordering::Relaxed);
+                    if current >= max_conn {
+                        active.fetch_sub(1, Ordering::Relaxed);
+                        // Trop de connexions : on ferme sans réponse.
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        continue;
+                    }
+
+                    // === Rate limit par IP (avant spawn) ===
+                    if !rate_limiter.allow(peer.ip()) {
+                        active.fetch_sub(1, Ordering::Relaxed);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        continue;
+                    }
+
                     let backend = Arc::clone(&self.backend);
                     let tls = tls.clone();
+                    let active_clone = Arc::clone(&active);
                     thread::spawn(move || {
-                        let _ =
-                            serve_one_connection(stream, backend, idle_timeout, max_requests, tls);
+                        let _ = serve_one_connection(
+                            stream,
+                            backend,
+                            idle_timeout,
+                            max_requests,
+                            tls,
+                        );
+                        active_clone.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -112,21 +216,17 @@ impl<B: RpcBackend> RpcServer<B> {
     }
 }
 
-/// Handle pour demander l'arrêt du serveur.
 #[derive(Clone)]
 pub struct ShutdownHandle {
     flag: Arc<AtomicBool>,
 }
 
 impl ShutdownHandle {
-    /// Demande l'arrêt. Le serveur s'arrêtera à la prochaine itération.
     pub fn shutdown(&self) {
         self.flag.store(true, Ordering::Relaxed);
     }
 }
 
-/// Sert une connexion TCP : applique TLS si configuré, puis délègue
-/// à la boucle keep-alive.
 fn serve_one_connection<B: RpcBackend>(
     tcp: TcpStream,
     backend: Arc<B>,
@@ -134,8 +234,6 @@ fn serve_one_connection<B: RpcBackend>(
     max_requests: usize,
     tls: Option<TlsConfig>,
 ) -> std::io::Result<()> {
-    // Timeouts TCP : à poser **avant** le wrap TLS pour qu'ils s'appliquent
-    // au socket sous-jacent.
     tcp.set_read_timeout(Some(idle_timeout)).ok();
     tcp.set_write_timeout(Some(idle_timeout)).ok();
 
@@ -150,15 +248,6 @@ fn serve_one_connection<B: RpcBackend>(
     }
 }
 
-/// Boucle keep-alive générique sur un stream (`TcpStream` ou
-/// `StreamOwned<ServerConnection, TcpStream>`).
-/// Trait pour fermer proprement un stream, TLS ou non.
-///
-/// - `TcpStream` : `shutdown(Write)` envoie FIN.
-/// - `StreamOwned<ServerConnection, TcpStream>` : envoie `close_notify` TLS
-///   puis FIN. Sans ce close_notify, certains clients (rustls inclus)
-///   remontent une erreur `peer closed connection without sending TLS
-///   close_notify` quand ils font `read_to_end`.
 trait GracefulShutdown {
     fn graceful_close(&mut self);
 }
@@ -182,8 +271,6 @@ where
     S: Read + Write + GracefulShutdown,
     B: RpcBackend,
 {
-    // Le `BufReader` persiste sur toute la connexion (keep-alive) : il
-    // contient les bytes déjà lus qui appartiennent à la requête suivante.
     let mut reader = BufReader::new(stream);
     let mut served: usize = 0;
 
@@ -196,12 +283,12 @@ where
         let req = match read_request(&mut reader) {
             Ok(None) => {
                 reader.get_mut().graceful_close();
-                return Ok(()); // EOF propre.
+                return Ok(());
             }
             Ok(Some(r)) => r,
             Err(e) if e.status == 408 => {
                 reader.get_mut().graceful_close();
-                return Ok(()); // timeout silencieux
+                return Ok(());
             }
             Err(e) => {
                 let _ = write_error(reader.get_mut(), &e, false);
@@ -210,13 +297,8 @@ where
             }
         };
         served += 1;
-
-        // Dernière requête autorisée ou client demande close → fermer.
         let keep_alive = req.keep_alive && served < max_requests;
 
-        // CORS preflight : répondre 204 avec les headers Allow-*,
-        // sans exécuter le RPC. Doit être AVANT le check `method != POST`,
-        // sinon OPTIONS tombe dans le 405.
         if req.method == "OPTIONS" {
             if write_preflight_ok(reader.get_mut(), keep_alive, "POST, OPTIONS").is_err() {
                 reader.get_mut().graceful_close();
@@ -228,7 +310,6 @@ where
             continue;
         }
 
-        // Méthode.
         if req.method != "POST" {
             let err = HttpError::method_not_allowed(format!("method {} not allowed", req.method));
             if write_error(reader.get_mut(), &err, keep_alive).is_err() {
@@ -241,7 +322,6 @@ where
             continue;
         }
 
-        // Chemin.
         if req.path != "/rpc" && req.path != "/" {
             let err = HttpError::not_found(format!("path {} not found", req.path));
             if write_error(reader.get_mut(), &err, keep_alive).is_err() {
@@ -254,16 +334,12 @@ where
             continue;
         }
 
-        // Parser le JSON brut en `Value` (objet unique OU tableau batch).
         let json_value: serde_json::Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
             Err(e) => {
                 let resp = serde_json::json!({
                     "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32600,
-                        "message": format!("parse json: {e}")
-                    },
+                    "error": { "code": -32600, "message": format!("parse json: {e}") },
                     "id": serde_json::Value::Null,
                 });
                 let body = serde_json::to_vec(&resp).unwrap_or_default();
@@ -277,6 +353,29 @@ where
                 continue;
             }
         };
+
+        // === Cap batch size (DoS via 10k items) ===
+        if let serde_json::Value::Array(ref items) = json_value {
+            if items.len() > MAX_BATCH_SIZE {
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32600,
+                        "message": format!("batch size {} exceeds {}", items.len(), MAX_BATCH_SIZE)
+                    },
+                    "id": serde_json::Value::Null,
+                });
+                let body = serde_json::to_vec(&resp).unwrap_or_default();
+                if write_json_ok(reader.get_mut(), &body, keep_alive).is_err() {
+                    reader.get_mut().graceful_close();
+                    return Ok(());
+                }
+                if !keep_alive {
+                    return Ok(());
+                }
+                continue;
+            }
+        }
 
         let resp = crate::dispatch::dispatch_value(&*backend, json_value);
         let body = serde_json::to_vec(&resp).unwrap_or_default();

@@ -32,6 +32,16 @@ pub enum RpcError {
     /// Transaction rejetée par le mempool ou l'état.
     #[error("{0}")]
     TransactionRejected(String),
+
+    /// Trop de requêtes (rate limit IP ou batch trop volumineux).
+    ///
+    /// Code JSON-RPC `-32005` (espace réservé Sango). Le serveur HTTP
+    /// répond avec un statut `429 Too Many Requests` quand cette erreur
+    /// est levée au niveau du rate limiter, mais le JSON-RPC peut aussi
+    /// la transporter dans un `200 OK` si elle est levée au niveau du
+    /// batch cap.
+    #[error("{0}")]
+    RateLimited(String),
 }
 
 impl RpcError {
@@ -45,6 +55,7 @@ impl RpcError {
             RpcError::Internal(_) => -32603,
             RpcError::NotFound(_) => -32001,
             RpcError::TransactionRejected(_) => -32010,
+            RpcError::RateLimited(_) => -32005,
         }
     }
 }

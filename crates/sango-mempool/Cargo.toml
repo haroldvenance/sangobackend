@@ -13,3 +13,4 @@ sango-types.workspace = true
 sango-crypto.workspace = true
 k256.workspace = true
 rlp.workspace = true
+sango-tx = { path = "../sango-tx" }

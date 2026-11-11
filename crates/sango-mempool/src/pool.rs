@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sango_primitives::{Hash32, NativeAddress};
+use sango_tx::ValidatedTransaction;
 use sango_types::Transaction;
 
 use crate::error::MempoolError;
@@ -38,24 +39,31 @@ pub struct MempoolEntry {
     pub tx: Transaction,
     /// Hash de la transaction.
     pub tx_hash: Hash32,
-    /// Prix effectif (min(max_fee, base_fee + priority_fee)) au moment
-    /// de l'admission.
+    /// Prix effectif, **copié depuis le `ValidatedTransaction`**.
     pub effective_price: u128,
     /// Ordre d'arrivée (timestamp logique interne).
     pub arrival: u64,
 }
 
-/// Mempool.
+/// Mempool natif.
+///
+/// ## Contrat de validation
+///
+/// `add()` prend un [`ValidatedTransaction`] produit par
+/// `sango_tx::validate_for_mempool`. Le pool **ne revalide pas** la
+/// cryptographie (coût O(1) déjà payé par le caller). Il fait un
+/// contrôle de cohérence (`tx_hash`, `sender`) et applique ses règles
+/// locales (duplicate, capacité, replacement bump).
+///
+/// Cette séparation est ce qui empêche un attaquant de remplir le pool
+/// avec des tx dont la signature est fausse : `validate_for_mempool`
+/// rejette ces tx **avant** que `pool.add` ne les voie.
 #[derive(Debug)]
 pub struct Mempool {
     config: MempoolConfig,
-    /// Entrées par hash.
     by_hash: HashMap<Hash32, MempoolEntry>,
-    /// Index secondaire : `(sender, nonce) → hash`.
     by_sender_nonce: BTreeMap<(NativeAddress, u64), Hash32>,
-    /// Ordre d'arrivée, monotone.
     arrival_counter: u64,
-    /// Nombre de transactions par sender.
     per_sender_count: HashMap<NativeAddress, usize>,
 }
 
@@ -102,78 +110,60 @@ impl Mempool {
         self.by_hash.get(hash)
     }
 
-    /// Admet une transaction.
+    /// Admet une transaction **pré-validée**.
     ///
-    /// ## Règles
+    /// # Contrat
     ///
-    /// - Doublon de hash → [`MempoolError::Duplicate`].
-    /// - Capacité globale atteinte → [`MempoolError::Full`].
-    /// - Capacité par sender atteinte → [`MempoolError::Full`].
-    /// - `max_fee < base_fee` → [`MempoolError::MaxFeeBelowBaseFee`].
-    /// - Nonce déjà occupé par une autre tx :
-    ///   - si la nouvelle offre un bump `>= replacement_bump_bps`, elle
-    ///     remplace l'ancienne ;
-    ///   - sinon → [`MempoolError::ReplacementFeeTooLow`].
+    /// Le paramètre `validated` **DOIT** provenir de
+    /// `sango_tx::validate_for_mempool(tx, &ctx, max_gap)` pour **la
+    /// même** `tx`. Le pool vérifie `tx_hash` et `sender` en défense en
+    /// profondeur, mais ne revalide pas la cryptographie.
+    ///
+    /// ## Règles locales
+    ///
+    /// - `tx_hash` ou `sender` incohérent avec `validated` →
+    ///   [`MempoolError::ValidationMismatch`].
+    /// - Doublon hash → [`MempoolError::Duplicate`].
+    /// - Capacité atteinte → [`MempoolError::Full`].
+    /// - Nonce collision sans bump → [`MempoolError::ReplacementFeeTooLow`].
     pub fn add(
         &mut self,
         tx: Transaction,
-        base_fee: u128,
-        sender_nonce: u64,
+        validated: &ValidatedTransaction,
     ) -> Result<Hash32, MempoolError> {
         let tx_hash = tx.hash();
+        if tx_hash != validated.tx_hash {
+            return Err(MempoolError::ValidationMismatch);
+        }
+        if validated.sender != tx.sender {
+            return Err(MempoolError::ValidationMismatch);
+        }
 
         if self.by_hash.contains_key(&tx_hash) {
             return Err(MempoolError::Duplicate(tx_hash));
         }
 
-        if tx.max_fee < base_fee {
-            return Err(MempoolError::MaxFeeBelowBaseFee {
-                max_fee: tx.max_fee,
-                base_fee,
-            });
-        }
+        let effective_price = validated.effective_gas_price;
 
-        // Fenêtre de nonce.
-        let min_nonce = sender_nonce;
-        let max_nonce = sender_nonce.saturating_add(self.config.max_nonce_gap);
-        if tx.nonce < min_nonce {
-            return Err(MempoolError::NonceTooLow {
-                expected: min_nonce,
-                got: tx.nonce,
-            });
-        }
-        if tx.nonce > max_nonce {
-            return Err(MempoolError::NonceTooHigh {
-                expected: max_nonce,
-                got: tx.nonce,
-            });
-        }
-
-        // Prix effectif.
-        let effective_price = tx.max_fee.min(base_fee.saturating_add(tx.priority_fee));
-
-        // Collision de nonce pour ce sender ?
         let key = (tx.sender, tx.nonce);
         if let Some(existing_hash) = self.by_sender_nonce.get(&key).copied() {
             let existing = self.by_hash.get(&existing_hash).expect("index consistant");
             let bump_bps = self.config.replacement_bump_bps as u128;
-            let min_required = existing.effective_price.saturating_mul(10_000 + bump_bps) / 10_000;
+            let min_required =
+                existing.effective_price.saturating_mul(10_000 + bump_bps) / 10_000;
             if effective_price < min_required {
                 return Err(MempoolError::ReplacementFeeTooLow {
                     needed: min_required,
                     got: effective_price,
                 });
             }
-            // Remplacer : retirer l'ancienne.
             self.remove(&existing_hash);
         }
 
-        // Capacité globale.
         if self.by_hash.len() >= self.config.max_transactions {
             return Err(MempoolError::Full);
         }
 
-        // Capacité par sender.
         let count = self.per_sender_count.entry(tx.sender).or_insert(0);
         if *count >= self.config.max_per_sender {
             return Err(MempoolError::Full);
@@ -208,10 +198,8 @@ impl Mempool {
 
     /// Sélectionne jusqu'à `max_count` transactions pour un bloc.
     ///
-    /// Ordre de tri : `effective_price` décroissant, puis `arrival`
-    /// croissant (FIFO à prix égal). Les dépendances de nonce sont
-    /// respectées : pour un même sender, on ne peut inclure un nonce `n`
-    /// sans avoir inclus `n-1` (dans la même sélection ou déjà appliqué).
+    /// Ordre : `effective_price` décroissant, puis `arrival` croissant.
+    /// Respecte les dépendances de nonce.
     #[must_use]
     pub fn select_for_block(
         &self,
@@ -237,20 +225,14 @@ impl Mempool {
                 next_nonce.insert(entry.tx.sender, expected + 1);
                 selected.push(entry.clone());
             } else if entry.tx.nonce < expected {
-                // Déjà appliqué ou en retard.
                 continue;
             }
-            // Sinon : nonce futur, ne peut pas être sélectionné tant que les
-            // nonces intermédiaires n'ont pas été pris.
         }
         selected
     }
 
     /// Retire toutes les transactions dont le nonce est strictement
     /// inférieur à `min_nonces[sender]`.
-    ///
-    /// Utilisé après application d'un bloc pour purger les transactions
-    /// déjà incluses.
     pub fn prune_below_nonces(&mut self, min_nonces: &HashMap<NativeAddress, u64>) -> usize {
         let mut to_remove = Vec::new();
         for (key, hash) in &self.by_sender_nonce {
@@ -275,8 +257,6 @@ impl Mempool {
     }
 
     /// Retire les transactions dont `max_fee < new_base_fee`.
-    ///
-    /// Utilisé quand la base fee augmente.
     pub fn evict_below_base_fee(&mut self, new_base_fee: u128) -> usize {
         let to_remove: Vec<Hash32> = self
             .by_hash
@@ -291,8 +271,7 @@ impl Mempool {
         count
     }
 
-    /// Retourne les hashes de toutes les transactions, triés par ordre de
-    /// sélection (prix décroissant, FIFO).
+    /// Retourne les hashes triés par ordre de sélection (prix déc, FIFO).
     #[must_use]
     pub fn ordered_hashes(&self) -> Vec<Hash32> {
         let mut candidates: Vec<&MempoolEntry> = self.by_hash.values().collect();
@@ -349,12 +328,30 @@ mod tests {
         }
     }
 
+    /// Construit un `ValidatedTransaction` valide pour les tests.
+    ///
+    /// ⚠️ **Test-only** — reproduit la sortie de `validate_for_mempool`
+    /// sans faire la crypto. En production, `ValidatedTransaction` ne
+    /// doit provenir que de `sango_tx::validate_*`.
+    fn fake_validated(tx: &Transaction, base_fee: u128) -> ValidatedTransaction {
+        let effective_price = tx.max_fee.min(base_fee.saturating_add(tx.priority_fee));
+        ValidatedTransaction {
+            tx_hash: tx.hash(),
+            sender: tx.sender,
+            effective_gas_price: effective_price,
+            max_total_fee: (tx.gas_limit as u128).saturating_mul(effective_price),
+            value: tx.value.base_units(),
+            bootstrap_public_key: None,
+        }
+    }
+
     #[test]
     fn add_and_remove() {
         let mut pool = Mempool::default();
         let t = tx(addr(0xaa), 0, 20, 2);
         let h = t.hash();
-        pool.add(t, 10, 0).unwrap();
+        let v = fake_validated(&t, 10);
+        pool.add(t, &v).unwrap();
         assert_eq!(pool.len(), 1);
         assert!(pool.contains(&h));
         pool.remove(&h);
@@ -365,54 +362,53 @@ mod tests {
     fn duplicate_rejected() {
         let mut pool = Mempool::default();
         let t = tx(addr(0xaa), 0, 20, 2);
-        pool.add(t.clone(), 10, 0).unwrap();
-        let err = pool.add(t, 10, 0).unwrap_err();
+        let v = fake_validated(&t, 10);
+        pool.add(t.clone(), &v).unwrap();
+        let err = pool.add(t, &v).unwrap_err();
         assert!(matches!(err, MempoolError::Duplicate(_)));
     }
 
     #[test]
-    fn max_fee_below_base_rejected() {
+    fn validation_mismatch_rejected_on_hash() {
+        let tx_a = tx(addr(0xaa), 0, 20, 2);
+        let tx_b = tx(addr(0xbb), 0, 20, 2);
+        let v_a = fake_validated(&tx_a, 10);
         let mut pool = Mempool::default();
-        let t = tx(addr(0xaa), 0, 5, 1);
-        let err = pool.add(t, 10, 0).unwrap_err();
-        assert!(matches!(err, MempoolError::MaxFeeBelowBaseFee { .. }));
+        let err = pool.add(tx_b, &v_a).unwrap_err();
+        assert!(matches!(err, MempoolError::ValidationMismatch));
     }
 
     #[test]
-    fn nonce_too_low_rejected() {
-        let mut pool = Mempool::default();
+    fn validation_mismatch_rejected_on_sender() {
         let t = tx(addr(0xaa), 0, 20, 2);
-        let err = pool.add(t, 10, 5).unwrap_err();
-        assert!(matches!(err, MempoolError::NonceTooLow { .. }));
-    }
-
-    #[test]
-    fn nonce_too_high_rejected() {
+        let mut v = fake_validated(&t, 10);
+        v.sender = addr(0xbb);
         let mut pool = Mempool::default();
-        let t = tx(addr(0xaa), 100, 20, 2);
-        let err = pool.add(t, 10, 0).unwrap_err();
-        assert!(matches!(err, MempoolError::NonceTooHigh { .. }));
+        let err = pool.add(t, &v).unwrap_err();
+        assert!(matches!(err, MempoolError::ValidationMismatch));
     }
 
     #[test]
     fn replacement_with_insufficient_bump_rejected() {
         let mut pool = Mempool::default();
-        pool.add(tx(addr(0xaa), 0, 20, 2), 10, 0).unwrap();
-        // Même nonce, prix effectif à peine supérieur → rejeté.
-        // effective_price initial = min(20, 10+2) = 12.
-        // besoin = 12 * 11000 / 10000 = 13.2 → 13.
-        let err = pool.add(tx(addr(0xaa), 0, 13, 0), 10, 0).unwrap_err();
+        let t1 = tx(addr(0xaa), 0, 20, 2);
+        let v1 = fake_validated(&t1, 10);
+        pool.add(t1, &v1).unwrap();
+        let t2 = tx(addr(0xaa), 0, 13, 0);
+        let v2 = fake_validated(&t2, 10);
+        let err = pool.add(t2, &v2).unwrap_err();
         assert!(matches!(err, MempoolError::ReplacementFeeTooLow { .. }));
     }
 
     #[test]
     fn replacement_with_sufficient_bump_accepted() {
         let mut pool = Mempool::default();
-        let h1 = pool.add(tx(addr(0xaa), 0, 20, 2), 10, 0).unwrap();
-        // Nouvelle tx avec max_fee 25, priority 2 → effective = min(25, 12) = 12.
-        // Hmm 12 < 13 : rejeté. Prenons max_fee 30, priority 3 :
-        // effective = min(30, 13) = 13 >= 13 → accepté.
-        let h2 = pool.add(tx(addr(0xaa), 0, 30, 3), 10, 0).unwrap();
+        let t1 = tx(addr(0xaa), 0, 20, 2);
+        let v1 = fake_validated(&t1, 10);
+        let h1 = pool.add(t1, &v1).unwrap();
+        let t2 = tx(addr(0xaa), 0, 30, 3);
+        let v2 = fake_validated(&t2, 10);
+        let h2 = pool.add(t2, &v2).unwrap();
         assert_ne!(h1, h2);
         assert_eq!(pool.len(), 1);
         assert!(!pool.contains(&h1));
@@ -426,9 +422,14 @@ mod tests {
             ..Default::default()
         };
         let mut pool = Mempool::new(config);
-        pool.add(tx(addr(0xaa), 0, 100, 10), 0, 0).unwrap();
-        pool.add(tx(addr(0xaa), 1, 100, 10), 0, 0).unwrap();
-        let err = pool.add(tx(addr(0xaa), 2, 100, 10), 0, 0).unwrap_err();
+        for nonce in 0..2 {
+            let t = tx(addr(0xaa), nonce, 100, 10);
+            let v = fake_validated(&t, 0);
+            pool.add(t, &v).unwrap();
+        }
+        let t = tx(addr(0xaa), 2, 100, 10);
+        let v = fake_validated(&t, 0);
+        let err = pool.add(t, &v).unwrap_err();
         assert!(matches!(err, MempoolError::Full));
     }
 
@@ -439,24 +440,33 @@ mod tests {
             ..Default::default()
         };
         let mut pool = Mempool::new(config);
-        pool.add(tx(addr(0xaa), 0, 100, 0), 0, 0).unwrap();
-        pool.add(tx(addr(0xbb), 0, 100, 0), 0, 0).unwrap();
-        let err = pool.add(tx(addr(0xcc), 0, 100, 0), 0, 0).unwrap_err();
+        for sender_byte in [0xaau8, 0xbbu8] {
+            let t = tx(addr(sender_byte), 0, 100, 0);
+            let v = fake_validated(&t, 0);
+            pool.add(t, &v).unwrap();
+        }
+        let t = tx(addr(0xcc), 0, 100, 0);
+        let v = fake_validated(&t, 0);
+        let err = pool.add(t, &v).unwrap_err();
         assert!(matches!(err, MempoolError::Full));
     }
 
     #[test]
     fn select_orders_by_price_then_arrival() {
         let mut pool = Mempool::default();
-        // Ordre d'arrivée : A (prix 12), B (prix 15), C (prix 15).
-        pool.add(tx(addr(0xaa), 0, 20, 2), 10, 0).unwrap(); // eff=12
-        pool.add(tx(addr(0xbb), 0, 30, 5), 10, 0).unwrap(); // eff=15
-        pool.add(tx(addr(0xcc), 0, 30, 5), 10, 0).unwrap(); // eff=15
+        let t_a = tx(addr(0xaa), 0, 20, 2);
+        let t_b = tx(addr(0xbb), 0, 30, 5);
+        let t_c = tx(addr(0xcc), 0, 30, 5);
+        let v_a = fake_validated(&t_a, 10);
+        let v_b = fake_validated(&t_b, 10);
+        let v_c = fake_validated(&t_c, 10);
+        pool.add(t_a, &v_a).unwrap();
+        pool.add(t_b, &v_b).unwrap();
+        pool.add(t_c, &v_c).unwrap();
 
         let base = HashMap::new();
         let selected = pool.select_for_block(10, &base);
         assert_eq!(selected.len(), 3);
-        // B et C (prix 15) avant A (prix 12), B avant C (arrivée).
         assert_eq!(selected[0].tx.sender, addr(0xbb));
         assert_eq!(selected[1].tx.sender, addr(0xcc));
         assert_eq!(selected[2].tx.sender, addr(0xaa));
@@ -465,14 +475,13 @@ mod tests {
     #[test]
     fn select_respects_nonce_dependencies() {
         let mut pool = Mempool::default();
-        // Nonce 2 d'abord (prix élevé), puis 0 et 1 (prix bas).
-        pool.add(tx(addr(0xaa), 2, 100, 10), 0, 0).unwrap();
-        pool.add(tx(addr(0xaa), 0, 15, 1), 0, 0).unwrap();
-        pool.add(tx(addr(0xaa), 1, 15, 1), 0, 0).unwrap();
-
+        for (n, fee, pri) in [(2, 100, 10), (0, 15, 1), (1, 15, 1)] {
+            let t = tx(addr(0xaa), n, fee, pri);
+            let v = fake_validated(&t, 0);
+            pool.add(t, &v).unwrap();
+        }
         let base = HashMap::new();
         let selected = pool.select_for_block(10, &base);
-        // Seuls 0 et 1 sont sélectionnables (2 doit attendre).
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].tx.nonce, 0);
         assert_eq!(selected[1].tx.nonce, 1);
@@ -481,9 +490,11 @@ mod tests {
     #[test]
     fn select_respects_base_nonces() {
         let mut pool = Mempool::default();
-        pool.add(tx(addr(0xaa), 5, 100, 0), 0, 0).unwrap();
-        pool.add(tx(addr(0xaa), 6, 100, 0), 0, 0).unwrap();
-
+        for n in [5u64, 6] {
+            let t = tx(addr(0xaa), n, 100, 0);
+            let v = fake_validated(&t, 0);
+            pool.add(t, &v).unwrap();
+        }
         let mut base = HashMap::new();
         base.insert(addr(0xaa), 5u64);
         let selected = pool.select_for_block(10, &base);
@@ -495,10 +506,11 @@ mod tests {
     #[test]
     fn prune_below_nonces_removes_applied() {
         let mut pool = Mempool::default();
-        pool.add(tx(addr(0xaa), 0, 100, 0), 0, 0).unwrap();
-        pool.add(tx(addr(0xaa), 1, 100, 0), 0, 0).unwrap();
-        pool.add(tx(addr(0xaa), 2, 100, 0), 0, 0).unwrap();
-
+        for n in [0u64, 1, 2] {
+            let t = tx(addr(0xaa), n, 100, 0);
+            let v = fake_validated(&t, 0);
+            pool.add(t, &v).unwrap();
+        }
         let mut mins = HashMap::new();
         mins.insert(addr(0xaa), 2u64);
         let removed = pool.prune_below_nonces(&mins);
@@ -509,8 +521,12 @@ mod tests {
     #[test]
     fn evict_below_base_fee_removes_cheap_txs() {
         let mut pool = Mempool::default();
-        pool.add(tx(addr(0xaa), 0, 20, 0), 10, 0).unwrap();
-        pool.add(tx(addr(0xbb), 0, 5, 0), 0, 0).unwrap();
+        let t1 = tx(addr(0xaa), 0, 20, 0);
+        let v1 = fake_validated(&t1, 10);
+        pool.add(t1, &v1).unwrap();
+        let t2 = tx(addr(0xbb), 0, 5, 0);
+        let v2 = fake_validated(&t2, 0);
+        pool.add(t2, &v2).unwrap();
         let removed = pool.evict_below_base_fee(10);
         assert_eq!(removed, 1);
         assert_eq!(pool.len(), 1);
@@ -519,8 +535,11 @@ mod tests {
     #[test]
     fn clear_empties_pool() {
         let mut pool = Mempool::default();
-        pool.add(tx(addr(0xaa), 0, 100, 0), 0, 0).unwrap();
-        pool.add(tx(addr(0xbb), 0, 100, 0), 0, 0).unwrap();
+        for sender_byte in [0xaau8, 0xbbu8] {
+            let t = tx(addr(sender_byte), 0, 100, 0);
+            let v = fake_validated(&t, 0);
+            pool.add(t, &v).unwrap();
+        }
         pool.clear();
         assert!(pool.is_empty());
     }
